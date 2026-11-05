@@ -2,7 +2,7 @@
 
 Дата: 2026-11-05. Ядро:
 `/home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh`
-(0.11.0, native ABI). QEMU `qemu-system-riscv64` 10.2.2, машина `virt`,
+(0.14.0, native ABI). QEMU `qemu-system-riscv64` 10.2.2, машина `virt`,
 256 MiB, serial на Unix-сокете, `-bios default`, `-display none`.
 Диск: 64 MiB ext2, создан на хосте
 
@@ -187,7 +187,7 @@ NaN-сравнения, точное сравнение `int` с `float` выш�
 
 ### Проверка FPU до реализации
 
-Утверждение «ядро 0.11.0 исполняет f64 в U-mode» проверено не по символам, а
+Утверждение «ядро 0.14.0 исполняет f64 в U-mode» проверено не по символам, а
 живым запуском `/home/oleg/pagh-api/examples/fp.rs`: `1.5 * 2.25` и сумма
 `1..=100` дали `fp product=3.375`, `fp sum=5050`, exit 0. Дополнительно
 временная U-mode программа проверила `fdiv`, сравнения, `fcvt` в `i64` и
@@ -231,7 +231,7 @@ run: /mnt/pythonc exited with code 0
 ## Зависимость от FPU
 
 `pythonc` теперь содержит настоящие f64-инструкции. Ядро обязано оставлять
-`sstatus.FS` включённым при `sret` в U-mode (как в 0.11.0). Если ядро выключит
+`sstatus.FS` включённым при `sret` в U-mode (как в 0.14.0). Если ядро выключит
 FPU, первая же float-операция упадёт по illegal instruction; это не ошибка
 интерпретатора, а нарушение контракта ядра. `hostcheck` на x86-64 проверяет ту
 же семантику без QEMU.
