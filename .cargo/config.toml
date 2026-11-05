@@ -1,0 +1,11 @@
+# The target is pinned here so a plain `cargo build --release` does the right
+# thing. The linker script itself is supplied by `build.rs` as an absolute path
+# derived from CARGO_MANIFEST_DIR: the layout lives in the API repository (one
+# contract, one copy) and must not depend on rustc's cwd.
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "linker=rust-lld",
+]

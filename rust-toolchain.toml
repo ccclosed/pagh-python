@@ -1,0 +1,8 @@
+# The same pinned nightly the kernel (`pagh-riscv`), `pagh-api` and
+# `pagh-programs` use, so the interpreter, `libpagh` and the kernel that loads
+# the ELF are built by one compiler. The precompiled `core` and `alloc` for the
+# bare-metal RISC-V target ship with this toolchain.
+[toolchain]
+channel = "nightly-2026-07-12"
+targets = ["riscv64gc-unknown-none-elf"]
+components = ["rustfmt"]

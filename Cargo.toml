@@ -1,0 +1,36 @@
+[package]
+name = "pythonc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A native, integer-only Python interpreter for the pagh-riscv native ABI"
+
+[[bin]]
+name = "pythonc"
+path = "src/main.rs"
+
+# Sibling checkout, exactly like pagh-programs/programs/Cargo.toml. There is no
+# fallback for a path dependency: check out pagh-api next to this repository.
+[dependencies]
+libpagh = { path = "../pagh-api/libpagh" }
+
+# Userland is freestanding: no unwinder, no relocations, one static ELF. The
+# kernel refuses images above 1 MiB and does not load debug info, so stripping
+# it matters. `overflow-checks = false` is deliberate: the interpreter performs
+# every arithmetic operation with explicit `checked_*` calls and raises a
+# Python `OverflowError` instead of aborting the process on user data.
+[profile.release]
+panic = "abort"
+opt-level = 2
+debug = false
+strip = "debuginfo"
+lto = false
+codegen-units = 1
+overflow-checks = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = false
+strip = "debuginfo"
+overflow-checks = false
