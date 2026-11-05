@@ -62,6 +62,12 @@ pub enum StmtKind {
         else_body: Vec<Stmt>,
         finally_body: Vec<Stmt>,
     },
+    /// `with a as x, b as y: ...`. The items are entered left to right and
+    /// exited right to left.
+    With {
+        items: Vec<WithItem>,
+        body: Vec<Stmt>,
+    },
     Raise(Option<Expr>),
     Import(Vec<ImportAlias>),
     FromImport {
@@ -83,6 +89,11 @@ pub struct Param {
     pub default: Option<Expr>,
 }
 
+pub struct WithItem {
+    pub context: Expr,
+    pub target: Option<Expr>,
+}
+
 pub struct Handler {
     /// `None` is a bare `except:`.
     pub kind: Option<Expr>,
@@ -95,6 +106,20 @@ pub struct ImportAlias {
     /// `from a.b import c` (unused for the imported-name entry itself).
     pub name: Name,
     pub alias: Option<Name>,
+}
+
+/// One piece of an f-string literal. Text pieces are already unescaped;
+/// expression pieces keep the source text until the parser turns it into an
+/// `Expr`, so the lexer never depends on the parser.
+pub enum FStringPart {
+    Text(Rc<str>),
+    Value {
+        expression: Box<Expr>,
+        /// The text after `:`, without the colon.
+        spec: Option<Rc<str>>,
+        /// `!r`, `!s` or `!a`.
+        conversion: Option<char>,
+    },
 }
 
 pub struct CompGen {
@@ -117,6 +142,13 @@ pub enum Expr {
     List(Vec<Expr>),
     Tuple(Vec<Expr>),
     Dict(Vec<(Expr, Expr)>),
+    Set(Vec<Expr>),
+    Bytes(Rc<Vec<u8>>),
+    FString(Vec<FStringPart>),
+    Lambda {
+        params: Vec<Param>,
+        body: Rc<Expr>,
+    },
     Unary {
         op: UnOp,
         value: Box<Expr>,
@@ -156,6 +188,15 @@ pub enum Expr {
     },
     ListComp {
         element: Box<Expr>,
+        generators: Vec<CompGen>,
+    },
+    SetComp {
+        element: Box<Expr>,
+        generators: Vec<CompGen>,
+    },
+    DictComp {
+        key: Box<Expr>,
+        value: Box<Expr>,
         generators: Vec<CompGen>,
     },
     IfExpr {

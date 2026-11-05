@@ -22,7 +22,10 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::cmp::Ordering;
 
-use crate::ast::{BinOp, BoolOp, CmpOp, CompGen, Expr, Handler, Name, Param, Stmt, StmtKind, UnOp};
+use crate::ast::{
+    BinOp, BoolOp, CmpOp, CompGen, Expr, FStringPart, Handler, Name, Param, Stmt, StmtKind, UnOp,
+    WithItem,
+};
 use crate::builtins;
 use crate::error::{ErrorName, PyError, PyResult, TraceFrame};
 use crate::parser;
@@ -30,8 +33,8 @@ use crate::platform;
 use crate::value;
 use crate::value::{
     attr_get, attr_set, class_is_subclass, class_lookup, dict_get, dict_set, env_find_nonlocal,
-    env_lookup, is_same, values_equal, BuiltinId, BuiltinType, BuiltinValue, Class, Env, EnvRef,
-    Function, Instance, IterState, ModuleValue, RangeValue, Value,
+    env_lookup, is_same, set_find, set_insert, values_equal, BuiltinId, BuiltinType, BuiltinValue,
+    Class, Env, EnvRef, Function, FunctionBody, Instance, IterState, ModuleValue, RangeValue, Value,
 };
 
 /// Maximum number of nested Python calls. See the module docs.
@@ -147,6 +150,8 @@ pub struct Interp {
     /// guarantee without exposing host addresses (which differ between the
     /// host harness and the kernel).
     pub ids: Vec<(Value, i64)>,
+    /// Lazily created `os.stat_result` class, shared by every call.
+    stat_class: Option<Rc<Class>>,
     module_cache: Vec<(String, Value)>,
 }
 
@@ -166,6 +171,8 @@ impl Interp {
             BuiltinType::List,
             BuiltinType::Tuple,
             BuiltinType::Dict,
+            BuiltinType::Set,
+            BuiltinType::Bytes,
             BuiltinType::Function,
             BuiltinType::Module,
             BuiltinType::File,
@@ -202,11 +209,20 @@ impl Interp {
             exception_class("NotImplementedError", alloc::vec![runtime.clone()], None);
         let recursion = exception_class("RecursionError", alloc::vec![runtime.clone()], None);
         let value_error = exception_class("ValueError", alloc::vec![exception.clone()], None);
+        let unicode_error = exception_class("UnicodeError", alloc::vec![value_error.clone()], None);
+        let unicode_decode =
+            exception_class("UnicodeDecodeError", alloc::vec![unicode_error.clone()], None);
+        let unicode_encode =
+            exception_class("UnicodeEncodeError", alloc::vec![unicode_error.clone()], None);
+        let json_decode =
+            exception_class("JSONDecodeError", alloc::vec![value_error.clone()], None);
         let type_error = exception_class("TypeError", alloc::vec![exception.clone()], None);
         let name_error = exception_class("NameError", alloc::vec![exception.clone()], None);
         let attribute = exception_class("AttributeError", alloc::vec![exception.clone()], None);
         let os_error = exception_class("OSError", alloc::vec![exception.clone()], None);
         let file_error = exception_class("FileNotFoundError", alloc::vec![os_error.clone()], None);
+        let file_exists =
+            exception_class("FileExistsError", alloc::vec![os_error.clone()], None);
         let import_error = exception_class("ImportError", alloc::vec![exception.clone()], None);
         let module_error = exception_class(
             "ModuleNotFoundError",
@@ -233,11 +249,16 @@ impl Interp {
             not_implemented,
             recursion,
             value_error,
+            unicode_error,
+            unicode_decode,
+            unicode_encode,
+            json_decode,
             type_error,
             name_error,
             attribute,
             os_error,
             file_error,
+            file_exists,
             import_error,
             module_error,
             stop_iteration,
@@ -262,6 +283,7 @@ impl Interp {
             depth: 0,
             class_env: None,
             ids: Vec::new(),
+            stat_class: None,
             module_cache: Vec::new(),
         };
         interp.init_search_paths(script_dir);
@@ -298,6 +320,8 @@ impl Interp {
             BuiltinType::List,
             BuiltinType::Tuple,
             BuiltinType::Dict,
+            BuiltinType::Set,
+            BuiltinType::Bytes,
         ] {
             if let Some(class) = self.class_for(tag) {
                 entries.push((Rc::from(tag.name()), Value::Class(class)));
@@ -328,6 +352,7 @@ impl Interp {
             ("round", BuiltinId::Round),
             ("hex", BuiltinId::Hex),
             ("id", BuiltinId::Id),
+            ("map", BuiltinId::Map),
         ] {
             entries.push((Rc::from(name), Value::builtin(id)));
         }
@@ -482,6 +507,7 @@ impl Interp {
                 else_body,
                 finally_body,
             } => self.exec_try(body, handlers, else_body, finally_body, env),
+            StmtKind::With { items, body } => self.exec_with(items, body, env),
             StmtKind::Raise(expression) => match expression {
                 Some(expression) => {
                     let value = self.eval_expr(expression, env)?;
@@ -614,7 +640,108 @@ impl Interp {
         Ok(Function {
             name: name.clone(),
             params: bound,
-            body: body.clone(),
+            body: FunctionBody::Block(body.clone()),
+            closure,
+            filename: self.current_filename(),
+            def_line,
+        })
+    }
+
+    /// Enter every manager left to right, run the body, then leave right to
+    /// left. An `__exit__` returning a truthy value suppresses the exception.
+    fn exec_with(&mut self, items: &[WithItem], body: &[Stmt], env: &EnvRef) -> PyResult<Flow> {
+        self.exec_with_from(items, 0, body, env)
+    }
+
+    fn exec_with_from(
+        &mut self,
+        items: &[WithItem],
+        index: usize,
+        body: &[Stmt],
+        env: &EnvRef,
+    ) -> PyResult<Flow> {
+        let Some(item) = items.get(index) else {
+            return self.exec_block(body, env);
+        };
+        let manager = self.eval_expr(&item.context, env)?;
+        let enter = self.get_attribute(&manager, "__enter__")?;
+        let entered = self.call_value(enter, ArgList::new(), Vec::new())?;
+        if let Some(target) = &item.target {
+            self.assign_target(target, entered, env)?;
+        }
+        let outcome = self.exec_with_from(items, index + 1, body, env);
+        let exit = self.get_attribute(&manager, "__exit__")?;
+        match outcome {
+            Ok(flow) => {
+                let mut args = ArgList::new();
+                args.push(Value::None);
+                args.push(Value::None);
+                args.push(Value::None);
+                self.call_value(exit, args, Vec::new())?;
+                Ok(flow)
+            }
+            Err(error) => {
+                let (kind, value) = self.exception_type_and_value(&error);
+                let mut args = ArgList::new();
+                args.push(kind);
+                args.push(value);
+                args.push(Value::None);
+                let suppress = self.call_value(exit, args, Vec::new())?.truthy();
+                if suppress {
+                    Ok(Flow::Normal)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn exception_type_and_value(&self, error: &PyError) -> (Value, Value) {
+        let class = match self.error_class(error) {
+            Some(class) => class,
+            None => match self.exception_class("Exception") {
+                Some(class) => class,
+                None => return (Value::None, Value::None),
+            },
+        };
+        let value = self.exception_value(error);
+        (Value::Class(class), value)
+    }
+
+    fn make_lambda_function(
+        &mut self,
+        params: &[Param],
+        body: &Rc<Expr>,
+        env: &EnvRef,
+    ) -> PyResult<Function> {
+        let mut bound = Vec::with_capacity(params.len());
+        for parameter in params {
+            let default = match &parameter.default {
+                Some(expression) => Some(self.eval_expr(expression, env)?),
+                None => None,
+            };
+            bound.push((parameter.name.clone(), default));
+        }
+        let in_class_body = match &self.class_env {
+            Some(class_env) => Rc::ptr_eq(class_env, env),
+            None => false,
+        };
+        let closure = if in_class_body {
+            match env.borrow().parent.clone() {
+                Some(parent) => parent,
+                None => env.clone(),
+            }
+        } else {
+            env.clone()
+        };
+        let def_line = match self.call_stack.last() {
+            Some(frame) => frame.line,
+            None => 1,
+        };
+        Ok(Function {
+            name: Rc::from("<lambda>"),
+            params: bound,
+            body: FunctionBody::Expression(body.clone()),
             closure,
             filename: self.current_filename(),
             def_line,
@@ -989,6 +1116,7 @@ impl Interp {
             Expr::Int(value) => Ok(Value::Int(*value)),
             Expr::Float(value) => Ok(Value::Float(*value)),
             Expr::Str(text) => Ok(Value::Str(text.clone())),
+            Expr::Bytes(data) => Ok(Value::Bytes(data.clone())),
             Expr::Name(name) => self.lookup_name(env, name),
             Expr::List(items) => {
                 let mut values = Vec::with_capacity(items.len());
@@ -1018,6 +1146,46 @@ impl Interp {
                     dict_set(&mut values, key, value);
                 }
                 Ok(Value::dict(values))
+            }
+            Expr::Set(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    let value = self.eval_expr(item, env)?;
+                    if !value.is_hashable() {
+                        return Err(self.err(
+                            "TypeError",
+                            format!("unhashable type: '{}'", value.type_name()),
+                        ));
+                    }
+                    set_insert(&mut values, value);
+                }
+                Ok(Value::set(values))
+            }
+            Expr::FString(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        FStringPart::Text(text) => out.push_str(text),
+                        FStringPart::Value {
+                            expression,
+                            spec,
+                            conversion,
+                        } => {
+                            let value = self.eval_expr(expression, env)?;
+                            out.push_str(&builtins::format_value(
+                                self,
+                                &value,
+                                spec.as_deref(),
+                                *conversion,
+                            )?);
+                        }
+                    }
+                }
+                Ok(Value::Str(Rc::from(out.as_str())))
+            }
+            Expr::Lambda { params, body } => {
+                let function = self.make_lambda_function(params, body, env)?;
+                Ok(Value::Function(Rc::new(function)))
             }
             Expr::Unary { op, value } => {
                 let value = self.eval_expr(value, env)?;
@@ -1142,6 +1310,15 @@ impl Interp {
                 element,
                 generators,
             } => self.eval_list_comprehension(element, generators, env),
+            Expr::SetComp {
+                element,
+                generators,
+            } => self.eval_set_comprehension(element, generators, env),
+            Expr::DictComp {
+                key,
+                value,
+                generators,
+            } => self.eval_dict_comprehension(key, value, generators, env),
             Expr::IfExpr {
                 body,
                 condition,
@@ -1182,6 +1359,121 @@ impl Interp {
         self.release_env(comp_env);
         outcome?;
         Ok(Value::list(items))
+    }
+
+    fn eval_set_comprehension(
+        &mut self,
+        element: &Expr,
+        generators: &[CompGen],
+        env: &EnvRef,
+    ) -> PyResult<Value> {
+        let comp_env = Env::new(Some(env.clone()));
+        let mut items = Vec::new();
+        let outcome = self.run_set_generators(generators, 0, &comp_env, element, &mut items);
+        self.release_env(comp_env);
+        outcome?;
+        Ok(Value::set(items))
+    }
+
+    fn run_set_generators(
+        &mut self,
+        generators: &[CompGen],
+        index: usize,
+        env: &EnvRef,
+        element: &Expr,
+        out: &mut Vec<Value>,
+    ) -> PyResult<()> {
+        if index >= generators.len() {
+            let value = self.eval_expr(element, env)?;
+            if !value.is_hashable() {
+                return Err(self.err(
+                    "TypeError",
+                    format!("unhashable type: '{}'", value.type_name()),
+                ));
+            }
+            set_insert(out, value);
+            return Ok(());
+        }
+        let generator = &generators[index];
+        let iterable = self.eval_expr(&generator.iterable, env)?;
+        let iterator = self.make_iterator(iterable)?;
+        while let Some(item) = self.next_from_iterator(&iterator)? {
+            self.assign_target(&generator.target, item, env)?;
+            let mut keep = true;
+            for condition in &generator.conditions {
+                if !self.eval_expr(condition, env)?.truthy() {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                self.run_set_generators(generators, index + 1, env, element, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn eval_dict_comprehension(
+        &mut self,
+        key: &Expr,
+        value: &Expr,
+        generators: &[CompGen],
+        env: &EnvRef,
+    ) -> PyResult<Value> {
+        let comp_env = Env::new(Some(env.clone()));
+        let mut entries: Vec<(Value, Value)> = Vec::new();
+        let outcome =
+            self.run_dict_generators(generators, 0, &comp_env, key, value, &mut entries);
+        self.release_env(comp_env);
+        outcome?;
+        Ok(Value::dict(entries))
+    }
+
+    fn run_dict_generators(
+        &mut self,
+        generators: &[CompGen],
+        index: usize,
+        env: &EnvRef,
+        key_expression: &Expr,
+        value_expression: &Expr,
+        out: &mut Vec<(Value, Value)>,
+    ) -> PyResult<()> {
+        if index >= generators.len() {
+            let key = self.eval_expr(key_expression, env)?;
+            if !key.is_hashable() {
+                return Err(self.err(
+                    "TypeError",
+                    format!("unhashable type: '{}'", key.type_name()),
+                ));
+            }
+            let value = self.eval_expr(value_expression, env)?;
+            dict_set(out, key, value);
+            return Ok(());
+        }
+        let generator = &generators[index];
+        let iterable = self.eval_expr(&generator.iterable, env)?;
+        let iterator = self.make_iterator(iterable)?;
+        while let Some(item) = self.next_from_iterator(&iterator)? {
+            self.assign_target(&generator.target, item, env)?;
+            let mut keep = true;
+            for condition in &generator.conditions {
+                if !self.eval_expr(condition, env)?.truthy() {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                self.run_dict_generators(
+                    generators,
+                    index + 1,
+                    env,
+                    key_expression,
+                    value_expression,
+                    out,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn run_generators(
@@ -1289,7 +1581,12 @@ impl Interp {
             name: function.name.clone(),
             line: function.def_line,
         });
-        let outcome = self.exec_block(&function.body, &env);
+        let outcome = match &function.body {
+            FunctionBody::Block(body) => self.exec_block(body, &env),
+            FunctionBody::Expression(expression) => self
+                .eval_expr(expression, &env)
+                .map(Flow::Return),
+        };
         self.call_stack.pop();
         self.depth -= 1;
         self.release_env(env);
@@ -1514,6 +1811,32 @@ impl Interp {
                 }
             }
             BuiltinType::Dict => self.construct_dict(args, kwargs),
+            BuiltinType::Set => {
+                if !kwargs.is_empty() || args.len() > 1 {
+                    return Err(self.err(
+                        "TypeError",
+                        String::from("set() takes at most one argument"),
+                    ));
+                }
+                match args.get(0) {
+                    Some(value) => {
+                        let items = self.collect_iterable(value.clone())?;
+                        let mut unique = Vec::with_capacity(items.len());
+                        for item in items {
+                            if !item.is_hashable() {
+                                return Err(self.err(
+                                    "TypeError",
+                                    format!("unhashable type: '{}'", item.type_name()),
+                                ));
+                            }
+                            set_insert(&mut unique, item);
+                        }
+                        Ok(Value::set(unique))
+                    }
+                    None => Ok(Value::set(Vec::new())),
+                }
+            }
+            BuiltinType::Bytes => self.construct_bytes(args, kwargs),
             BuiltinType::Type => {
                 if !kwargs.is_empty() || args.len() != 1 {
                     return Err(self.err(
@@ -1735,6 +2058,104 @@ impl Interp {
         Ok(Value::dict(entries))
     }
 
+    /// `bytes()`, `bytes(iterable_of_int)`, `bytes(bytes)`, `bytes(int)`
+    /// (zero bytes) and `bytes(str, "utf-8")`.
+    pub(crate) fn construct_bytes(
+        &mut self,
+        args: &ArgList,
+        kwargs: &[(Name, Value)],
+    ) -> PyResult<Value> {
+        if let Some((name, _)) = kwargs.first() {
+            return Err(self.err(
+                "TypeError",
+                format!("bytes() got an unexpected keyword argument '{}'", name),
+            ));
+        }
+        if args.len() > 2 {
+            return Err(self.err(
+                "TypeError",
+                format!("bytes() takes at most 2 arguments ({} given)", args.len()),
+            ));
+        }
+        let Some(value) = args.get(0) else {
+            return Ok(Value::bytes(Vec::new()));
+        };
+        match value {
+            Value::Bytes(data) => Ok(Value::Bytes(data.clone())),
+            Value::Str(text) => {
+                let encoding = match args.get(1) {
+                    Some(Value::Str(encoding)) => String::from(&**encoding),
+                    Some(other) => {
+                        return Err(self.err(
+                            "TypeError",
+                            format!(
+                                "bytes() encoding must be str, not '{}'",
+                                other.type_name()
+                            ),
+                        ))
+                    }
+                    None => {
+                        return Err(self.err(
+                            "TypeError",
+                            String::from("string argument without an encoding"),
+                        ))
+                    }
+                };
+                if !is_utf8_name(&encoding) {
+                    return Err(self.err(
+                        "LookupError",
+                        format!("unknown encoding: {}", encoding),
+                    ));
+                }
+                Ok(Value::bytes(text.as_bytes().to_vec()))
+            }
+            other => {
+                if let Some(count) = other.as_int() {
+                    if count < 0 {
+                        return Err(self.err(
+                            "ValueError",
+                            String::from("negative count for bytes()"),
+                        ));
+                    }
+                    if count > 1_000_000 {
+                        return Err(self.err(
+                            "MemoryError",
+                            String::from("bytes() result is too large for the 1 MiB heap"),
+                        ));
+                    }
+                    return Ok(Value::bytes(alloc::vec![0u8; count as usize]));
+                }
+                let items = self.collect_iterable(other.clone())?;
+                let mut data = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    match item.as_int() {
+                        Some(number) if (0..=255).contains(&number) => data.push(number as u8),
+                        Some(_) => {
+                            return Err(self.err(
+                                "ValueError",
+                                format!(
+                                    "bytes must be in range(0, 256) (element {} is {})",
+                                    index,
+                                    item.to_repr()
+                                ),
+                            ))
+                        }
+                        None => {
+                            return Err(self.err(
+                                "TypeError",
+                                format!(
+                                    "bytes() argument must be an integer or iterable of                                      integers, not '{}'",
+                                    item.type_name()
+                                ),
+                            ))
+                        }
+                    }
+                }
+                Ok(Value::bytes(data))
+            }
+        }
+    }
+
     pub fn type_of(&self, value: &Value) -> PyResult<Value> {
         if let Value::Instance(instance) = value {
             return Ok(Value::Class(instance.class.clone()));
@@ -1796,6 +2217,18 @@ impl Interp {
                 items.extend(a.iter().cloned());
                 items.extend(b.iter().cloned());
                 Ok(Value::tuple(items))
+            }
+            (Value::Bytes(a), Value::Bytes(b)) => {
+                if a.len().saturating_add(b.len()) > 1_000_000 {
+                    return Err(self.err(
+                        "MemoryError",
+                        String::from("bytes concatenation is too large for the 1 MiB heap"),
+                    ));
+                }
+                let mut data = Vec::with_capacity(a.len() + b.len());
+                data.extend(a.iter().copied());
+                data.extend(b.iter().copied());
+                Ok(Value::bytes(data))
             }
             _ => Err(self.err(
                 "TypeError",
@@ -1881,6 +2314,16 @@ impl Interp {
             return Ok(Value::Str(Rc::from(text.repeat(count))));
         }
         match (&left, &right) {
+            (Value::Bytes(data), _) => {
+                if let Some(count) = right.as_int() {
+                    return self.repeat_bytes(data, count);
+                }
+            }
+            (_, Value::Bytes(data)) => {
+                if let Some(count) = left.as_int() {
+                    return self.repeat_bytes(data, count);
+                }
+            }
             (Value::List(items), _) => {
                 if let Some(count) = right.as_int() {
                     return self.repeat_list(items, count);
@@ -1942,6 +2385,21 @@ impl Interp {
             result.extend(items.iter().cloned());
         }
         Ok(Value::tuple(result))
+    }
+
+    fn repeat_bytes(&self, data: &Rc<Vec<u8>>, count: i64) -> PyResult<Value> {
+        let count = if count < 0 { 0 } else { count as usize };
+        if data.len().saturating_mul(count) > 1_000_000 {
+            return Err(self.err(
+                "MemoryError",
+                String::from("bytes repetition is too large for the 1 MiB heap"),
+            ));
+        }
+        let mut out = Vec::with_capacity(data.len() * count);
+        for _ in 0..count {
+            out.extend(data.iter().copied());
+        }
+        Ok(Value::bytes(out))
     }
 
     /// `/` always produces a float, including for two integers (`1 / 2` is
@@ -2105,6 +2563,17 @@ impl Interp {
             CmpOp::Is => Ok(is_same(left, right)),
             CmpOp::IsNot => Ok(!is_same(left, right)),
             CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+                if let (Value::Set(a), Value::Set(b)) = (left, right) {
+                    let a = a.borrow();
+                    let b = b.borrow();
+                    let subset = set_is_subset(&a, &b);
+                    return Ok(match op {
+                        CmpOp::Lt => subset && a.len() < b.len(),
+                        CmpOp::Le => subset,
+                        CmpOp::Gt => set_is_subset(&b, &a) && b.len() < a.len(),
+                        _ => set_is_subset(&b, &a),
+                    });
+                }
                 let ordering = match self.numeric_ordering(left, right) {
                     Some(ordering) => ordering,
                     None => Some(self.cmp_values(left, right)?),
@@ -2174,6 +2643,7 @@ impl Interp {
         }
         match (left, right) {
             (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
+            (Value::Bytes(a), Value::Bytes(b)) => Ok(a.as_slice().cmp(b.as_slice())),
             (Value::List(a), Value::List(b)) => {
                 let a = a.borrow();
                 let b = b.borrow();
@@ -2207,6 +2677,34 @@ impl Interp {
                 }
                 Ok(dict_get(&entries.borrow(), item).is_some())
             }
+            Value::Set(items) => {
+                if !item.is_hashable() {
+                    return Err(self.err(
+                        "TypeError",
+                        format!("unhashable type: '{}'", item.type_name()),
+                    ));
+                }
+                Ok(set_find(&items.borrow(), item).is_some())
+            }
+            Value::Bytes(data) => match item {
+                Value::Int(number) => {
+                    if !(0..=255).contains(number) {
+                        return Err(self.err(
+                            "ValueError",
+                            String::from("byte must be in range(0, 256)"),
+                        ));
+                    }
+                    Ok(data.iter().any(|byte| *byte as i64 == *number))
+                }
+                Value::Bytes(needle) => Ok(find_bytes(data, needle)),
+                other => Err(self.err(
+                    "TypeError",
+                    format!(
+                        "a bytes-like object is required, not '{}'",
+                        other.type_name()
+                    ),
+                )),
+            },
             Value::Str(text) => match item {
                 Value::Str(needle) => Ok(text.contains(&**needle)),
                 _ => Err(self.err(
@@ -2256,6 +2754,17 @@ impl Interp {
                 match position.and_then(|position| chars.get(position)) {
                     Some(ch) => Ok(Value::Str(Rc::from(ch.to_string()))),
                     None => Err(self.err("IndexError", String::from("string index out of range"))),
+                }
+            }
+            Value::Bytes(data) => {
+                let number = self.require_int(index, "bytes indices must be integers")?;
+                let position = normalize_index(number, data.len());
+                match position.and_then(|position| data.get(position)) {
+                    Some(byte) => Ok(Value::Int(*byte as i64)),
+                    None => Err(self.err(
+                        "IndexError",
+                        String::from("bytes index out of range"),
+                    )),
                 }
             }
             Value::Dict(entries) => {
@@ -2433,6 +2942,26 @@ impl Interp {
                 }
                 Ok(Value::tuple(out))
             }
+            Value::Bytes(data) => {
+                let mut out = Vec::new();
+                let mut position = start;
+                if step > 0 {
+                    while position < stop {
+                        if let Some(byte) = data.get(position as usize) {
+                            out.push(*byte);
+                        }
+                        position += step;
+                    }
+                } else {
+                    while position > stop {
+                        if let Some(byte) = data.get(position as usize) {
+                            out.push(*byte);
+                        }
+                        position += step;
+                    }
+                }
+                Ok(Value::bytes(out))
+            }
             _ => Err(self.err(
                 "TypeError",
                 format!("'{}' object is not sliceable", target.type_name()),
@@ -2496,7 +3025,20 @@ impl Interp {
     pub fn get_attribute(&mut self, target: &Value, name: &str) -> PyResult<Value> {
         match target {
             Value::Str(_) => {
+                if name == "encode" {
+                    return Ok(Value::method(BuiltinId::StrEncode, target.clone()));
+                }
                 if let Some(id) = string_method(name) {
+                    return Ok(Value::method(id, target.clone()));
+                }
+            }
+            Value::Bytes(_) => {
+                if let Some(id) = bytes_method(name) {
+                    return Ok(Value::method(id, target.clone()));
+                }
+            }
+            Value::Set(_) => {
+                if let Some(id) = set_method(name) {
                     return Ok(Value::method(id, target.clone()));
                 }
             }
@@ -2511,6 +3053,12 @@ impl Interp {
                 }
             }
             Value::File(_) => {
+                if name == "__enter__" {
+                    return Ok(Value::method(BuiltinId::FileEnter, target.clone()));
+                }
+                if name == "__exit__" {
+                    return Ok(Value::method(BuiltinId::FileExit, target.clone()));
+                }
                 if let Some(value) = self.file_attribute(target, name) {
                     return value;
                 }
@@ -2657,6 +3205,16 @@ impl Interp {
                     index: 0,
                 },
             )))),
+            Value::Set(items) => Ok(Value::Iterator(Rc::new(RefCell::new(
+                IterState::SetElems {
+                    items: items.clone(),
+                    index: 0,
+                },
+            )))),
+            Value::Bytes(data) => Ok(Value::Iterator(Rc::new(RefCell::new(IterState::Bytes {
+                data: data.clone(),
+                index: 0,
+            })))),
             Value::File(file) => Ok(Value::Iterator(Rc::new(RefCell::new(IterState::File {
                 file: file.clone(),
             })))),
@@ -2711,6 +3269,12 @@ impl Interp {
         }
         if module == "math" {
             return self.math_module();
+        }
+        if module == "os" {
+            return self.os_module();
+        }
+        if module == "json" {
+            return self.json_module();
         }
         if let Some((_, value)) = self.module_cache.iter().find(|(name, _)| name == module) {
             return Ok(value.clone());
@@ -2826,6 +3390,128 @@ impl Interp {
         self.module_cache
             .push((String::from("math"), module.clone()));
         Ok(module)
+    }
+
+    /// The built-in `os` module. `environ` is a snapshot of the process
+    /// environment; there is no `putenv` in the ABI, so writing to the dict
+    /// changes only the Python copy.
+    fn os_module(&mut self) -> PyResult<Value> {
+        if let Some((_, value)) = self.module_cache.iter().find(|(name, _)| name == "os") {
+            return Ok(value.clone());
+        }
+        let mut attrs: Vec<(Rc<str>, Value)> = Vec::new();
+        for (name, id) in [
+            ("getpid", BuiltinId::OsGetpid),
+            ("getppid", BuiltinId::OsGetppid),
+            ("getcwd", BuiltinId::OsGetcwd),
+            ("listdir", BuiltinId::OsListdir),
+            ("mkdir", BuiltinId::OsMkdir),
+            ("makedirs", BuiltinId::OsMakedirs),
+            ("remove", BuiltinId::OsRemove),
+            ("rmdir", BuiltinId::OsRmdir),
+            ("rename", BuiltinId::OsRename),
+            ("stat", BuiltinId::OsStat),
+            ("fork", BuiltinId::OsFork),
+            ("execv", BuiltinId::OsExecv),
+            ("waitpid", BuiltinId::OsWaitpid),
+            ("wait", BuiltinId::OsWait),
+            ("system", BuiltinId::OsSystem),
+        ] {
+            attrs.push((Rc::from(name), Value::builtin(id)));
+        }
+        let mut environment: Vec<(Value, Value)> = Vec::new();
+        for (key, value) in platform::vars() {
+            dict_set(
+                &mut environment,
+                Value::Str(Rc::from(key.as_str())),
+                Value::Str(Rc::from(value.as_str())),
+            );
+        }
+        if !environment
+            .iter()
+            .any(|(key, _)| matches!(key, Value::Str(text) if &**text == "PWD"))
+        {
+            dict_set(
+                &mut environment,
+                Value::str("PWD"),
+                Value::Str(Rc::from(platform::current_dir().as_str())),
+            );
+        }
+        attrs.push((Rc::from("environ"), Value::dict(environment)));
+        attrs.push((Rc::from("sep"), Value::str("/")));
+        attrs.push((Rc::from("linesep"), Value::str("\n")));
+        let stat_class = self.ensure_stat_class()?;
+        attrs.push((Rc::from("stat_result"), Value::Class(stat_class)));
+        let module = Value::Module(Rc::new(ModuleValue {
+            name: Rc::from("os"),
+            attrs: RefCell::new(attrs),
+        }));
+        self.module_cache
+            .push((String::from("os"), module.clone()));
+        Ok(module)
+    }
+
+    fn json_module(&mut self) -> PyResult<Value> {
+        if let Some((_, value)) = self.module_cache.iter().find(|(name, _)| name == "json") {
+            return Ok(value.clone());
+        }
+        let mut attrs: Vec<(Rc<str>, Value)> = Vec::new();
+        attrs.push((Rc::from("dumps"), Value::builtin(BuiltinId::JsonDumps)));
+        attrs.push((Rc::from("loads"), Value::builtin(BuiltinId::JsonLoads)));
+        let module = Value::Module(Rc::new(ModuleValue {
+            name: Rc::from("json"),
+            attrs: RefCell::new(attrs),
+        }));
+        self.module_cache
+            .push((String::from("json"), module.clone()));
+        Ok(module)
+    }
+
+    fn ensure_stat_class(&mut self) -> PyResult<Rc<Class>> {
+        if let Some(class) = &self.stat_class {
+            return Ok(class.clone());
+        }
+        let object = match self.class_for(BuiltinType::Object) {
+            Some(class) => class,
+            None => {
+                return Err(self.err(
+                    "RuntimeError",
+                    String::from("interpreter is missing the object class"),
+                ))
+            }
+        };
+        let class = Rc::new(Class {
+            name: Rc::from("os.stat_result"),
+            bases: alloc::vec![object],
+            attrs: RefCell::new(Vec::new()),
+            builtin: None,
+            is_exception: false,
+        });
+        self.stat_class = Some(class.clone());
+        Ok(class)
+    }
+
+    /// Build the small `os.stat_result` object: size, mode, kind and two
+    /// convenience booleans.
+    pub(crate) fn make_stat_value(&mut self, size: u64, mode: u32, kind: u32) -> PyResult<Value> {
+        let class = self.ensure_stat_class()?;
+        let instance = Instance {
+            class,
+            attrs: RefCell::new(Vec::new()),
+        };
+        let size = i64::try_from(size).unwrap_or(i64::MAX);
+        let kind_name = match kind {
+            0 => "file",
+            1 => "dir",
+            2 => "symlink",
+            _ => "other",
+        };
+        attr_set(&instance.attrs, Rc::from("st_size"), Value::Int(size));
+        attr_set(&instance.attrs, Rc::from("st_mode"), Value::Int(mode as i64));
+        attr_set(&instance.attrs, Rc::from("st_kind"), Value::str(kind_name));
+        attr_set(&instance.attrs, Rc::from("st_isdir"), Value::Bool(kind == 1));
+        attr_set(&instance.attrs, Rc::from("st_isfile"), Value::Bool(kind == 0));
+        Ok(Value::Instance(Rc::new(instance)))
     }
 
     fn sys_module(&mut self) -> PyResult<Value> {
@@ -2968,6 +3654,7 @@ fn target_len(target: &Value) -> i64 {
         Value::Str(text) => text.chars().count() as i64,
         Value::List(items) => items.borrow().len() as i64,
         Value::Tuple(items) => items.len() as i64,
+        Value::Bytes(data) => data.len() as i64,
         _ => 0,
     }
 }
@@ -3027,6 +3714,54 @@ fn op_text(op: BinOp) -> &'static str {
         BinOp::Mod => "%",
         BinOp::Pow => "**",
     }
+}
+
+fn set_method(name: &str) -> Option<BuiltinId> {
+    Some(match name {
+        "add" => BuiltinId::SetAdd,
+        "remove" => BuiltinId::SetRemove,
+        "discard" => BuiltinId::SetDiscard,
+        "union" => BuiltinId::SetUnion,
+        "intersection" => BuiltinId::SetIntersection,
+        "difference" => BuiltinId::SetDifference,
+        "issubset" => BuiltinId::SetIssubset,
+        "issuperset" => BuiltinId::SetSuperset,
+        "copy" => BuiltinId::SetCopy,
+        "clear" => BuiltinId::SetClear,
+        _ => return None,
+    })
+}
+
+fn bytes_method(name: &str) -> Option<BuiltinId> {
+    Some(match name {
+        "decode" => BuiltinId::BytesDecode,
+        "hex" => BuiltinId::BytesHex,
+        _ => return None,
+    })
+}
+
+fn set_is_subset(left: &[Value], right: &[Value]) -> bool {
+    left.iter()
+        .all(|item| value::set_find(right, item).is_some())
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn is_utf8_name(name: &str) -> bool {
+    matches!(
+        name,
+        "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8"
+    )
 }
 
 fn string_method(name: &str) -> Option<BuiltinId> {

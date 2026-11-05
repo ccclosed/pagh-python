@@ -22,6 +22,8 @@ mod error;
 mod float;
 #[path = "../../src/interp.rs"]
 mod interp;
+#[path = "../../src/json.rs"]
+mod json;
 #[path = "../../src/lexer.rs"]
 mod lexer;
 #[path = "../../src/parser.rs"]

@@ -337,6 +337,316 @@ fn imports() -> Result<(), String> {
     result
 }
 
+fn lambdas() -> Result<(), String> {
+    expect_repr("f = lambda x: x + 1\nx = f(4)", "x", "5")?;
+    expect_repr("f = lambda x, y=10: x + y\nx = (f(5), f(5, 1))", "x", "(15, 6)")?;
+    expect_repr(
+        "def outer(n):\n    return lambda x: x + n\nf = outer(7)\nx = f(3)",
+        "x",
+        "10",
+    )?;
+    expect_repr(
+        "x = sorted([\"ccc\", \"a\", \"bb\"], key=lambda value: len(value))",
+        "x",
+        "['a', 'bb', 'ccc']",
+    )?;
+    expect_repr(
+        "x = list(map(lambda value: value * 2, [1, 2, 3]))",
+        "x",
+        "[2, 4, 6]",
+    )?;
+    expect_repr(
+        "x = list(map(lambda a, b: a + b, [1, 2], [10, 20, 30]))",
+        "x",
+        "[11, 22]",
+    )?;
+    expect_repr("x = (lambda: 42)()", "x", "42")?;
+    Ok(())
+}
+
+fn with_statement() -> Result<(), String> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("pagh-python-with-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path)
+        .map_err(|error| format!("cannot create {}: {}", path.display(), error))?;
+    let file = path.join("with.txt");
+    let script = format!(
+        r#"p = "{file}"
+with open(p, "w") as out:
+    out.write("alpha\nbeta\n")
+with open(p) as source:
+    x = source.read()
+y = open(p).read()
+with open(p, "w") as out:
+    out.write("closed")
+z = source.closed"#,
+        file = file.display()
+    );
+    let interpreter = run_source(&script, None)?;
+    for (name, expected) in [
+        ("x", "'alpha\\nbeta\\n'"),
+        ("y", "'alpha\\nbeta\\n'"),
+        ("z", "True"),
+    ] {
+        match env_lookup(&interpreter.module_env, name) {
+            Some(value) => {
+                let actual = value.to_repr();
+                if actual != expected {
+                    let _ = std::fs::remove_dir_all(&path);
+                    return Err(format!("{}: expected {}, got {}", name, expected, actual));
+                }
+            }
+            None => {
+                let _ = std::fs::remove_dir_all(&path);
+                return Err(format!("{} was not defined", name));
+            }
+        }
+    }
+    let contents = std::fs::read_to_string(&file)
+        .map_err(|error| format!("cannot read {}: {}", file.display(), error))?;
+    let _ = std::fs::remove_dir_all(&path);
+    if contents != "closed" {
+        return Err(format!("unexpected file contents: {:?}", contents));
+    }
+    expect_repr(
+        r#"class Box:
+    def __init__(self):
+        self.events = []
+    def __enter__(self):
+        self.events.append("enter")
+        return self
+    def __exit__(self, kind, value, tb):
+        self.events.append((kind, value, tb))
+        return False
+b = Box()
+with b:
+    b.events.append("body")
+x = b.events"#,
+        "x",
+        "['enter', 'body', (None, None, None)]",
+    )?;
+    expect_repr(
+        r#"class Suppress:
+    def __enter__(self):
+        return self
+    def __exit__(self, kind, value, tb):
+        self.seen = (kind.__name__, str(value))
+        return True
+with Suppress() as s:
+    raise ValueError("boom")
+x = s.seen"#,
+        "x",
+        "('ValueError', 'boom')",
+    )?;
+    expect_repr(
+        r#"class Name:
+    def __init__(self, value):
+        self.value = value
+    def __enter__(self):
+        return self.value
+    def __exit__(self, kind, value, tb):
+        return False
+with Name("a") as a, Name("b") as b:
+    x = a + b"#,
+        "x",
+        "'ab'",
+    )?;
+    Ok(())
+}
+
+fn sets() -> Result<(), String> {
+    expect_repr("x = {1, 2, 2, 3}", "x", "{1, 2, 3}")?;
+    expect_repr("x = set([1, 2, 2])", "x", "{1, 2}")?;
+    expect_repr("x = len({1, 1, 2})", "x", "2")?;
+    expect_repr("x = 2 in {1, 2, 3}", "x", "True")?;
+    expect_repr("x = {1, 2} == {2, 1}", "x", "True")?;
+    expect_repr("x = sorted({3, 1, 2})", "x", "[1, 2, 3]")?;
+    expect_repr(
+        "a = {1, 2}\na.add(3)\na.discard(9)\na.remove(1)\nx = sorted(a)",
+        "x",
+        "[2, 3]",
+    )?;
+    expect_repr(
+        "x = sorted({1, 2}.union({2, 3})), sorted({1, 2, 3}.intersection({2, 3, 4})), sorted({1, 2, 3}.difference({2}))",
+        "x",
+        "([1, 2, 3], [2, 3], [1, 3])",
+    )?;
+    expect_repr(
+        "x = ({1, 2}.issubset({1, 2, 3}), {1, 2, 3}.issuperset({1, 2}), {1, 2}.issubset([1, 2, 3]))",
+        "x",
+        "(True, True, True)",
+    )?;
+    expect_repr("x = sorted({value * value for value in range(5) if value % 2 == 0})", "x", "[0, 4, 16]")?;
+    expect_repr("x = {key: value for key, value in [(1, 'a'), (2, 'b')]}", "x", "{1: 'a', 2: 'b'}")?;
+    expect_repr(
+        "try:\n    {1, 2}.remove(9)\nexcept KeyError:\n    x = 'missing'",
+        "x",
+        "'missing'",
+    )?;
+    Ok(())
+}
+
+fn bytes_values() -> Result<(), String> {
+    expect_repr(r#"x = b"abc""#, "x", "b'abc'")?;
+    expect_repr(r#"x = b"a\nb\x41\t""#, "x", "b'a\\nbA\\t'")?;
+    expect_repr(r#"x = len(b"abc")"#, "x", "3")?;
+    expect_repr(r#"x = b"abc"[1]"#, "x", "98")?;
+    expect_repr(r#"x = b"abcdef"[1:4]"#, "x", "b'bcd'")?;
+    expect_repr(r#"x = b"abc" + b"de""#, "x", "b'abcde'")?;
+    expect_repr(r#"x = b"ab" * 2"#, "x", "b'abab'")?;
+    expect_repr(r#"x = b"abc" == b"abc", b"abc" == b"abd""#, "x", "(True, False)")?;
+    expect_repr(r#"x = b"abc" < b"abd""#, "x", "True")?;
+    expect_repr(r#"x = b"abc".decode(), "hello".encode()"#, "x", "('abc', b'hello')")?;
+    expect_repr(r#"x = bytes([65, 66, 67])"#, "x", "b'ABC'")?;
+    expect_repr(r#"x = bytes(3)"#, "x", "b'\\x00\\x00\\x00'")?;
+    expect_repr(r#"x = bytes("hi", "utf-8")"#, "x", "b'hi'")?;
+    expect_repr(r#"x = list(b"ab")"#, "x", "[97, 98]")?;
+    expect_repr(r#"x = b"abc" in b"xxabcxx", 97 in b"abc""#, "x", "(True, True)")?;
+    Ok(())
+}
+
+fn fstrings() -> Result<(), String> {
+    expect_repr(r#"name = "pagh"
+x = f"hello {name}""#, "x", "'hello pagh'")?;
+    expect_repr("value = 3.14159\nx = f\"{value:.2f}\"", "x", "'3.14'")?;
+    expect_repr("x = f\"{42:d}\"", "x", "'42'")?;
+    expect_repr("name = 'pagh'\nx = f\"{name!r}\" == repr(name)", "x", "True")?;
+    expect_repr("x = f\"{{literal}}\"", "x", "'{literal}'")?;
+    expect_repr("x = f\"{7:>5d}|{7:<5d}|{7:^5d}\"", "x", "'    7|7    |  7  '")?;
+    expect_repr("x = f\"{255:x}\"", "x", "'ff'")?;
+    expect_repr("x = f\"{1.0}\"", "x", "'1.0'")?;
+    expect_repr("x = f\"a\" f\"b\"", "x", "'ab'")?;
+    Ok(())
+}
+
+fn json_module() -> Result<(), String> {
+    expect_repr(
+        "import json\nv = {\"a\": [1, 2.5, True, None], \"s\": 'q\"x\\\\n', \"u\": \"привет\"}\nt = json.dumps(v)\nx = (json.loads(t) == v, t.startswith('{\"a\": [1, 2.5, true, null]'), '\\\\u043f' in t)",
+        "x",
+        "(True, True, True)",
+    )?;
+    expect_repr("import json\nx = json.dumps([1, -2, 3.0, False, None])", "x", "'[1, -2, 3.0, false, null]'")?;
+    expect_repr(
+        "import json\nx = json.loads('{\"x\": 1, \"y\": [true, false, null, -0.5e2]}')",
+        "x",
+        "{'x': 1, 'y': [True, False, None, -50.0]}",
+    )?;
+    expect_repr("import json\nx = json.loads('\"hi\\\\nthere\"')", "x", "'hi\\nthere'")?;
+    expect_repr("import json\nx = json.loads('null')", "x", "None")?;
+    expect_repr(
+        "import json\ntry:\n    json.loads('{bad}')\nexcept ValueError as error:\n    x = type(error).__name__",
+        "x",
+        "'JSONDecodeError'",
+    )?;
+    Ok(())
+}
+
+fn os_module() -> Result<(), String> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("pagh-python-os-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path)
+        .map_err(|error| format!("cannot create {}: {}", path.display(), error))?;
+    let script = format!(
+        "import os\n\
+         os.mkdir(\"{0}/one\")\n\
+         os.makedirs(\"{0}/two/three\")\n\
+         x1 = sorted(os.listdir(\"{0}\"))\n\
+         p = \"{0}/f.txt\"\n\
+         f = open(p, \"w\")\n\
+         f.write(\"xy\")\n\
+         f.close()\n\
+         st = os.stat(p)\n\
+         x2 = (st.st_size, st.st_kind, st.st_isfile, st.st_isdir)\n\
+         os.rename(p, \"{0}/g.txt\")\n\
+         x3 = os.stat(\"{0}/g.txt\").st_size\n\
+         os.remove(\"{0}/g.txt\")\n\
+         os.rmdir(\"{0}/one\")\n\
+         x4 = sorted(os.listdir(\"{0}\"))\n\
+         x5 = (\"PWD\" in os.environ, os.getpid() > 0, os.getppid() >= 0, len(os.getcwd()) > 0)\n\
+         x6 = sorted(os.listdir(\"{0}/two\"))\n\
+         d = os.stat(\"{0}/two\")\n\
+         x7 = (d.st_kind, d.st_isdir, d.st_isfile)",
+        path.display()
+    );
+    let interpreter = match run_source(&script, None) {
+        Ok(interpreter) => interpreter,
+        Err(message) => {
+            let _ = std::fs::remove_dir_all(&path);
+            return Err(message);
+        }
+    };
+    let expected = [
+        ("x1", "['one', 'two']"),
+        ("x2", "(2, 'file', True, False)"),
+        ("x3", "2"),
+        ("x4", "['two']"),
+        ("x5", "(True, True, True, True)"),
+        ("x6", "['three']"),
+        ("x7", "('dir', True, False)"),
+    ];
+    for (name, value) in expected {
+        let result = match env_lookup(&interpreter.module_env, name) {
+            Some(actual) => {
+                let actual = actual.to_repr();
+                if actual == value {
+                    Ok(())
+                } else {
+                    Err(format!("{}: expected {}, got {}", name, value, actual))
+                }
+            }
+            None => Err(format!("{} was not defined", name)),
+        };
+        if let Err(message) = result {
+            let _ = std::fs::remove_dir_all(&path);
+            return Err(message);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&path);
+    Ok(())
+}
+
+fn binary_files() -> Result<(), String> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("pagh-python-bin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path)
+        .map_err(|error| format!("cannot create {}: {}", path.display(), error))?;
+    let file = path.join("data.bin");
+    let script = format!(
+        "p = \"{}\"\n\
+         with open(p, \"wb\") as out:\n\
+         \x20   written = out.write(b\"\\x00\\x01hi\\xff\")\n\
+         with open(p, \"rb\") as source:\n\
+         \x20   data = source.read()\n\
+         x = (written, data, len(data), data[2:4])",
+        file.display()
+    );
+    let interpreter = match run_source(&script, None) {
+        Ok(interpreter) => interpreter,
+        Err(message) => {
+            let _ = std::fs::remove_dir_all(&path);
+            return Err(message);
+        }
+    };
+    let actual = match env_lookup(&interpreter.module_env, "x") {
+        Some(value) => value.to_repr(),
+        None => String::from("x was not defined"),
+    };
+    let expected = "(5, b'\\x00\\x01hi\\xff', 5, b'hi')";
+    if actual != expected {
+        let _ = std::fs::remove_dir_all(&path);
+        return Err(format!("x: expected {}, got {}", expected, actual));
+    }
+    let contents = std::fs::read(&file).map_err(|error| format!("cannot read file: {}", error))?;
+    let _ = std::fs::remove_dir_all(&path);
+    if contents != b"\x00\x01hi\xff".to_vec() {
+        return Err(format!("unexpected bytes on disk: {:?}", contents));
+    }
+    Ok(())
+}
+
 fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
     alloc::vec![
         ("arithmetic", arithmetic as fn() -> Result<(), String>),
@@ -351,6 +661,14 @@ fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
         ("uncaught", uncaught),
         ("files", files),
         ("imports", imports),
+        ("lambdas", lambdas),
+        ("with", with_statement),
+        ("sets", sets),
+        ("bytes", bytes_values),
+        ("fstrings", fstrings),
+        ("json", json_module),
+        ("os", os_module),
+        ("binary files", binary_files),
     ]
 }
 
@@ -430,4 +748,44 @@ fn files_work() {
 #[test]
 fn imports_work() {
     imports().unwrap();
+}
+
+#[test]
+fn lambdas_work() {
+    lambdas().unwrap();
+}
+
+#[test]
+fn with_statement_works() {
+    with_statement().unwrap();
+}
+
+#[test]
+fn sets_work() {
+    sets().unwrap();
+}
+
+#[test]
+fn bytes_work() {
+    bytes_values().unwrap();
+}
+
+#[test]
+fn fstrings_work() {
+    fstrings().unwrap();
+}
+
+#[test]
+fn json_works() {
+    json_module().unwrap();
+}
+
+#[test]
+fn os_works() {
+    os_module().unwrap();
+}
+
+#[test]
+fn binary_files_work() {
+    binary_files().unwrap();
 }

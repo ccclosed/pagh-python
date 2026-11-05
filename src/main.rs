@@ -16,6 +16,7 @@ mod builtins;
 mod error;
 mod float;
 mod interp;
+mod json;
 mod lexer;
 mod parser;
 mod platform;

@@ -21,8 +21,8 @@ use crate::error::PyResult;
 use crate::interp::{ArgList, Interp};
 use crate::platform;
 use crate::value::{
-    self, dict_find, dict_get, dict_set, hex_text, is_same, range_length, values_equal, BuiltinId,
-    BuiltinType, BuiltinValue, FileValue, IterState, RangeValue, Value,
+    self, dict_find, dict_get, dict_set, hex_text, is_same, range_length, set_find, set_insert,
+    values_equal, BuiltinId, BuiltinType, BuiltinValue, FileValue, IterState, RangeValue, Value,
 };
 
 // ── dispatch ───────────────────────────────────────────────────────────────
@@ -50,6 +50,8 @@ pub fn call(
         BuiltinId::List => construct_tag(interp, BuiltinType::List, args, kwargs, "list"),
         BuiltinId::Dict => construct_tag(interp, BuiltinType::Dict, args, kwargs, "dict"),
         BuiltinId::Tuple => construct_tag(interp, BuiltinType::Tuple, args, kwargs, "tuple"),
+        BuiltinId::Set => construct_tag(interp, BuiltinType::Set, args, kwargs, "set"),
+        BuiltinId::Bytes => construct_tag(interp, BuiltinType::Bytes, args, kwargs, "bytes"),
         BuiltinId::Type => construct_tag(interp, BuiltinType::Type, args, kwargs, "type"),
         BuiltinId::IsInstance => builtin_isinstance(interp, args, kwargs),
         BuiltinId::Open => builtin_open(interp, args, kwargs),
@@ -81,6 +83,24 @@ pub fn call(
         BuiltinId::MathIsinf => math_isinf(interp, args, kwargs),
         BuiltinId::Hex => builtin_hex(interp, args, kwargs),
         BuiltinId::Id => builtin_id(interp, args, kwargs),
+        BuiltinId::Map => builtin_map(interp, args, kwargs),
+        BuiltinId::OsGetpid => os_getpid(interp, args, kwargs),
+        BuiltinId::OsGetppid => os_getppid(interp, args, kwargs),
+        BuiltinId::OsGetcwd => os_getcwd(interp, args, kwargs),
+        BuiltinId::OsListdir => os_listdir(interp, args, kwargs),
+        BuiltinId::OsMkdir => os_mkdir(interp, args, kwargs),
+        BuiltinId::OsMakedirs => os_makedirs(interp, args, kwargs),
+        BuiltinId::OsRemove => os_remove(interp, args, kwargs),
+        BuiltinId::OsRmdir => os_rmdir(interp, args, kwargs),
+        BuiltinId::OsRename => os_rename(interp, args, kwargs),
+        BuiltinId::OsStat => os_stat(interp, args, kwargs),
+        BuiltinId::OsFork => os_fork(interp, args, kwargs),
+        BuiltinId::OsExecv => os_execv(interp, args, kwargs),
+        BuiltinId::OsWaitpid => os_waitpid(interp, args, kwargs),
+        BuiltinId::OsWait => os_wait(interp, args, kwargs),
+        BuiltinId::OsSystem => os_system(interp, args, kwargs),
+        BuiltinId::JsonDumps => json_dumps(interp, args, kwargs),
+        BuiltinId::JsonLoads => json_loads(interp, args, kwargs),
         _ => call_method(interp, builtin, args, kwargs),
     }
 }
@@ -264,6 +284,436 @@ fn repr_value(interp: &mut Interp, value: &Value) -> PyResult<String> {
     Ok(value.to_repr())
 }
 
+// ── f-string / format() specs ──────────────────────────────────────────────
+
+struct FormatSpec {
+    fill: char,
+    align: Option<char>,
+    sign: Option<char>,
+    alternate: bool,
+    zero: bool,
+    width: usize,
+    grouping: bool,
+    precision: Option<usize>,
+    kind: Option<char>,
+}
+
+fn parse_format_spec(interp: &Interp, spec: &str) -> PyResult<FormatSpec> {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut parsed = FormatSpec {
+        fill: ' ',
+        align: None,
+        sign: None,
+        alternate: false,
+        zero: false,
+        width: 0,
+        grouping: false,
+        precision: None,
+        kind: None,
+    };
+    let mut index = 0usize;
+    let is_align = |ch: char| matches!(ch, '<' | '>' | '^' | '=');
+    if chars.len() >= 2 && is_align(chars[1]) {
+        parsed.fill = chars[0];
+        parsed.align = Some(chars[1]);
+        index = 2;
+    } else if chars.first().map(|ch| is_align(*ch)).unwrap_or(false) {
+        parsed.align = chars.first().copied();
+        index = 1;
+    }
+    if let Some(ch) = chars.get(index).copied() {
+        if matches!(ch, '+' | '-' | ' ') {
+            parsed.sign = Some(ch);
+            index += 1;
+        }
+    }
+    if chars.get(index) == Some(&'#') {
+        parsed.alternate = true;
+        index += 1;
+    }
+    if chars.get(index) == Some(&'0') {
+        parsed.zero = true;
+        index += 1;
+    }
+    let mut width = 0usize;
+    let mut digits = 0usize;
+    while let Some(ch) = chars.get(index).copied() {
+        if let Some(digit) = ch.to_digit(10) {
+            if width > 100_000 {
+                return Err(interp.err(
+                    "ValueError",
+                    String::from("format specifier width is too large"),
+                ));
+            }
+            width = width * 10 + digit as usize;
+            digits += 1;
+            index += 1;
+        } else {
+            break;
+        }
+    }
+    if digits > 0 {
+        parsed.width = width.min(10_000);
+    }
+    if chars.get(index) == Some(&',') {
+        parsed.grouping = true;
+        index += 1;
+    }
+    if chars.get(index) == Some(&'.') {
+        index += 1;
+        let mut precision = 0usize;
+        let mut has_digits = false;
+        while let Some(ch) = chars.get(index).copied() {
+            if let Some(digit) = ch.to_digit(10) {
+                precision = precision * 10 + digit as usize;
+                has_digits = true;
+                index += 1;
+                if precision > 10_000 {
+                    return Err(interp.err(
+                        "ValueError",
+                        String::from("format specifier precision is too large"),
+                    ));
+                }
+            } else {
+                break;
+            }
+        }
+        if !has_digits {
+            return Err(interp.err(
+                "ValueError",
+                String::from("format specifier is missing precision digits"),
+            ));
+        }
+        parsed.precision = Some(precision);
+    }
+    if let Some(ch) = chars.get(index).copied() {
+        parsed.kind = Some(ch);
+        index += 1;
+    }
+    if index != chars.len() {
+        return Err(interp.err(
+            "ValueError",
+            format!("invalid format specifier '{}'", spec),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn pad_formatted(body: String, spec: &FormatSpec, numeric: bool) -> String {
+    let length = body.chars().count();
+    if spec.width <= length {
+        return body;
+    }
+    let padding = spec.width - length;
+    let default_align = if numeric { '>' } else { '<' };
+    let mut align = spec.align.unwrap_or(default_align);
+    if spec.zero && numeric && spec.align.is_none() {
+        align = '=';
+    }
+    let fill = if spec.zero && numeric { '0' } else { spec.fill };
+    match align {
+        '=' => {
+            let mut chars = body.chars();
+            let first = chars.next();
+            let Some(first) = first else {
+                return body;
+            };
+            if matches!(first, '+' | '-' | ' ') {
+                let rest: String = chars.collect();
+                let mut out = String::with_capacity(spec.width);
+                out.push(first);
+                for _ in 0..padding {
+                    out.push(fill);
+                }
+                out.push_str(&rest);
+                out
+            } else {
+                let mut out = String::with_capacity(spec.width);
+                for _ in 0..padding {
+                    out.push(fill);
+                }
+                out.push_str(&body);
+                out
+            }
+        }
+        '<' => {
+            let mut out = body;
+            for _ in 0..padding {
+                out.push(fill);
+            }
+            out
+        }
+        '^' => {
+            let left = padding / 2;
+            let right = padding - left;
+            let mut out = String::with_capacity(spec.width);
+            for _ in 0..left {
+                out.push(fill);
+            }
+            out.push_str(&body);
+            for _ in 0..right {
+                out.push(fill);
+            }
+            out
+        }
+        _ => {
+            let mut out = String::with_capacity(spec.width);
+            for _ in 0..padding {
+                out.push(fill);
+            }
+            out.push_str(&body);
+            out
+        }
+    }
+}
+
+fn group_digits(digits: &str) -> String {
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let length = digits.len();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (length - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn sign_prefix(negative: bool, spec: &FormatSpec) -> String {
+    if negative {
+        String::from("-")
+    } else {
+        match spec.sign {
+            Some('+') => String::from("+"),
+            Some(' ') => String::from(" "),
+            _ => String::new(),
+        }
+    }
+}
+
+fn format_text_value(interp: &mut Interp, value: &Value, spec: &FormatSpec) -> PyResult<String> {
+    let mut text = str_value(interp, value)?;
+    if let Some(precision) = spec.precision {
+        text = text.chars().take(precision).collect();
+    }
+    Ok(pad_formatted(text, spec, false))
+}
+
+fn format_integer_body(
+    _interp: &Interp,
+    number: i64,
+    spec: &FormatSpec,
+    radix: u32,
+    upper: bool,
+    prefix: &str,
+) -> PyResult<String> {
+    let negative = number < 0;
+    let magnitude = (number as i128).unsigned_abs();
+    let mut digits = match radix {
+        10 => format!("{}", magnitude),
+        2 => format!("{:b}", magnitude),
+        8 => format!("{:o}", magnitude),
+        16 if upper => format!("{:X}", magnitude),
+        _ => format!("{:x}", magnitude),
+    };
+    if spec.grouping && radix == 10 {
+        digits = group_digits(&digits);
+    }
+    let mut body = String::with_capacity(digits.len() + 2);
+    body.push_str(&sign_prefix(negative, spec));
+    if spec.alternate {
+        body.push_str(prefix);
+    }
+    body.push_str(&digits);
+    Ok(pad_formatted(body, spec, true))
+}
+
+fn float_special(value: f64) -> Option<&'static str> {
+    if value.is_nan() {
+        Some("nan")
+    } else if value.is_infinite() {
+        Some("inf")
+    } else {
+        None
+    }
+}
+
+fn exponent_text(mantissa: String, exponent: i32) -> String {
+    let sign = if exponent < 0 { '-' } else { '+' };
+    let magnitude = exponent.unsigned_abs();
+    format!("{}e{}{:02}", mantissa, sign, magnitude)
+}
+
+fn format_float_body(
+    _interp: &Interp,
+    value: f64,
+    spec: &FormatSpec,
+    kind: char,
+) -> PyResult<String> {
+    let negative = value.is_sign_negative() && !value.is_nan();
+    let mut digits = if let Some(special) = float_special(value) {
+        String::from(special)
+    } else {
+        match kind {
+            'f' => {
+                let precision = spec.precision.unwrap_or(6);
+                format!("{:.*}", precision, crate::float::abs(value))
+            }
+            '%' => {
+                let precision = spec.precision.unwrap_or(6);
+                let mut text = format!("{:.*}", precision, crate::float::abs(value * 100.0));
+                text.push('%');
+                text
+            }
+            'e' => {
+                let precision = spec.precision.unwrap_or(6);
+                let raw = format!("{:.*e}", precision, crate::float::abs(value));
+                match raw.split_once('e') {
+                    Some((mantissa, exponent)) => {
+                        let exponent = exponent.parse::<i32>().unwrap_or(0);
+                        exponent_text(String::from(mantissa), exponent)
+                    }
+                    None => raw,
+                }
+            }
+            _ => crate::float::format(crate::float::abs(value)),
+        }
+    };
+    if spec.grouping && (kind == 'f' || kind == '%') {
+        if let Some(dot) = digits.find('.') {
+            let (integer, fraction) = digits.split_at(dot);
+            digits = format!("{}{}", group_digits(integer), fraction);
+        } else if kind == 'f' {
+            digits = group_digits(&digits);
+        }
+    }
+    let mut body = String::with_capacity(digits.len() + 1);
+    body.push_str(&sign_prefix(negative, spec));
+    body.push_str(&digits);
+    Ok(pad_formatted(body, spec, true))
+}
+
+/// Format one value for an f-string (or, ultimately, a `format()`-like call).
+/// `spec` is the text after `:`; `conversion` is the `!r`/`!s`/`!a` letter.
+pub(crate) fn format_value(
+    interp: &mut Interp,
+    value: &Value,
+    spec: Option<&str>,
+    conversion: Option<char>,
+) -> PyResult<String> {
+    let Some(spec_text) = spec else {
+        if let Some(conversion) = conversion {
+            return match conversion {
+                'r' | 'a' => repr_value(interp, value),
+                _ => str_value(interp, value),
+            };
+        }
+        return str_value(interp, value);
+    };
+    let parsed = parse_format_spec(interp, spec_text)?;
+    if let Some(conversion) = conversion {
+        let text = match conversion {
+            'r' | 'a' => repr_value(interp, value)?,
+            _ => str_value(interp, value)?,
+        };
+        if !matches!(parsed.kind, None | Some('s')) {
+            return Err(interp.err(
+                "ValueError",
+                String::from("a numeric format spec requires a numeric value, not a conversion"),
+            ));
+        }
+        return format_text_value(interp, &Value::Str(Rc::from(text.as_str())), &parsed);
+    }
+    match parsed.kind {
+        Some('s') => format_text_value(interp, value, &parsed),
+        Some('d') => {
+            if parsed.precision.is_some() {
+                return Err(interp.err(
+                    "ValueError",
+                    String::from("precision is not allowed in an integer format specifier"),
+                ));
+            }
+            match value.as_int() {
+                Some(number) => format_integer_body(interp, number, &parsed, 10, false, ""),
+                None => Err(interp.err(
+                    "TypeError",
+                    format!(
+                        "unknown format code 'd' for object of type '{}'",
+                        value.type_name()
+                    ),
+                )),
+            }
+        }
+        Some(kind @ ('b' | 'o' | 'x' | 'X')) => {
+            if parsed.precision.is_some() {
+                return Err(interp.err(
+                    "ValueError",
+                    String::from("precision is not allowed in an integer format specifier"),
+                ));
+            }
+            let (radix, upper, prefix) = match kind {
+                'b' => (2, false, "0b"),
+                'o' => (8, false, "0o"),
+                'X' => (16, true, "0X"),
+                _ => (16, false, "0x"),
+            };
+            match value.as_int() {
+                Some(number) => format_integer_body(interp, number, &parsed, radix, upper, prefix),
+                None => Err(interp.err(
+                    "TypeError",
+                    format!(
+                        "unknown format code '{}' for object of type '{}'",
+                        kind,
+                        value.type_name()
+                    ),
+                )),
+            }
+        }
+        Some(kind @ ('f' | 'e' | 'g' | '%')) => match value.as_float() {
+            Some(number) => format_float_body(interp, number, &parsed, kind),
+            None => Err(interp.err(
+                "TypeError",
+                format!(
+                    "unknown format code '{}' for object of type '{}'",
+                    kind,
+                    value.type_name()
+                ),
+            )),
+        },
+        Some(other) => Err(interp.err(
+            "ValueError",
+            format!("unknown format code '{}'", other),
+        )),
+        None => match value {
+            Value::Str(_) => format_text_value(interp, value, &parsed),
+            Value::Bool(_) | Value::Int(_) => match value.as_int() {
+                Some(number) => format_integer_body(interp, number, &parsed, 10, false, ""),
+                None => unreachable!(),
+            },
+            Value::Float(number) => {
+                let negative = number.is_sign_negative() && !number.is_nan();
+                let mut digits = if let Some(special) = float_special(*number) {
+                    String::from(special)
+                } else {
+                    crate::float::format(crate::float::abs(*number))
+                };
+                if parsed.grouping {
+                    if let Some(dot) = digits.find('.') {
+                        let (integer, fraction) = digits.split_at(dot);
+                        digits = format!("{}{}", group_digits(integer), fraction);
+                    } else {
+                        digits = group_digits(&digits);
+                    }
+                }
+                let mut body = sign_prefix(negative, &parsed);
+                body.push_str(&digits);
+                Ok(pad_formatted(body, &parsed, true))
+            }
+            _ => format_text_value(interp, value, &parsed),
+        },
+    }
+}
+
 // ── free functions ─────────────────────────────────────────────────────────
 
 fn builtin_print(
@@ -322,6 +772,8 @@ fn builtin_len(
         Value::List(items) => items.borrow().len() as i64,
         Value::Tuple(items) => items.len() as i64,
         Value::Dict(entries) => entries.borrow().len() as i64,
+        Value::Set(items) => items.borrow().len() as i64,
+        Value::Bytes(data) => data.len() as i64,
         Value::Range(range) => range.len,
         Value::Instance(_) => match call_dunder(interp, value, "__len__")? {
             Some(result) => match result.as_int() {
@@ -725,33 +1177,12 @@ fn builtin_open(
         Some(value) => Some(value),
         None => keyword(kwargs, "encoding"),
     };
-    if let Some(value) = encoding {
-        match value {
-            Value::None => {}
-            Value::Str(text)
-                if &**text == "utf-8"
-                    || &**text == "utf8"
-                    || &**text == "UTF-8"
-                    || &**text == "UTF8" => {}
-            Value::Str(text) => {
-                return Err(interp.err(
-                    "NotImplementedError",
-                    format!("open() encoding '{}' is not supported; only UTF-8", text),
-                ))
-            }
-            other => {
-                return Err(interp.err(
-                    "TypeError",
-                    format!("open() encoding must be str, not '{}'", other.type_name()),
-                ))
-            }
-        }
-    }
 
     let mut readable = false;
     let mut writable = false;
     let mut append = false;
     let mut truncate = false;
+    let mut binary = false;
     let mut bases = 0;
     for ch in mode.chars() {
         match ch {
@@ -774,14 +1205,7 @@ fn builtin_open(
                 writable = true;
             }
             't' => {}
-            'b' => {
-                return Err(interp.err(
-                    "ValueError",
-                    String::from(
-                        "binary mode is not supported: the pagh ABI has text-only file I/O",
-                    ),
-                ))
-            }
+            'b' => binary = true,
             'x' => {
                 return Err(interp.err(
                     "NotImplementedError",
@@ -794,25 +1218,41 @@ fn builtin_open(
     if bases != 1 {
         return Err(interp.err("ValueError", format!("invalid mode: '{}'", mode)));
     }
-
-    let existing = if truncate {
-        String::new()
-    } else if append {
-        if platform::path_exists(&path) {
-            match platform::read_text(&path) {
-                Ok(text) => text,
-                Err(message) => {
-                    return Err(
-                        interp.err("OSError", format!("cannot read '{}': {}", path, message))
-                    )
+    if encoding.is_some() {
+        if binary {
+            return Err(interp.err(
+                "ValueError",
+                String::from("binary mode doesn't take an encoding argument"),
+            ));
+        }
+        if let Some(value) = encoding {
+            match value {
+                Value::None => {}
+                Value::Str(text) if is_utf8_name(text) => {}
+                Value::Str(text) => {
+                    return Err(interp.err(
+                        "NotImplementedError",
+                        format!("open() encoding '{}' is not supported; only UTF-8", text),
+                    ))
+                }
+                other => {
+                    return Err(interp.err(
+                        "TypeError",
+                        format!("open() encoding must be str, not '{}'", other.type_name()),
+                    ))
                 }
             }
-        } else {
-            String::new()
         }
+    }
+
+    let exists = platform::path_exists(&path);
+    let mut data = if truncate {
+        Vec::new()
+    } else if append && !exists {
+        Vec::new()
     } else {
-        match platform::read_text(&path) {
-            Ok(text) => text,
+        match platform::read_bytes(&path) {
+            Ok(data) => data,
             Err(message) => {
                 return Err(interp.err(
                     "FileNotFoundError",
@@ -821,17 +1261,30 @@ fn builtin_open(
             }
         }
     };
-    let pos = if append { existing.len() } else { 0 };
-    let dirty = truncate || (append && !platform::path_exists(&path));
+    if !binary {
+        if core::str::from_utf8(&data).is_err() {
+            return Err(interp.err(
+                "OSError",
+                format!(
+                    "cannot open '{}': file is not valid UTF-8; use binary mode",
+                    path
+                ),
+            ));
+        }
+    }
+    let pos = if append { data.len() } else { 0 };
+    let dirty = truncate || (append && !exists);
+    data.shrink_to_fit();
     Ok(Value::File(Rc::new(RefCell::new(FileValue {
         name: Rc::from(path.as_str()),
         mode: Rc::from(mode.as_str()),
-        data: existing,
+        data,
         pos,
         readable,
         writable,
         closed: false,
         dirty,
+        binary,
     }))))
 }
 
@@ -1493,6 +1946,19 @@ fn call_method(
         BuiltinId::DictSetdefault => dict_method_setdefault(interp, builtin, args, kwargs),
         BuiltinId::DictClear => dict_method_clear(interp, builtin, args, kwargs),
         BuiltinId::DictCopy => dict_method_copy(interp, builtin, args, kwargs),
+        BuiltinId::SetAdd => set_add(interp, builtin, args, kwargs),
+        BuiltinId::SetRemove => set_remove(interp, builtin, args, kwargs),
+        BuiltinId::SetDiscard => set_discard(interp, builtin, args, kwargs),
+        BuiltinId::SetUnion => set_union(interp, builtin, args, kwargs),
+        BuiltinId::SetIntersection => set_intersection(interp, builtin, args, kwargs),
+        BuiltinId::SetDifference => set_difference(interp, builtin, args, kwargs),
+        BuiltinId::SetIssubset => set_issubset(interp, builtin, args, kwargs),
+        BuiltinId::SetSuperset => set_issuperset(interp, builtin, args, kwargs),
+        BuiltinId::SetCopy => set_copy(interp, builtin, args, kwargs),
+        BuiltinId::SetClear => set_clear(interp, builtin, args, kwargs),
+        BuiltinId::BytesDecode => bytes_decode(interp, builtin, args, kwargs),
+        BuiltinId::BytesHex => bytes_hex(interp, builtin, args, kwargs),
+        BuiltinId::StrEncode => str_encode(interp, builtin, args, kwargs),
         BuiltinId::FileRead => file_read(interp, builtin, args, kwargs),
         BuiltinId::FileReadline => file_readline(interp, builtin, args, kwargs),
         BuiltinId::FileReadlines => file_readlines(interp, builtin, args, kwargs),
@@ -1500,6 +1966,8 @@ fn call_method(
         BuiltinId::FileWritelines => file_writelines(interp, builtin, args, kwargs),
         BuiltinId::FileClose => file_close(interp, builtin, args, kwargs),
         BuiltinId::FileFlush => file_flush(interp, builtin, args, kwargs),
+        BuiltinId::FileEnter => file_enter(interp, builtin, args, kwargs),
+        BuiltinId::FileExit => file_exit(interp, builtin, args, kwargs),
         other => Err(interp.err(
             "RuntimeError",
             format!("builtin '{}' is not a method", value::builtin_name(other)),
@@ -2525,6 +2993,734 @@ fn dict_method_copy(
     Ok(Value::dict(snapshot))
 }
 
+// ── os module ──────────────────────────────────────────────────────────────
+
+fn os_failure(interp: &Interp, operation: &str, path: &str, message: String) -> crate::error::PyError {
+    let name = if platform::path_exists(path) {
+        "OSError"
+    } else {
+        "FileNotFoundError"
+    };
+    interp.err(name, format!("{} '{}': {}", operation, path, message))
+}
+
+fn os_getpid(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "getpid")?;
+    expect_args(interp, args, "getpid", 0, 0)?;
+    Ok(Value::Int(platform::getpid()))
+}
+
+fn os_getppid(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "getppid")?;
+    expect_args(interp, args, "getppid", 0, 0)?;
+    Ok(Value::Int(platform::getppid()))
+}
+
+fn os_getcwd(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "getcwd")?;
+    expect_args(interp, args, "getcwd", 0, 0)?;
+    Ok(Value::Str(Rc::from(platform::current_dir().as_str())))
+}
+
+fn os_listdir(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "listdir")?;
+    expect_args(interp, args, "listdir", 0, 1)?;
+    let path = match args.get(0) {
+        Some(Value::Str(text)) => String::from(&**text),
+        Some(other) => {
+            return Err(interp.err(
+                "TypeError",
+                format!("listdir() path must be str, not '{}'", other.type_name()),
+            ))
+        }
+        None => String::from("."),
+    };
+    match platform::list_dir(&path) {
+        Ok(entries) => Ok(Value::list(
+            entries
+                .into_iter()
+                .map(|(name, _)| Value::Str(Rc::from(name.as_str())))
+                .collect(),
+        )),
+        Err(message) => Err(os_failure(interp, "listdir", &path, message)),
+    }
+}
+
+fn os_mkdir(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "mkdir")?;
+    expect_args(interp, args, "mkdir", 1, 2)?;
+    let path = as_str(interp, argument(interp, args, 0, "mkdir")?, "mkdir() path")?;
+    if platform::path_exists(path) {
+        return Err(interp.err(
+            "FileExistsError",
+            format!("mkdir '{}': path already exists", path),
+        ));
+    }
+    match platform::create_dir(path) {
+        Ok(()) => Ok(Value::None),
+        Err(message) => Err(interp.err("OSError", format!("mkdir '{}': {}", path, message))),
+    }
+}
+
+fn os_makedirs(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    check_kwargs(interp, kwargs, "makedirs", &["mode", "exist_ok"])?;
+    expect_args(interp, args, "makedirs", 1, 3)?;
+    let path = String::from(as_str(
+        interp,
+        argument(interp, args, 0, "makedirs")?,
+        "makedirs() path",
+    )?);
+    let exist_ok = match (args.get(2), keyword(kwargs, "exist_ok")) {
+        (Some(_), Some(_)) => {
+            return Err(interp.err(
+                "TypeError",
+                String::from("makedirs() got multiple values for argument 'exist_ok'"),
+            ))
+        }
+        (Some(value), None) => value.truthy(),
+        (None, Some(value)) => value.truthy(),
+        (None, None) => false,
+    };
+    if platform::path_exists(&path) {
+        if exist_ok {
+            return Ok(Value::None);
+        }
+        return Err(interp.err(
+            "FileExistsError",
+            format!("makedirs '{}': path already exists", path),
+        ));
+    }
+    match platform::create_dir_all(&path) {
+        Ok(()) => Ok(Value::None),
+        Err(message) => Err(interp.err(
+            "OSError",
+            format!("makedirs '{}': {}", path, message),
+        )),
+    }
+}
+
+fn os_remove(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "remove")?;
+    expect_args(interp, args, "remove", 1, 1)?;
+    let path = as_str(interp, argument(interp, args, 0, "remove")?, "remove() path")?;
+    match platform::remove_file(path) {
+        Ok(()) => Ok(Value::None),
+        Err(message) => Err(os_failure(interp, "remove", path, message)),
+    }
+}
+
+fn os_rmdir(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "rmdir")?;
+    expect_args(interp, args, "rmdir", 1, 1)?;
+    let path = as_str(interp, argument(interp, args, 0, "rmdir")?, "rmdir() path")?;
+    match platform::remove_dir(path) {
+        Ok(()) => Ok(Value::None),
+        Err(message) => Err(os_failure(interp, "rmdir", path, message)),
+    }
+}
+
+fn os_rename(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "rename")?;
+    expect_args(interp, args, "rename", 2, 2)?;
+    let from = as_str(interp, argument(interp, args, 0, "rename")?, "rename() src")?;
+    let to = as_str(interp, argument(interp, args, 1, "rename")?, "rename() dst")?;
+    match platform::rename(from, to) {
+        Ok(()) => Ok(Value::None),
+        Err(message) => Err(os_failure(interp, "rename", from, message)),
+    }
+}
+
+fn os_stat(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "stat")?;
+    expect_args(interp, args, "stat", 1, 1)?;
+    let path = as_str(interp, argument(interp, args, 0, "stat")?, "stat() path")?;
+    match platform::stat_path(path) {
+        Ok((size, mode, kind)) => interp.make_stat_value(size, mode, kind),
+        Err(message) => Err(os_failure(interp, "stat", path, message)),
+    }
+}
+
+fn os_fork(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "fork")?;
+    expect_args(interp, args, "fork", 0, 0)?;
+    match platform::fork_process() {
+        Ok(pid) => Ok(Value::Int(pid)),
+        Err(message) => Err(interp.err("OSError", format!("fork: {}", message))),
+    }
+}
+
+fn os_execv(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "execv")?;
+    expect_args(interp, args, "execv", 2, 2)?;
+    let path = String::from(as_str(
+        interp,
+        argument(interp, args, 0, "execv")?,
+        "execv() path",
+    )?);
+    let source = argument(interp, args, 1, "execv")?.clone();
+    let values = interp.collect_iterable(source)?;
+    let mut arguments: Vec<String> = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            Value::Str(text) => arguments.push(String::from(&*text)),
+            other => {
+                return Err(interp.err(
+                    "TypeError",
+                    format!(
+                        "execv() arguments must be str, not '{}'",
+                        other.type_name()
+                    ),
+                ))
+            }
+        }
+    }
+    match platform::execv_replace(&path, &arguments) {
+        Ok(()) => Err(interp.err(
+            "OSError",
+            format!("execv '{}': execve returned without replacing the process", path),
+        )),
+        Err(message) => Err(interp.err("OSError", format!("execv '{}': {}", path, message))),
+    }
+}
+
+fn os_waitpid(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "waitpid")?;
+    expect_args(interp, args, "waitpid", 1, 2)?;
+    let pid = as_int(interp, argument(interp, args, 0, "waitpid")?, "waitpid() pid")?;
+    let options = match args.get(1) {
+        Some(value) => as_int(interp, value, "waitpid() options")?,
+        None => 0,
+    };
+    match platform::wait_child(pid, options & 1 != 0) {
+        Ok((child, status)) => Ok(Value::tuple(alloc::vec![
+            Value::Int(child),
+            Value::Int(status as i64),
+        ])),
+        Err(message) => Err(interp.err("OSError", format!("waitpid: {}", message))),
+    }
+}
+
+fn os_wait(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "wait")?;
+    expect_args(interp, args, "wait", 0, 0)?;
+    match platform::wait_child(-1, false) {
+        Ok((child, status)) => Ok(Value::tuple(alloc::vec![
+            Value::Int(child),
+            Value::Int(status as i64),
+        ])),
+        Err(message) => Err(interp.err("OSError", format!("wait: {}", message))),
+    }
+}
+
+fn os_system(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "system")?;
+    expect_args(interp, args, "system", 1, 1)?;
+    Err(interp.err(
+        "NotImplementedError",
+        String::from(
+            "os.system() needs a shell executable, and pagh has none; \
+             use os.fork() + os.execv() instead",
+        ),
+    ))
+}
+
+// ── json module ────────────────────────────────────────────────────────────
+
+fn json_dumps(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "dumps")?;
+    expect_args(interp, args, "dumps", 1, 1)?;
+    let value = argument(interp, args, 0, "dumps")?;
+    match crate::json::dumps(value) {
+        Ok(text) => Ok(Value::Str(Rc::from(text.as_str()))),
+        Err(message) => {
+            let name = if message.contains("nesting") {
+                "ValueError"
+            } else {
+                "TypeError"
+            };
+            Err(interp.err(name, message))
+        }
+    }
+}
+
+fn json_loads(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "loads")?;
+    expect_args(interp, args, "loads", 1, 1)?;
+    let value = argument(interp, args, 0, "loads")?;
+    let text = match value {
+        Value::Str(text) => String::from(&**text),
+        Value::Bytes(data) => match core::str::from_utf8(data) {
+            Ok(text) => String::from(text),
+            Err(error) => {
+                return Err(interp.err(
+                    "UnicodeDecodeError",
+                    format!("invalid UTF-8 in json.loads at offset {}", error.valid_up_to()),
+                ))
+            }
+        },
+        other => {
+            return Err(interp.err(
+                "TypeError",
+                format!(
+                    "the JSON object must be str or bytes, not '{}'",
+                    other.type_name()
+                ),
+            ))
+        }
+    };
+    match crate::json::loads(&text) {
+        Ok(value) => Ok(value),
+        Err(message) => Err(interp.err("JSONDecodeError", message)),
+    }
+}
+
+// ── set methods ────────────────────────────────────────────────────────────
+
+fn set_receiver(
+    interp: &Interp,
+    builtin: &BuiltinValue,
+    function: &str,
+) -> PyResult<Rc<RefCell<Vec<Value>>>> {
+    match receiver(interp, builtin, function)? {
+        Value::Set(items) => Ok(items.clone()),
+        other => Err(interp.err(
+            "TypeError",
+            format!(
+                "{}() receiver must be set, not '{}'",
+                function,
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+fn require_set_hashable(interp: &Interp, value: &Value) -> PyResult<()> {
+    if value.is_hashable() {
+        Ok(())
+    } else {
+        Err(interp.err(
+            "TypeError",
+            format!("unhashable type: '{}'", value.type_name()),
+        ))
+    }
+}
+
+fn set_add(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "add")?;
+    expect_args(interp, args, "add", 1, 1)?;
+    let items = set_receiver(interp, builtin, "add")?;
+    let value = argument(interp, args, 0, "add")?.clone();
+    require_set_hashable(interp, &value)?;
+    set_insert(&mut items.borrow_mut(), value);
+    Ok(Value::None)
+}
+
+fn set_remove(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "remove")?;
+    expect_args(interp, args, "remove", 1, 1)?;
+    let items = set_receiver(interp, builtin, "remove")?;
+    let value = argument(interp, args, 0, "remove")?.clone();
+    let mut borrowed = items.borrow_mut();
+    match set_find(&borrowed, &value) {
+        Some(index) => {
+            borrowed.remove(index);
+            Ok(Value::None)
+        }
+        None => Err(interp.err("KeyError", value.to_repr())),
+    }
+}
+
+fn set_discard(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "discard")?;
+    expect_args(interp, args, "discard", 1, 1)?;
+    let items = set_receiver(interp, builtin, "discard")?;
+    let value = argument(interp, args, 0, "discard")?.clone();
+    let mut borrowed = items.borrow_mut();
+    if let Some(index) = set_find(&borrowed, &value) {
+        borrowed.remove(index);
+    }
+    Ok(Value::None)
+}
+
+fn set_union(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "union")?;
+    let items = set_receiver(interp, builtin, "union")?;
+    let mut result = items.borrow().clone();
+    for index in 0..args.len() {
+        let source = argument(interp, args, index, "union")?.clone();
+        for value in interp.collect_iterable(source)? {
+            require_set_hashable(interp, &value)?;
+            set_insert(&mut result, value);
+        }
+    }
+    Ok(Value::set(result))
+}
+
+fn set_intersection(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "intersection")?;
+    let items = set_receiver(interp, builtin, "intersection")?;
+    let mut others: Vec<Vec<Value>> = Vec::with_capacity(args.len());
+    for index in 0..args.len() {
+        let source = argument(interp, args, index, "intersection")?.clone();
+        others.push(interp.collect_iterable(source)?);
+    }
+    let result: Vec<Value> = items
+        .borrow()
+        .iter()
+        .filter(|value| others.iter().all(|other| set_find(other, value).is_some()))
+        .cloned()
+        .collect();
+    Ok(Value::set(result))
+}
+
+fn set_difference(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "difference")?;
+    let items = set_receiver(interp, builtin, "difference")?;
+    let mut others: Vec<Vec<Value>> = Vec::with_capacity(args.len());
+    for index in 0..args.len() {
+        let source = argument(interp, args, index, "difference")?.clone();
+        others.push(interp.collect_iterable(source)?);
+    }
+    let result: Vec<Value> = items
+        .borrow()
+        .iter()
+        .filter(|value| others.iter().all(|other| set_find(other, value).is_none()))
+        .cloned()
+        .collect();
+    Ok(Value::set(result))
+}
+
+fn set_issubset(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "issubset")?;
+    expect_args(interp, args, "issubset", 1, 1)?;
+    let items = set_receiver(interp, builtin, "issubset")?;
+    let source = argument(interp, args, 0, "issubset")?.clone();
+    let other = interp.collect_iterable(source)?;
+    let subset = items
+        .borrow()
+        .iter()
+        .all(|value| set_find(&other, value).is_some());
+    Ok(Value::Bool(subset))
+}
+
+fn set_issuperset(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "issuperset")?;
+    expect_args(interp, args, "issuperset", 1, 1)?;
+    let items = set_receiver(interp, builtin, "issuperset")?;
+    let source = argument(interp, args, 0, "issuperset")?.clone();
+    let other = interp.collect_iterable(source)?;
+    let borrowed = items.borrow();
+    let superset = other
+        .iter()
+        .all(|value| set_find(&borrowed, value).is_some());
+    Ok(Value::Bool(superset))
+}
+
+fn set_copy(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "copy")?;
+    expect_args(interp, args, "copy", 0, 0)?;
+    let items = set_receiver(interp, builtin, "copy")?;
+    let snapshot = items.borrow().clone();
+    Ok(Value::set(snapshot))
+}
+
+fn set_clear(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "clear")?;
+    expect_args(interp, args, "clear", 0, 0)?;
+    let items = set_receiver(interp, builtin, "clear")?;
+    items.borrow_mut().clear();
+    Ok(Value::None)
+}
+
+// ── bytes methods ──────────────────────────────────────────────────────────
+
+fn bytes_receiver<'a>(
+    interp: &Interp,
+    builtin: &'a BuiltinValue,
+    function: &str,
+) -> PyResult<&'a Rc<Vec<u8>>> {
+    match receiver(interp, builtin, function)? {
+        Value::Bytes(data) => Ok(data),
+        other => Err(interp.err(
+            "TypeError",
+            format!(
+                "{}() receiver must be bytes, not '{}'",
+                function,
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+fn decode_arguments(
+    interp: &Interp,
+    args: &ArgList,
+    function: &str,
+) -> PyResult<()> {
+    if args.len() > 2 {
+        return Err(interp.err(
+            "TypeError",
+            format!("{}() takes at most 2 arguments", function),
+        ));
+    }
+    if let Some(value) = args.get(0) {
+        match value {
+            Value::Str(name) if is_utf8_name(name) => {}
+            Value::Str(name) => {
+                return Err(interp.err(
+                    "LookupError",
+                    format!("unknown encoding: {}", name),
+                ))
+            }
+            other => {
+                return Err(interp.err(
+                    "TypeError",
+                    format!(
+                        "{}() encoding must be str, not '{}'",
+                        function,
+                        other.type_name()
+                    ),
+                ))
+            }
+        }
+    }
+    if let Some(value) = args.get(1) {
+        match value {
+            Value::Str(name) if &**name == "strict" => {}
+            Value::Str(name) => {
+                return Err(interp.err(
+                    "NotImplementedError",
+                    format!(
+                        "{}() error handler '{}' is not supported; only 'strict'",
+                        function, name
+                    ),
+                ))
+            }
+            other => {
+                return Err(interp.err(
+                    "TypeError",
+                    format!(
+                        "{}() errors must be str, not '{}'",
+                        function,
+                        other.type_name()
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bytes_decode(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "decode")?;
+    decode_arguments(interp, args, "decode")?;
+    let data = bytes_receiver(interp, builtin, "decode")?;
+    match core::str::from_utf8(data) {
+        Ok(text) => Ok(Value::str(text)),
+        Err(error) => Err(interp.err(
+            "UnicodeDecodeError",
+            format!(
+                "'utf-8' codec can't decode byte at offset {}: invalid UTF-8",
+                error.valid_up_to()
+            ),
+        )),
+    }
+}
+
+fn bytes_hex(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "hex")?;
+    expect_args(interp, args, "hex", 0, 0)?;
+    let data = bytes_receiver(interp, builtin, "hex")?;
+    let mut out = String::with_capacity(data.len() * 2);
+    for byte in data.iter() {
+        let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{:02x}", byte));
+    }
+    Ok(Value::Str(Rc::from(out.as_str())))
+}
+
+fn str_encode(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "encode")?;
+    decode_arguments(interp, args, "encode")?;
+    let text = str_receiver(interp, builtin, "encode")?;
+    Ok(Value::bytes(text.as_bytes().to_vec()))
+}
+
+fn is_utf8_name(name: &str) -> bool {
+    matches!(name, "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8")
+}
+
+// ── map ────────────────────────────────────────────────────────────────────
+
+/// `map(function, iterable, ...)`.
+///
+/// This implementation is eager: it collects into a list instead of returning
+/// a lazy iterator. The values and the call semantics are Python's; only the
+/// evaluation time differs, which the README documents.
+fn builtin_map(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "map")?;
+    if args.len() < 2 {
+        return Err(interp.err(
+            "TypeError",
+            format!("map() expected at least 2 arguments, got {}", args.len()),
+        ));
+    }
+    let function = argument(interp, args, 0, "map")?.clone();
+    let mut sources: Vec<Vec<Value>> = Vec::with_capacity(args.len() - 1);
+    for index in 1..args.len() {
+        let iterable = argument(interp, args, index, "map")?.clone();
+        sources.push(interp.collect_iterable(iterable)?);
+    }
+    let count = sources.iter().map(|values| values.len()).min().unwrap_or(0);
+    let mut out = Vec::with_capacity(count);
+    for position in 0..count {
+        let mut call_args = ArgList::new();
+        for source in &sources {
+            if let Some(value) = source.get(position) {
+                call_args.push(value.clone());
+            }
+        }
+        out.push(interp.call_value(function.clone(), call_args, Vec::new())?);
+    }
+    Ok(Value::list(out))
+}
+
 // ── file methods ───────────────────────────────────────────────────────────
 
 fn file_read(
@@ -2541,11 +3737,21 @@ fn file_read(
         None => None,
     };
     let mut borrowed = file.borrow_mut();
-    match borrowed.read(count) {
-        Ok(text) => Ok(Value::Str(Rc::from(text.as_str()))),
-        Err(message) => {
-            drop(borrowed);
-            Err(file_error(interp, message))
+    if borrowed.binary {
+        match borrowed.read_bytes(count) {
+            Ok(data) => Ok(Value::bytes(data)),
+            Err(message) => {
+                drop(borrowed);
+                Err(file_error(interp, message))
+            }
+        }
+    } else {
+        match borrowed.read(count) {
+            Ok(text) => Ok(Value::Str(Rc::from(text.as_str()))),
+            Err(message) => {
+                drop(borrowed);
+                Err(file_error(interp, message))
+            }
         }
     }
 }
@@ -2560,6 +3766,47 @@ fn file_readline(
     expect_args(interp, args, "readline", 0, 1)?;
     let file = file_receiver(interp, builtin, "readline")?;
     let mut borrowed = file.borrow_mut();
+    if borrowed.binary {
+        let result = match args.get(0) {
+            None => borrowed.readline_bytes(),
+            Some(value) => {
+                let size = as_int(interp, value, "readline() size")?;
+                let mut out = Vec::new();
+                let mut taken = 0i64;
+                let mut error = None;
+                while size < 0 || taken < size {
+                    match borrowed.read_bytes(Some(1)) {
+                        Ok(data) => {
+                            if data.is_empty() {
+                                break;
+                            }
+                            let newline = data[0] == b'\n';
+                            out.extend_from_slice(&data);
+                            taken += 1;
+                            if newline {
+                                break;
+                            }
+                        }
+                        Err(message) => {
+                            error = Some(message);
+                            break;
+                        }
+                    }
+                }
+                match error {
+                    Some(message) => Err(message),
+                    None => Ok(out),
+                }
+            }
+        };
+        return match result {
+            Ok(data) => Ok(Value::bytes(data)),
+            Err(message) => {
+                drop(borrowed);
+                Err(file_error(interp, message))
+            }
+        };
+    }
     let result = match args.get(0) {
         None => borrowed.readline(),
         Some(value) => {
@@ -2573,9 +3820,10 @@ fn file_readline(
                         if text.is_empty() {
                             break;
                         }
+                        let newline = text == "\n";
                         out.push_str(&text);
                         taken += 1;
-                        if text == "\n" {
+                        if newline {
                             break;
                         }
                     }
@@ -2613,21 +3861,36 @@ fn file_readlines(
         Some(value) => as_int(interp, value, "readlines() hint")?,
         None => -1,
     };
+    let binary = file.borrow().binary;
     let mut out = Vec::new();
     let mut total = 0i64;
     loop {
-        let line = {
+        let (line, more) = {
             let mut borrowed = file.borrow_mut();
-            match borrowed.readline() {
-                Ok(line) => line,
-                Err(message) => return Err(file_error(interp, message)),
+            if binary {
+                match borrowed.readline_bytes() {
+                    Ok(line) => {
+                        let more = !line.is_empty();
+                        total += line.len() as i64;
+                        (Value::bytes(line), more)
+                    }
+                    Err(message) => return Err(file_error(interp, message)),
+                }
+            } else {
+                match borrowed.readline() {
+                    Ok(line) => {
+                        let more = !line.is_empty();
+                        total += line.chars().count() as i64;
+                        (Value::Str(Rc::from(line.as_str())), more)
+                    }
+                    Err(message) => return Err(file_error(interp, message)),
+                }
             }
         };
-        if line.is_empty() {
+        if !more {
             break;
         }
-        total += line.chars().count() as i64;
-        out.push(Value::Str(Rc::from(line.as_str())));
+        out.push(line);
         if hint >= 0 && total >= hint {
             break;
         }
@@ -2644,13 +3907,36 @@ fn file_write(
     no_kwargs(interp, kwargs, "write")?;
     expect_args(interp, args, "write", 1, 1)?;
     let file = file_receiver(interp, builtin, "write")?;
-    let text = as_str(
-        interp,
-        argument(interp, args, 0, "write")?,
-        "write() argument",
-    )?;
+    let value = argument(interp, args, 0, "write")?;
     let mut borrowed = file.borrow_mut();
-    match borrowed.write(text) {
+    let result = if borrowed.binary {
+        match value {
+            Value::Bytes(data) => borrowed.write_bytes(data),
+            other => {
+                return Err(interp.err(
+                    "TypeError",
+                    format!(
+                        "write() argument must be bytes, not '{}' (binary file)",
+                        other.type_name()
+                    ),
+                ))
+            }
+        }
+    } else {
+        match value {
+            Value::Str(text) => borrowed.write(text),
+            other => {
+                return Err(interp.err(
+                    "TypeError",
+                    format!(
+                        "write() argument must be str, not '{}' (text file)",
+                        other.type_name()
+                    ),
+                ))
+            }
+        }
+    };
+    match result {
         Ok(count) => Ok(Value::Int(count as i64)),
         Err(message) => {
             drop(borrowed);
@@ -2670,24 +3956,39 @@ fn file_writelines(
     let file = file_receiver(interp, builtin, "writelines")?;
     let source = argument(interp, args, 0, "writelines")?.clone();
     let lines = interp.collect_iterable(source)?;
+    let binary = file.borrow().binary;
     for line in lines {
-        match &line {
-            Value::Str(text) => {
-                let mut borrowed = file.borrow_mut();
-                if let Err(message) = borrowed.write(text) {
-                    drop(borrowed);
-                    return Err(file_error(interp, message));
+        let mut borrowed = file.borrow_mut();
+        let result = if binary {
+            match &line {
+                Value::Bytes(data) => borrowed.write_bytes(data).map(|_| ()),
+                other => {
+                    return Err(interp.err(
+                        "TypeError",
+                        format!(
+                            "writelines() argument must be bytes-like, not '{}'",
+                            other.type_name()
+                        ),
+                    ))
                 }
             }
-            other => {
-                return Err(interp.err(
-                    "TypeError",
-                    format!(
-                        "writelines() argument must be an iterable of strings, not '{}'",
-                        other.type_name()
-                    ),
-                ))
+        } else {
+            match &line {
+                Value::Str(text) => borrowed.write(text).map(|_| ()),
+                other => {
+                    return Err(interp.err(
+                        "TypeError",
+                        format!(
+                            "writelines() argument must be str, not '{}'",
+                            other.type_name()
+                        ),
+                    ))
+                }
             }
+        };
+        if let Err(message) = result {
+            drop(borrowed);
+            return Err(file_error(interp, message));
         }
     }
     Ok(Value::None)
@@ -2730,11 +4031,43 @@ fn file_flush(
         ));
     }
     if borrowed.writable && borrowed.dirty {
-        if let Err(message) = platform::write_text(&borrowed.name, &borrowed.data) {
+        if let Err(message) = platform::write_bytes(&borrowed.name, &borrowed.data) {
             drop(borrowed);
             return Err(file_error(interp, message));
         }
         borrowed.dirty = false;
     }
     Ok(Value::None)
+}
+
+fn file_enter(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "__enter__")?;
+    expect_args(interp, args, "__enter__", 0, 0)?;
+    Ok(receiver(interp, builtin, "__enter__")?.clone())
+}
+
+fn file_exit(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "__exit__")?;
+    expect_args(interp, args, "__exit__", 3, 3)?;
+    let file = file_receiver(interp, builtin, "__exit__")?;
+    let mut borrowed = file.borrow_mut();
+    match borrowed.close() {
+        // CPython's file.__exit__ returns None, which is false: an exception
+        // inside `with open(...)` is never suppressed.
+        Ok(()) => Ok(Value::None),
+        Err(message) => {
+            drop(borrowed);
+            Err(file_error(interp, message))
+        }
+    }
 }

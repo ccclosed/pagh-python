@@ -32,12 +32,26 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     Str(Rc<str>),
+    Bytes(Rc<Vec<u8>>),
+    FStr(Rc<Vec<FStringLexPart>>),
     Newline,
     Indent,
     Dedent,
     Eof,
     Op(Op),
     Kw(Kw),
+}
+
+/// The lexer's half of an f-string: literal chunks are unescaped here, while
+/// expression chunks keep their source text until the parser parses them.
+#[derive(Clone, PartialEq, Debug)]
+pub enum FStringLexPart {
+    Text(Rc<str>),
+    Value {
+        text: Rc<str>,
+        spec: Option<Rc<str>>,
+        conversion: Option<char>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -383,20 +397,14 @@ impl Lexer {
                 let lower = word.to_ascii_lowercase();
                 let raw = lower.contains('r');
                 if lower.contains('f') {
-                    return Err(self.error_at(
-                        String::from(
-                            "formatted string literals (f-strings) are not supported",
-                        ),
-                        line,
-                        column,
-                    ));
+                    let token = self.lex_fstring(raw, line, column)?;
+                    self.push(token, line, column);
+                    return Ok(());
                 }
                 if lower.contains('b') {
-                    return Err(self.error_at(
-                        String::from("bytes literals are not supported; use str"),
-                        line,
-                        column,
-                    ));
+                    let bytes = self.lex_bytes_literal(raw, line, column)?;
+                    self.push(Tok::Bytes(bytes), line, column);
+                    return Ok(());
                 }
                 let text = self.lex_string_body(raw, line, column)?;
                 self.push(Tok::Str(text), line, column);
@@ -738,6 +746,571 @@ impl Lexer {
             self.bump();
         }
         Ok(Rc::from(out))
+    }
+
+    /// Scan a `b"..."` literal. Bytes are ASCII-only on input (as in CPython);
+    /// `\xNN` produces one arbitrary byte, and `\u`/`\U` are rejected.
+    fn lex_bytes_literal(
+        &mut self,
+        raw: bool,
+        start_line: u32,
+        start_column: u32,
+    ) -> Result<Rc<Vec<u8>>, SyntaxError> {
+        let Some(quote) = self.peek() else {
+            return Err(self.error_at(
+                String::from("unterminated bytes literal"),
+                start_line,
+                start_column,
+            ));
+        };
+        let triple = self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote);
+        self.bump();
+        if triple {
+            self.bump();
+            self.bump();
+        }
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let Some(ch) = self.peek() else {
+                return Err(self.error_at(
+                    String::from("unterminated bytes literal"),
+                    start_line,
+                    start_column,
+                ));
+            };
+            if ch == quote {
+                if triple {
+                    if self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote) {
+                        self.bump();
+                        self.bump();
+                        self.bump();
+                        break;
+                    }
+                    out.push(ch as u8);
+                    self.bump();
+                    continue;
+                }
+                self.bump();
+                break;
+            }
+            if ch == '\n' && !triple {
+                return Err(self.error_at(
+                    String::from(
+                        "unterminated bytes literal (newline in a single-quoted literal)",
+                    ),
+                    start_line,
+                    start_column,
+                ));
+            }
+            if ch == '\\' {
+                if raw {
+                    out.push(b'\\');
+                    self.bump();
+                    if let Some(next) = self.peek() {
+                        if !next.is_ascii() {
+                            return Err(self.error_at(
+                                String::from(
+                                    "bytes can only contain ASCII literal characters",
+                                ),
+                                start_line,
+                                start_column,
+                            ));
+                        }
+                        out.push(next as u8);
+                        self.bump();
+                    }
+                    continue;
+                }
+                self.bump();
+                let Some(escape) = self.peek() else {
+                    return Err(self.error_at(
+                        String::from("unterminated escape sequence at end of file"),
+                        start_line,
+                        start_column,
+                    ));
+                };
+                match escape {
+                    'n' => {
+                        out.push(b'\n');
+                        self.bump();
+                    }
+                    't' => {
+                        out.push(b'\t');
+                        self.bump();
+                    }
+                    'r' => {
+                        out.push(b'\r');
+                        self.bump();
+                    }
+                    'a' => {
+                        out.push(0x07);
+                        self.bump();
+                    }
+                    'b' => {
+                        out.push(0x08);
+                        self.bump();
+                    }
+                    'f' => {
+                        out.push(0x0c);
+                        self.bump();
+                    }
+                    'v' => {
+                        out.push(0x0b);
+                        self.bump();
+                    }
+                    '0' => {
+                        out.push(0);
+                        self.bump();
+                    }
+                    '\\' => {
+                        out.push(b'\\');
+                        self.bump();
+                    }
+                    '\'' => {
+                        out.push(b'\'');
+                        self.bump();
+                    }
+                    '"' => {
+                        out.push(b'"');
+                        self.bump();
+                    }
+                    '\n' => {
+                        self.bump();
+                    }
+                    'x' => {
+                        self.bump();
+                        let value = self.read_hex_escape(2, start_line, start_column)?;
+                        out.push(value as u8);
+                    }
+                    'u' | 'U' => {
+                        return Err(self.error_at(
+                            String::from(
+                                "\\u and \\U escapes are not allowed in bytes literals; use \\xNN",
+                            ),
+                            start_line,
+                            start_column,
+                        ))
+                    }
+                    other => {
+                        if !other.is_ascii() {
+                            return Err(self.error_at(
+                                String::from(
+                                    "bytes can only contain ASCII literal characters",
+                                ),
+                                start_line,
+                                start_column,
+                            ));
+                        }
+                        out.push(b'\\');
+                        out.push(other as u8);
+                        self.bump();
+                    }
+                }
+                continue;
+            }
+            if !ch.is_ascii() {
+                return Err(self.error_at(
+                    String::from("bytes can only contain ASCII literal characters"),
+                    start_line,
+                    start_column,
+                ));
+            }
+            out.push(ch as u8);
+            self.bump();
+        }
+        Ok(Rc::new(out))
+    }
+
+    /// Scan an f-string. Expressions are captured as source text and parsed by
+    /// the parser; nested quotes and backslashes inside `{...}` are rejected,
+    /// which keeps the scanner independent of the tokenizer recursion.
+    fn lex_fstring(
+        &mut self,
+        raw: bool,
+        start_line: u32,
+        start_column: u32,
+    ) -> Result<Tok, SyntaxError> {
+        let Some(quote) = self.peek() else {
+            return Err(self.error_at(
+                String::from("unterminated f-string literal"),
+                start_line,
+                start_column,
+            ));
+        };
+        let triple = self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote);
+        self.bump();
+        if triple {
+            self.bump();
+            self.bump();
+        }
+        let mut parts: Vec<FStringLexPart> = Vec::new();
+        let mut text = String::new();
+        loop {
+            let Some(ch) = self.peek() else {
+                return Err(self.error_at(
+                    String::from("unterminated f-string literal"),
+                    start_line,
+                    start_column,
+                ));
+            };
+            if ch == quote {
+                if triple {
+                    if self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote) {
+                        self.bump();
+                        self.bump();
+                        self.bump();
+                        break;
+                    }
+                    text.push(ch);
+                    self.bump();
+                    continue;
+                }
+                self.bump();
+                break;
+            }
+            if ch == '\n' && !triple {
+                return Err(self.error_at(
+                    String::from(
+                        "unterminated f-string literal (newline in a single-quoted f-string)",
+                    ),
+                    start_line,
+                    start_column,
+                ));
+            }
+            if ch == '\\' {
+                if raw {
+                    text.push('\\');
+                    self.bump();
+                    if let Some(next) = self.peek() {
+                        text.push(next);
+                        self.bump();
+                    }
+                } else {
+                    self.read_escape_string(&mut text, start_line, start_column)?;
+                }
+                continue;
+            }
+            if ch == '{' {
+                if self.peek_at(1) == Some('{') {
+                    text.push('{');
+                    self.bump();
+                    self.bump();
+                    continue;
+                }
+                if !text.is_empty() {
+                    parts.push(FStringLexPart::Text(Rc::from(text.as_str())));
+                    text.clear();
+                }
+                self.bump();
+                let mut expression = String::new();
+                let mut spec: Option<String> = None;
+                let mut conversion: Option<char> = None;
+                let mut depth = 0usize;
+                loop {
+                    let Some(current) = self.peek() else {
+                        return Err(self.error_at(
+                            String::from("unterminated f-string expression"),
+                            start_line,
+                            start_column,
+                        ));
+                    };
+                    match current {
+                        '\n' => {
+                            return Err(self.error_at(
+                                String::from("f-string expressions cannot span a line"),
+                                start_line,
+                                start_column,
+                            ))
+                        }
+                        '\'' | '"' => {
+                            return Err(self.error_at(
+                                String::from(
+                                    "nested quotes in f-string expressions are not supported",
+                                ),
+                                start_line,
+                                start_column,
+                            ))
+                        }
+                        '\\' => {
+                            return Err(self.error_at(
+                                String::from(
+                                    "backslashes in f-string expressions are not supported",
+                                ),
+                                start_line,
+                                start_column,
+                            ))
+                        }
+                        '(' | '[' | '{' => {
+                            depth += 1;
+                            expression.push(current);
+                            self.bump();
+                        }
+                        ')' | ']' => {
+                            if depth == 0 {
+                                return Err(self.error_at(
+                                    String::from(
+                                        "unmatched closing bracket in an f-string expression",
+                                    ),
+                                    start_line,
+                                    start_column,
+                                ));
+                            }
+                            depth -= 1;
+                            expression.push(current);
+                            self.bump();
+                        }
+                        '}' => {
+                            if depth == 0 {
+                                self.bump();
+                                break;
+                            }
+                            depth -= 1;
+                            expression.push(current);
+                            self.bump();
+                        }
+                        '!' if depth == 0 && self.peek_at(1) != Some('=') => {
+                            self.bump();
+                            match self.peek() {
+                                Some(value @ ('r' | 's' | 'a')) => {
+                                    conversion = Some(value);
+                                    self.bump();
+                                }
+                                _ => {
+                                    return Err(self.error_at(
+                                        String::from(
+                                            "expected 'r', 's' or 'a' after '!' in an f-string",
+                                        ),
+                                        start_line,
+                                        start_column,
+                                    ))
+                                }
+                            }
+                            if self.peek() == Some(':') {
+                                self.bump();
+                                spec = Some(self.read_format_spec(start_line, start_column)?);
+                            }
+                            if self.peek() != Some('}') {
+                                return Err(self.error_at(
+                                    String::from("expected '}' after an f-string conversion"),
+                                    start_line,
+                                    start_column,
+                                ));
+                            }
+                            self.bump();
+                            break;
+                        }
+                        ':' if depth == 0 => {
+                            self.bump();
+                            spec = Some(self.read_format_spec(start_line, start_column)?);
+                            if self.peek() != Some('}') {
+                                return Err(self.error_at(
+                                    String::from("expected '}' after an f-string format spec"),
+                                    start_line,
+                                    start_column,
+                                ));
+                            }
+                            self.bump();
+                            break;
+                        }
+                        other => {
+                            expression.push(other);
+                            self.bump();
+                        }
+                    }
+                }
+                let trimmed = expression.trim();
+                if trimmed.is_empty() {
+                    return Err(self.error_at(
+                        String::from("empty expression in an f-string"),
+                        start_line,
+                        start_column,
+                    ));
+                }
+                parts.push(FStringLexPart::Value {
+                    text: Rc::from(trimmed),
+                    spec: spec.map(|value| Rc::from(value.as_str())),
+                    conversion,
+                });
+                continue;
+            }
+            if ch == '}' {
+                if self.peek_at(1) == Some('}') {
+                    text.push('}');
+                    self.bump();
+                    self.bump();
+                    continue;
+                }
+                return Err(self.error_at(
+                    String::from(
+                        "single '}' is not allowed in an f-string; use '}}' for a literal brace",
+                    ),
+                    start_line,
+                    start_column,
+                ));
+            }
+            text.push(ch);
+            self.bump();
+        }
+        if !text.is_empty() {
+            parts.push(FStringLexPart::Text(Rc::from(text.as_str())));
+        }
+        Ok(Tok::FStr(Rc::new(parts)))
+    }
+
+    /// The format spec between `:` and the closing `}` of an f-string
+    /// expression. Nested replacement fields are not supported.
+    fn read_format_spec(
+        &mut self,
+        start_line: u32,
+        start_column: u32,
+    ) -> Result<String, SyntaxError> {
+        let mut out = String::new();
+        loop {
+            let Some(ch) = self.peek() else {
+                return Err(self.error_at(
+                    String::from("unterminated f-string format spec"),
+                    start_line,
+                    start_column,
+                ));
+            };
+            if ch == '}' {
+                return Ok(out);
+            }
+            if ch == '\n' {
+                return Err(self.error_at(
+                    String::from("f-string format specs cannot span a line"),
+                    start_line,
+                    start_column,
+                ));
+            }
+            if ch == '{' || ch == '\'' || ch == '"' {
+                return Err(self.error_at(
+                    String::from(
+                        "nested replacement fields and quotes in f-string format specs \
+                         are not supported",
+                    ),
+                    start_line,
+                    start_column,
+                ));
+            }
+            out.push(ch);
+            self.bump();
+        }
+    }
+
+    /// Decode one backslash escape (the current character is the backslash)
+    /// into `out`. Shared by f-string literal chunks.
+    fn read_escape_string(
+        &mut self,
+        out: &mut String,
+        start_line: u32,
+        start_column: u32,
+    ) -> Result<(), SyntaxError> {
+        self.bump();
+        let Some(escape) = self.peek() else {
+            return Err(self.error_at(
+                String::from("unterminated escape sequence at end of file"),
+                start_line,
+                start_column,
+            ));
+        };
+        match escape {
+            'n' => {
+                out.push('\n');
+                self.bump();
+            }
+            't' => {
+                out.push('\t');
+                self.bump();
+            }
+            'r' => {
+                out.push('\r');
+                self.bump();
+            }
+            'a' => {
+                out.push('\u{07}');
+                self.bump();
+            }
+            'b' => {
+                out.push('\u{08}');
+                self.bump();
+            }
+            'f' => {
+                out.push('\u{0c}');
+                self.bump();
+            }
+            'v' => {
+                out.push('\u{0b}');
+                self.bump();
+            }
+            '0' => {
+                out.push('\0');
+                self.bump();
+            }
+            '\\' => {
+                out.push('\\');
+                self.bump();
+            }
+            '\'' => {
+                out.push('\'');
+                self.bump();
+            }
+            '"' => {
+                out.push('"');
+                self.bump();
+            }
+            '\n' => {
+                self.bump();
+            }
+            'x' => {
+                self.bump();
+                let value = self.read_hex_escape(2, start_line, start_column)?;
+                match char::from_u32(value) {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        return Err(self.error_at(
+                            String::from("invalid \\x escape value"),
+                            start_line,
+                            start_column,
+                        ))
+                    }
+                }
+            }
+            'u' => {
+                self.bump();
+                let value = self.read_hex_escape(4, start_line, start_column)?;
+                match char::from_u32(value) {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        return Err(self.error_at(
+                            String::from("invalid \\u escape value"),
+                            start_line,
+                            start_column,
+                        ))
+                    }
+                }
+            }
+            'U' => {
+                self.bump();
+                let value = self.read_hex_escape(8, start_line, start_column)?;
+                match char::from_u32(value) {
+                    Some(ch) => out.push(ch),
+                    None => {
+                        return Err(self.error_at(
+                            String::from("invalid \\U escape value"),
+                            start_line,
+                            start_column,
+                        ))
+                    }
+                }
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+                self.bump();
+            }
+        }
+        Ok(())
     }
 
     fn read_hex_escape(

@@ -1,31 +1,31 @@
-# Живой прогон pythonc 0.1.0
+# Живой прогон pythonc 0.1.2 на ядре 0.16.1
 
 Дата: 2026-11-05. Ядро:
 `/home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh`
-(0.14.0, native ABI). QEMU `qemu-system-riscv64` 10.2.2, машина `virt`,
-256 MiB, serial на Unix-сокете, `-bios default`, `-display none`.
-Диск: 64 MiB ext2, создан на хосте
+(0.16.1, native ABI, `fork`/`execve`/`wait4`). QEMU `qemu-system-riscv64`
+10.2.2, машина `virt`, 256 MiB, serial на Unix-сокете, `-bios default`,
+`-display none`. Диск: 64 MiB ext2, создан на хосте
 
 ```sh
 mke2fs -q -t ext2 -F -b 4096 -d rootfs disk.img 64M
 ```
 
-В корне образа — `pythonc` (release, 781 928 байт) и скрипты из
-[`../tests/live/`](../tests/live/). Одна загрузка, 21 команда подряд; после
+В корне образа — `pythonc` (release, 987 008 байт) и скрипты из
+[`../tests/live/`](../tests/live/). Одна загрузка, 31 команда подряд; после
 каждого `run` ядро печатает `run: /mnt/pythonc exited with code N`.
 
 Сырой транскрипт: [`live-pythonc.txt`](live-pythonc.txt).
 
 ## Итог
 
-**21 PASS из 21 команды.** Двенадцать прежних языковых проверок (hello,
-functions, collections, classes, exceptions, file I/O, import, argv, `-c`,
-usage, syntax error, uncaught exception) по-прежнему проходят. Старая проверка
-«float gap is explicit» удалена: она утверждала ложное ограничение. Вместо неё
-добавлены шесть float-скриптов и `-c print(1/2)`, то есть семь новых PASS.
-
-Два `cat` подтверждают, что файлы, записанные через `open(..., 'w')`, реально
-дошли до ext2.
+**30 PASS из 31 команды.** Единственная не-PASS команда — `cat /mnt/hello.py`:
+она просто показывает исходник и не является проверкой. Двадцать одна
+прежняя проверка (hello, functions, collections, classes, exceptions,
+file I/O, import, argv, `-c`, usage, syntax error, uncaught exception и семь
+float-проверок) проходит без изменений. Добавлены девять новых скриптов:
+lambda/`sorted`/`map`, `with open` и протокол контекстного менеджера, `set`,
+`bytes`, бинарный файл, f-strings, `os`, `json` и `os.fork`/`os.execv`/
+`os.waitpid`.
 
 ## PASS-строки
 
@@ -51,148 +51,190 @@ PASS float comparison/NaN: run /mnt/pythonc /mnt/float_compare.py -> exit 0
 PASS math module: run /mnt/pythonc /mnt/float_math.py -> exit 0
 PASS typed float errors: run /mnt/pythonc /mnt/float_errors.py -> exit 0
 PASS -c float: run /mnt/pythonc -c print(1/2) -> 0.5, exit 0
+PASS lambda/defaults/map/sorted: run /mnt/pythonc /mnt/lambda_map.py -> exit 0
+PASS with open/multiple/suppression: run /mnt/pythonc /mnt/with_open.py -> exit 0
+PASS set literal/methods/in/eq: run /mnt/pythonc /mnt/sets_demo.py -> exit 0
+PASS bytes literal/decode/encode: run /mnt/pythonc /mnt/bytes_demo.py -> exit 0
+PASS binary file read/write: run /mnt/pythonc /mnt/bytes_file.py -> exit 0
+PASS f-strings/specs/conversion: run /mnt/pythonc /mnt/fstrings_demo.py -> exit 0
+PASS os listdir/mkdir/stat/rename/env: run /mnt/pythonc /mnt/os_demo.py -> exit 0
+PASS json dumps/loads/escaping: run /mnt/pythonc /mnt/json_demo.py -> exit 0
+PASS os.fork/execv/waitpid: run /mnt/pythonc /mnt/os_proc.py -> exit 0
 ```
 
 ## Что именно проверено
 
+### Прежние проверки
+
+Двенадцать прежних языковых проверок (hello, functions, collections,
+classes, exceptions, file I/O, import, argv, `-c`, usage, syntax error,
+uncaught exception) и семь float-проверок по-прежнему проходят. Все float-
+скрипты завершаются `assert`-проверками, поэтому код возврата 0 означает
+совпадение значений, а не только напечатанные строки.
+
+### Lambda, defaults, sorted и map
+
 ```text
-run /mnt/pythonc /mnt/hello.py
+run /mnt/pythonc /mnt/lambda_map.py
+lambda defaults: 15 16
+lambda map: [2, 4, 6]
+sorted key: ['os', 'pagh', 'interpreter']
+sort key: [('a', 1), ('b', 2), ('c', 3)]
+lambda ok
+run: /mnt/pythonc exited with code 0
+```
+
+Проверены: `lambda` с параметрами по умолчанию, замыкание над локальной
+переменной внешней функции (`make_adder`), `sorted(..., key=lambda ...)`,
+`list.sort(key=lambda ...)` и `map` с несколькими итерируемыми.
+
+### with и протокол контекстного менеджера
+
+```text
+run /mnt/pythonc /mnt/with_open.py
+with file: alpha|beta|
+enter first
+enter second
+body first second
+exit second (None, None)
+exit first (None, None)
+events: [(None, None)] [(None, None)]
+suppressed: ('ValueError', 'suppressed')
+file exit propagates: not suppressed
+with ok
+run: /mnt/pythonc exited with code 0
+```
+
+Проверены: `with open(...) as f` (файл закрывается `__exit__`),
+`f.closed == True` после блока, несколько менеджеров в одном `with`
+(вход слева направо, выход справа налево), передача `(None, None, None)` в
+`__exit__` при нормальном выходе, подавление исключения при
+`__exit__ -> True` и проброс исключения, когда `open()`-файл возвращает
+`None` из `__exit__`.
+
+### set
+
+```text
+run /mnt/pythonc /mnt/sets_demo.py
+literal: {3, 1, 2} len: 3 in: True
+add/remove: [2, 3, 4]
+union: [1, 2, 3, 4]
+intersection: [3]
+difference: [1, 2]
+constructor: {1, 2, 3}
+set comp: [0, 4, 16]
+dict comp: {'0': 0, '1': 10, '2': 20}
+iter 1
+iter 3
+iter 5
+sets ok
+run: /mnt/pythonc exited with code 0
+```
+
+Проверены литерал `{1, 2, 3}` с дедупликацией, `set(iterable)`, `len`,
+`in`, `==` без учёта порядка, `add`, `remove`, `discard`, `union`,
+`intersection`, `difference`, `issubset`, `issuperset`, итерация, `KeyError`
+у `remove` и set/dict comprehensions. Порядок обхода — порядок вставки
+(реализация на `Vec`, см. README).
+
+### bytes и бинарные файлы
+
+```text
+run /mnt/pythonc /mnt/bytes_demo.py
+literal: b'pagh' len: 4 index: 112 slice: b'ag'
+escaped: b'line\nA\xff'
+encode/decode: b'hello' hello
+bytes(): b'ABC' b'\x00\x00'
+hex: 414243
+bytes ok
+run: /mnt/pythonc exited with code 0
+
+run /mnt/pythonc /mnt/bytes_file.py
+binary write: 7 bytes
+binary read: b'\x00\x01pagh\xff' len: 7
+binary file ok
+run: /mnt/pythonc exited with code 0
+```
+
+Проверены литералы `b"..."` с `\n`, `\x41`, `\xff`, индексация (int),
+срезы, `len`, конкатенация, повторение, сравнения, `in`, `bytes([65,66,67])`,
+`bytes(n)`, `bytes(str, "utf-8")`, `str.encode`/`bytes.decode`, `hex`,
+итерация по байтам и запись/чтение `open(..., "wb"/"rb")` с байтами
+`\x00\x01pagh\xff`. В текстовом режиме данные по-прежнему обязаны быть
+UTF-8; бинарный режим не декодирует содержимое.
+
+### f-strings
+
+```text
+run /mnt/pythonc /mnt/fstrings_demo.py
+hello pagh
+pi=3.14 count=42
+repr='pagh' width=   42
+braces {ok}
+fstrings ok
+run: /mnt/pythonc exited with code 0
+```
+
+Проверены подстановки `{name}`, выражения `{2 + 3}`, спецификаторы
+`:.2f`, `:d`, `:>5d`, `!r`, экранирование `{{`/`}}` и неявная конкатенация
+f-строк. Вложенные кавычки внутри `{...}` намеренно не поддерживаются
+(лексер сообщает об этом `SyntaxError`).
+
+### os
+
+```text
+run /mnt/pythonc /mnt/os_demo.py
+listdir: ['file.txt', 'nested']
+stat: 8 file True False
+rename: ['nested', 'renamed.txt']
+cwd stat: dir True
+pid: True True
+cwd: /
+os ok
+run: /mnt/pythonc exited with code 0
+```
+
+Проверены `getpid`, `getppid`, `getcwd`, `listdir`, `mkdir`, `makedirs`,
+`rename`, `remove`, `rmdir`, `stat` (size/kind/is_file/is_dir, включая
+каталог), `environ["PWD"]` и `FileNotFoundError` после удаления. Каталог —
+`/mnt/osdemo`, поэтому проверка работает на ext2.
+
+### os.fork / os.execv / os.waitpid
+
+```text
+run /mnt/pythonc /mnt/os_proc.py
 hello from pagh-python
 arithmetic: 7 3 1 1024
 builtins: 5 7 3 4
 sep/end:-a-b-c.
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/functions.py
-fact(6) = 720
-fib(10) = 55
-nested calls: 16
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/collections_demo.py
-list: [2, 3, 4, 5, 6] pop: 1 slice: [3, 4, 5] reversed: [6, 5, 4, 3, 2]
-dict: {'apple': 2, 'pear': 1, 'plum': 3} keys: ['apple', 'pear', 'plum']
-...
-sorted: [1, 2, 5, 9] ['b', 'a']
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/classes.py
-cat makes a sound
-Rex barks
-Animal(cat) isinstance: True False
-counter: 1 2 3
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/exceptions.py
-caught ValueError: bad value
-caught ZeroDivisionError
-propagated: from fail
-try body
-finally runs
-caught KeyError: 'key'
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/fileio.py
-file lines: ['first line', 'second line', 'third line']
-readline: first line
-rest: second line|third line|
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/import_main.py
-mymod.answer = 42
-mymod.double(4) = 8
-from-import double(21) = 42
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/argv.py one two
-script: /mnt/argv.py
-args: ['one', 'two']
-count: 3
+child: True status: 0
+proc ok
 run: /mnt/pythonc exited with code 0
 ```
 
-`fileio.py` пишет `/mnt/py.txt` тремя строками, затем открывает его на чтение,
-читает итерацией по файлу и через `readline`/`read`; отдельно
-`print("print to file", file=out)` проверяет запись в файл из `print`.
-`cat /mnt/py.txt` и `cat /mnt/print.txt` после этого показывают ожидаемый текст,
-то есть закрытие файла действительно сбрасывает буфер в ext2.
+`os.fork()` создаёт ребёнка; ребёнок вызывает
+`os.execv("/mnt/pythonc", ["/mnt/pythonc", "/mnt/hello.py"])`, поэтому
+`execve` заменяет его образ и печатает hello. Родитель ждёт
+`os.waitpid(pid, 0)` и получает status 0. Это живая проверка того, что
+`fork`/`execv`/`waitpid` из `libpagh` действительно работают из
+интерпретатора, а не только компилируются.
 
-### Float
-
-Все float-скрипты завершаются `assert`-проверками, поэтому код возврата 0
-означает, что значения совпали с ожидаемыми, а не только что программа
-допечатала строки:
+### json
 
 ```text
-run /mnt/pythonc /mnt/float_arithmetic.py
-literals: 1.5 0.5 1000.0 0.015 1.0 10.5
-mixed: 3.5 5.0 3.75 -1.5 1.5
-float arithmetic ok
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/float_division.py
-true division: 0.5 3.5 -3.5
-floor/mod: 3.0 -4.0 1.5 0.5 -0.5
-caught integer division by zero
-caught float floor division by zero
-caught float modulo by zero
-float division ok
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/float_format.py
-str: 1.0 1.5 1e+20 1e-07 1.5e-07
-repr: 1.0 0.30000000000000004 -0.0
-float formatting ok
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/float_compare.py
-mixed compare: True True True
-nan compare: False False
-float comparison ok
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/float_math.py
-pi/e: 3.141592653589793 2.718281828459045
-sqrt/pow: 1.4142135623730951 1.4142135623730951
-trig: 0.8414709848078965 0.5403023058681397 1.5574077246549025
-log/exp: 1.0 3.0 2.7182818284590446
-rounding: -3 -2 -2 2.5
-float math ok
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc /mnt/float_errors.py
-typed float errors: 6
-float errors ok
-run: /mnt/pythonc exited with code 0
-
-run /mnt/pythonc -c print(1/2)
-0.5
+run /mnt/pythonc /mnt/json_demo.py
+dumps: {"name": "pagh", "ok": true, "count": 3, "ratio": 1.5, "items": [1, 2, null, "x"]}
+loads: {'name': 'pagh', 'ok': True, 'count': 3, 'ratio': 1.5, 'items': [1, 2, None, 'x']}
+escaped: {"quote": "he said \"hi\"", "newline": "a\nb"}
+json ok
 run: /mnt/pythonc exited with code 0
 ```
 
-Проверены decimal/exponent-литералы (`.5`, `1.`, `1e3`, `1.5e-2`, `1_0.5`),
-смешанная арифметика int/float, `%` с знаком делителя, `//` с float-результатом,
-`divmod` с float, отрицательные и float-показатели `**`, `round` с ties-to-even
-и `ndigits`, `int(float)` (усечение к нулю), `float(int/bool/str)`, `bool(float)`,
-NaN-сравнения, точное сравнение `int` с `float` выше 2^53, `min`/`max`/`sorted`/
-`sum` с float, `type(1.0)`, `isinstance(1.5, float)`.
-
-Модуль `math` проверен целиком: `pi`, `e`, `sqrt`, `floor`, `ceil`, `trunc`,
-`fabs`, `pow`, `fmod`, `sin`, `cos`, `tan`, `log` (включая `log(x, base)`),
-`log10`, `exp`, `inf`, `nan`, `isnan`, `isinf`; `sys.float_info.dig` читается.
-Отдельно проверено, что доменные ошибки типизированы: `int(nan)` → `ValueError`,
-`int(inf)` → `OverflowError`, `math.sqrt(-1)`/`math.log(0)` → `ValueError`,
-`0.0 ** -1` → `ZeroDivisionError`, `(-8) ** (1/3)` → `ValueError` (комплексных
-чисел в интерпретаторе нет).
-
-### Проверка FPU до реализации
-
-Утверждение «ядро 0.14.0 исполняет f64 в U-mode» проверено не по символам, а
-живым запуском `/home/oleg/pagh-api/examples/fp.rs`: `1.5 * 2.25` и сумма
-`1..=100` дали `fp product=3.375`, `fp sum=5050`, exit 0. Дополнительно
-временная U-mode программа проверила `fdiv`, сравнения, `fcvt` в `i64` и
-`core::fmt` (`display=1.5 debug=1.5 big=1e20 small=1.5e-7`), тоже exit 0.
-Интерпретатор использует те же инструкции: `NaN`/`inf` не ловятся ядром.
+Проверены `dumps`/`loads` для None/bool/int/float/str/list/dict, порядок
+ключей, `true/false/null`, экранирование `"` и `\n`, round-trip,
+`json.loads` чисел/строк/массивов/объектов и `JSONDecodeError` (подкласс
+`ValueError`) на некорректном вводе. Не-ASCII символы кодируются как
+`\uXXXX` (`ensure_ascii=True`, как в CPython по умолчанию).
 
 ## Диагностика ошибок
 
@@ -218,36 +260,18 @@ ZeroDivisionError: integer division or modulo by zero
 run: /mnt/pythonc exited with code 1
 ```
 
-Float-ошибки используют те же типизированные исключения; отдельного
-`NotImplementedError` для float больше нет:
-
-```text
-run /mnt/pythonc /mnt/float_errors.py
-typed float errors: 6
-float errors ok
-run: /mnt/pythonc exited with code 0
-```
-
-## Зависимость от FPU
-
-`pythonc` теперь содержит настоящие f64-инструкции. Ядро обязано оставлять
-`sstatus.FS` включённым при `sret` в U-mode (как в 0.14.0). Если ядро выключит
-FPU, первая же float-операция упадёт по illegal instruction; это не ошибка
-интерпретатора, а нарушение контракта ядра. `hostcheck` на x86-64 проверяет ту
-же семантику без QEMU.
-
 ## Что не проверялось живьём
 
-- Сеть, потоки, процессы и сигналы: их нет в языке/ABI этого проекта.
-- `-c` с пробелами в коде: шелл ядра делит команду по пробелам, поэтому в
-  живом прогоне `-c` проверен на `print(6*7)` и `print(1/2)`; на хосте
-  `hostcheck -c` с произвольным кодом покрыт unit-тестами.
-- Долгие программы и исчерпание 1 MiB heap: в тестах участвуют только
-  небольшие скрипты, рассчитанные на bump-heap ядра.
-- Точное соответствие CPython для трансцендентных функций: см.
-  [`../README.md`](../README.md), раздел «Ограничения» (`exp`/`cos`/`tan` могут
-  отличаться на 1–2 ulp, `round(float, ndigits)` — на 1 ulp для очень больших
-  величин и отрицательных `ndigits`).
+- `os.system()`: в pagh нет shell-бинарника, поэтому функция типизированно
+  поднимает `NotImplementedError`; см. README.
+- Негативные пути `os.execv` (несуществующий файл, не-ELF) и `os.waitpid`
+  с `WNOHANG`: на хосте они недоступны, живьём проверен успешный сценарий.
+- Ошибки `bytes.decode` на невалидном UTF-8, `set` с нехешируемым
+  элементом, синтаксические ошибки f-строк: они покрыты hostcheck-тестами,
+  но не отдельными live-скриптами.
+- Сеть, потоки, сигналы: в языке/ABI этого проекта их нет.
+- Долгие программы и исчерпание 1 MiB heap: в тестах только небольшие
+  скрипты.
 
 ## Воспроизведение
 

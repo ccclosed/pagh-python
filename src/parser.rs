@@ -16,11 +16,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::ast::{
-    BinOp, BoolOp, CmpOp, CompGen, Expr, Handler, ImportAlias, Module, Name, Param, Stmt,
-    StmtKind, UnOp,
+    BinOp, BoolOp, CmpOp, CompGen, Expr, FStringPart, Handler, ImportAlias, Module, Name, Param,
+    Stmt, StmtKind, UnOp, WithItem,
 };
 use crate::error::SyntaxError;
-use crate::lexer::{tokenize, Kw, Op, Tok, Token};
+use crate::lexer::{tokenize, FStringLexPart, Kw, Op, Tok, Token};
 
 pub fn parse(source: &str) -> Result<Module, SyntaxError> {
     let tokens = tokenize(source)?;
@@ -86,6 +86,8 @@ impl Parser {
             Tok::Int(value) => format!("'{}'", value),
             Tok::Float(value) => format!("'{}'", crate::float::format(*value)),
             Tok::Str(_) => String::from("a string"),
+            Tok::Bytes(_) => String::from("a bytes literal"),
+            Tok::FStr(_) => String::from("an f-string"),
             Tok::Newline => String::from("end of line"),
             Tok::Indent => String::from("indent"),
             Tok::Dedent => String::from("dedent"),
@@ -207,7 +209,7 @@ impl Parser {
     fn parse_statement_line(&mut self) -> Result<Vec<Stmt>, SyntaxError> {
         if matches!(
             self.peek(),
-            Tok::Kw(Kw::If | Kw::While | Kw::For | Kw::Def | Kw::Class | Kw::Try)
+            Tok::Kw(Kw::If | Kw::While | Kw::For | Kw::Def | Kw::Class | Kw::Try | Kw::With)
         ) {
             Ok(alloc::vec![self.parse_compound()?])
         } else {
@@ -433,14 +435,8 @@ impl Parser {
         if self.eat_kw(Kw::Del) {
             return self.error(String::from("'del' statements are not supported"));
         }
-        if self.eat_kw(Kw::With) {
-            return self.error(String::from("'with' statements are not supported"));
-        }
         if self.eat_kw(Kw::Yield) {
             return self.error(String::from("generators ('yield') are not supported"));
-        }
-        if self.eat_kw(Kw::Lambda) {
-            return self.error(String::from("'lambda' is not supported"));
         }
 
         // Expression statement or assignment.
@@ -523,6 +519,9 @@ impl Parser {
         }
         if self.eat_kw(Kw::Try) {
             return self.parse_try();
+        }
+        if self.eat_kw(Kw::With) {
+            return self.parse_with();
         }
         self.error(String::from("expected a compound statement"))
     }
@@ -674,6 +673,33 @@ impl Parser {
                 else_body,
                 finally_body,
             },
+        })
+    }
+
+    fn parse_with(&mut self) -> Result<Stmt, SyntaxError> {
+        let line = self.line();
+        let mut items = Vec::new();
+        loop {
+            let context = self.parse_expr()?;
+            // `as` binds one target atom: an unparenthesized comma starts the
+            // next with-item, exactly as in CPython's grammar.
+            let target = if self.eat_kw(Kw::As) {
+                let target = self.parse_target_atom()?;
+                self.check_target(&target)?;
+                Some(target)
+            } else {
+                None
+            };
+            items.push(WithItem { context, target });
+            if !self.eat_op(Op::Comma) {
+                break;
+            }
+        }
+        self.expect_op(Op::Colon, "after the with items")?;
+        let body = self.parse_block()?;
+        Ok(Stmt {
+            line,
+            kind: StmtKind::With { items, body },
         })
     }
 
@@ -1038,6 +1064,37 @@ impl Parser {
                 }
                 Ok(Expr::Str(Rc::from(joined)))
             }
+            Tok::Bytes(bytes) => {
+                let bytes = bytes.clone();
+                self.advance();
+                Ok(Expr::Bytes(bytes))
+            }
+            Tok::FStr(parts) => {
+                let parts = parts.clone();
+                let line = self.line();
+                let column = self.column();
+                self.advance();
+                let mut out = self.fstring_parts(&parts, line, column)?;
+                // Adjacent literals concatenate, including f-strings.
+                loop {
+                    match self.peek() {
+                        Tok::Str(text) => {
+                            let text = text.clone();
+                            self.advance();
+                            out.push(FStringPart::Text(text));
+                        }
+                        Tok::FStr(next) => {
+                            let next = next.clone();
+                            let next_line = self.line();
+                            let next_column = self.column();
+                            self.advance();
+                            out.extend(self.fstring_parts(&next, next_line, next_column)?);
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(Expr::FString(out))
+            }
             Tok::Name(name) => {
                 let name = name.clone();
                 self.advance();
@@ -1055,9 +1112,7 @@ impl Parser {
                 self.advance();
                 Ok(Expr::False)
             }
-            Tok::Kw(Kw::Lambda) => {
-                self.error(String::from("'lambda' expressions are not supported"))
-            }
+            Tok::Kw(Kw::Lambda) => self.parse_lambda(),
             Tok::Kw(Kw::Yield) => {
                 self.error(String::from("generators ('yield') are not supported"))
             }
@@ -1092,34 +1147,59 @@ impl Parser {
             Tok::Op(Op::LBrace) => {
                 self.advance();
                 if self.eat_op(Op::RBrace) {
+                    // `{}` is an empty dict; `set()` is the empty set.
                     return Ok(Expr::Dict(Vec::new()));
                 }
-                let mut entries = Vec::new();
-                loop {
-                    let key = self.parse_expr()?;
-                    if !self.eat_op(Op::Colon) {
-                        return self.error(String::from(
-                            "set literals are not supported; only dict literals \
-                             use '{key: value}'",
-                        ));
-                    }
+                let first = self.parse_expr()?;
+                if self.check_kw(Kw::For) {
+                    let generators = self.parse_comp_generators()?;
+                    self.expect_op(Op::RBrace, "after the set comprehension")?;
+                    return Ok(Expr::SetComp {
+                        element: Box::new(first),
+                        generators,
+                    });
+                }
+                if self.eat_op(Op::Colon) {
                     let value = self.parse_expr()?;
-                    entries.push((key, value));
+                    if self.check_kw(Kw::For) {
+                        let generators = self.parse_comp_generators()?;
+                        self.expect_op(Op::RBrace, "after the dict comprehension")?;
+                        return Ok(Expr::DictComp {
+                            key: Box::new(first),
+                            value: Box::new(value),
+                            generators,
+                        });
+                    }
+                    let mut entries = alloc::vec![(first, value)];
+                    loop {
+                        if self.eat_op(Op::Comma) {
+                            if self.eat_op(Op::RBrace) {
+                                break;
+                            }
+                            let key = self.parse_expr()?;
+                            self.expect_op(Op::Colon, "after a dict key")?;
+                            let value = self.parse_expr()?;
+                            entries.push((key, value));
+                            continue;
+                        }
+                        self.expect_op(Op::RBrace, "after the dict entries")?;
+                        break;
+                    }
+                    return Ok(Expr::Dict(entries));
+                }
+                let mut items = alloc::vec![first];
+                loop {
                     if self.eat_op(Op::Comma) {
                         if self.eat_op(Op::RBrace) {
                             break;
                         }
-                        if self.check_kw(Kw::For) {
-                            return self.error(String::from(
-                                "dict comprehensions are not supported",
-                            ));
-                        }
+                        items.push(self.parse_expr()?);
                         continue;
                     }
-                    self.expect_op(Op::RBrace, "after the dict entries")?;
+                    self.expect_op(Op::RBrace, "after the set elements")?;
                     break;
                 }
-                Ok(Expr::Dict(entries))
+                Ok(Expr::Set(items))
             }
             _ => self.error(format!(
                 "expected an expression, found {}",
@@ -1129,6 +1209,15 @@ impl Parser {
     }
 
     fn parse_list_comprehension(&mut self, element: Expr) -> Result<Expr, SyntaxError> {
+        let generators = self.parse_comp_generators()?;
+        self.expect_op(Op::RBracket, "after the comprehension")?;
+        Ok(Expr::ListComp {
+            element: Box::new(element),
+            generators,
+        })
+    }
+
+    fn parse_comp_generators(&mut self) -> Result<Vec<CompGen>, SyntaxError> {
         let mut generators = Vec::new();
         while self.eat_kw(Kw::For) {
             let target = self.parse_target()?;
@@ -1145,11 +1234,67 @@ impl Parser {
                 conditions,
             });
         }
-        self.expect_op(Op::RBracket, "after the comprehension")?;
-        Ok(Expr::ListComp {
-            element: Box::new(element),
-            generators,
+        Ok(generators)
+    }
+
+    fn parse_lambda(&mut self) -> Result<Expr, SyntaxError> {
+        self.expect_kw(Kw::Lambda, "at the start of a lambda expression")?;
+        let mut params = Vec::new();
+        if !self.check_op(Op::Colon) {
+            loop {
+                if self.check_op(Op::Star) || self.check_op(Op::StarStar) {
+                    return self.error(String::from(
+                        "variadic parameters (*args / **kwargs) are not supported",
+                    ));
+                }
+                let name = self.expect_name("a parameter name after 'lambda'")?;
+                let default = if self.eat_op(Op::Assign) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                params.push(Param { name, default });
+                if !self.eat_op(Op::Comma) {
+                    break;
+                }
+                if self.check_op(Op::Colon) {
+                    break;
+                }
+            }
+        }
+        self.expect_op(Op::Colon, "after the lambda parameters")?;
+        let body = self.parse_expr()?;
+        Ok(Expr::Lambda {
+            params,
+            body: Rc::new(body),
         })
+    }
+
+    fn fstring_parts(
+        &mut self,
+        parts: &[FStringLexPart],
+        line: u32,
+        column: u32,
+    ) -> Result<Vec<FStringPart>, SyntaxError> {
+        let mut out = Vec::with_capacity(parts.len());
+        for part in parts {
+            match part {
+                FStringLexPart::Text(text) => out.push(FStringPart::Text(text.clone())),
+                FStringLexPart::Value {
+                    text,
+                    spec,
+                    conversion,
+                } => {
+                    let expression = parse_expression_fragment(text, line, column)?;
+                    out.push(FStringPart::Value {
+                        expression: Box::new(expression),
+                        spec: spec.clone(),
+                        conversion: *conversion,
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     // ── assignment targets ─────────────────────────────────────────────────
@@ -1220,6 +1365,39 @@ impl Parser {
         }
         Ok(name)
     }
+}
+
+/// Parse the source text of one f-string expression. Positions in errors are
+/// reported at the f-string's opening token: the fragment is a separate token
+/// stream, and its offsets would otherwise look like line 1.
+fn parse_expression_fragment(text: &str, line: u32, column: u32) -> Result<Expr, SyntaxError> {
+    let tokens = tokenize(text).map_err(|error| {
+        SyntaxError::new(
+            format!("in f-string expression: {}", error.message),
+            line,
+            column,
+        )
+    })?;
+    let mut parser = Parser { tokens, pos: 0 };
+    let expression = parser.parse_testlist().map_err(|error| {
+        SyntaxError::new(
+            format!("in f-string expression: {}", error.message),
+            line,
+            column,
+        )
+    })?;
+    parser.skip_newlines();
+    if !matches!(parser.peek(), Tok::Eof) {
+        return Err(SyntaxError::new(
+            format!(
+                "in f-string expression: unexpected {}",
+                Parser::describe(parser.peek())
+            ),
+            line,
+            column,
+        ));
+    }
+    Ok(expression)
 }
 
 fn compound_assignment_op(tok: &Tok) -> Option<BinOp> {

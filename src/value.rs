@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::fmt::Write;
 
-use crate::ast::Stmt;
+use crate::ast::{Expr, Stmt};
 
 /// A lexical environment. Function calls get one of these; the module scope
 /// and class bodies get their own.
@@ -104,11 +104,19 @@ pub fn env_find_nonlocal(env: &EnvRef, name: &str) -> Option<EnvRef> {
 
 // ── functions, classes, instances ──────────────────────────────────────────
 
+/// What a callable evaluates. A `def` owns a statement block; a `lambda`
+/// owns one expression, which keeps the AST borrowable for the module's
+/// lifetime without cloning it.
+pub enum FunctionBody {
+    Block(Rc<Vec<Stmt>>),
+    Expression(Rc<Expr>),
+}
+
 pub struct Function {
     pub name: Rc<str>,
     /// Parameters with defaults already evaluated at `def` time.
     pub params: Vec<(Rc<str>, Option<Value>)>,
-    pub body: Rc<Vec<Stmt>>,
+    pub body: FunctionBody,
     pub closure: EnvRef,
     /// The module the function was defined in, for traceback lines.
     pub filename: Rc<str>,
@@ -131,6 +139,8 @@ pub enum BuiltinType {
     List,
     Tuple,
     Dict,
+    Set,
+    Bytes,
     Function,
     Type,
     Module,
@@ -151,6 +161,8 @@ impl BuiltinType {
             BuiltinType::List => "list",
             BuiltinType::Tuple => "tuple",
             BuiltinType::Dict => "dict",
+            BuiltinType::Set => "set",
+            BuiltinType::Bytes => "bytes",
             BuiltinType::Function => "function",
             BuiltinType::Type => "type",
             BuiltinType::Module => "module",
@@ -188,52 +200,82 @@ pub struct ModuleValue {
 pub struct FileValue {
     pub name: Rc<str>,
     pub mode: Rc<str>,
-    pub data: String,
+    /// File contents are bytes. Text mode only ever stores valid UTF-8 (the
+    /// constructor validates it), while binary mode is unrestricted.
+    pub data: Vec<u8>,
     pub pos: usize,
     pub readable: bool,
     pub writable: bool,
     pub closed: bool,
     pub dirty: bool,
+    pub binary: bool,
 }
 
 impl Drop for FileValue {
     fn drop(&mut self) {
         // Python closes the file when the last reference dies, and a buffered
         // writer flushes. Our `open(..., 'w')` buffers in memory, so this is
-        // where an unclosed file's text reaches the filesystem. A write error
+        // where an unclosed file's bytes reach the filesystem. A write error
         // here cannot be reported anywhere (the value is being dropped), so it
         // is ignored exactly like a close error in CPython's `__del__`.
         if self.writable && self.dirty && !self.closed {
-            let _ = crate::platform::write_text(&self.name, &self.data);
+            let _ = crate::platform::write_bytes(&self.name, &self.data);
         }
     }
 }
 
 impl FileValue {
-    pub fn close(&mut self) -> Result<(), String> {
-        if self.closed {
-            return Ok(());
-        }
-        if self.writable && self.dirty {
-            crate::platform::write_text(&self.name, &self.data)?;
-            self.dirty = false;
-        }
-        self.closed = true;
-        Ok(())
-    }
-
-    pub fn read(&mut self, count: Option<i64>) -> Result<String, String> {
+    fn check_read(&self) -> Result<(), String> {
         if self.closed {
             return Err(String::from("I/O operation on closed file"));
         }
         if !self.readable {
             return Err(String::from("not readable"));
         }
+        Ok(())
+    }
+
+    fn check_write(&self) -> Result<(), String> {
+        if self.closed {
+            return Err(String::from("I/O operation on closed file"));
+        }
+        if !self.writable {
+            return Err(String::from("not writable"));
+        }
+        Ok(())
+    }
+
+    pub fn close(&mut self) -> Result<(), String> {
+        if self.closed {
+            return Ok(());
+        }
+        if self.writable && self.dirty {
+            crate::platform::write_bytes(&self.name, &self.data)?;
+            self.dirty = false;
+        }
+        self.closed = true;
+        Ok(())
+    }
+
+    /// One UTF-8 character at `offset`, if the bytes start with a valid one.
+    fn char_at(&self, offset: usize) -> Option<(char, usize)> {
+        let text = core::str::from_utf8(&self.data[offset..]).ok()?;
+        let ch = text.chars().next()?;
+        Some((ch, ch.len_utf8()))
+    }
+
+    pub fn read(&mut self, count: Option<i64>) -> Result<String, String> {
+        self.check_read()?;
+        if self.binary {
+            return Err(String::from("binary file read() returns bytes"));
+        }
         match count {
             None => {
-                let text = String::from(&self.data[self.pos..]);
+                let text = core::str::from_utf8(&self.data[self.pos..])
+                    .map_err(|_| String::from("file contains invalid UTF-8"))?;
+                let out = String::from(text);
                 self.pos = self.data.len();
-                Ok(text)
+                Ok(out)
             }
             Some(count) => {
                 if count < 0 {
@@ -241,73 +283,119 @@ impl FileValue {
                 }
                 let mut end = self.pos;
                 let mut taken = 0i64;
-                while taken < count && end < self.data.len() {
-                    let mut iter = self.data[end..].chars();
-                    if let Some(ch) = iter.next() {
-                        end += ch.len_utf8();
-                        taken += 1;
-                    } else {
-                        break;
+                while taken < count {
+                    match self.char_at(end) {
+                        Some((_, width)) => {
+                            end += width;
+                            taken += 1;
+                        }
+                        None => break,
                     }
                 }
-                let text = String::from(&self.data[self.pos..end]);
+                let text = core::str::from_utf8(&self.data[self.pos..end])
+                    .map_err(|_| String::from("file contains invalid UTF-8"))?;
                 self.pos = end;
-                Ok(text)
+                Ok(String::from(text))
+            }
+        }
+    }
+
+    pub fn read_bytes(&mut self, count: Option<i64>) -> Result<Vec<u8>, String> {
+        self.check_read()?;
+        if !self.binary {
+            return Err(String::from("text file read() returns str"));
+        }
+        match count {
+            None => {
+                let out = self.data[self.pos..].to_vec();
+                self.pos = self.data.len();
+                Ok(out)
+            }
+            Some(count) => {
+                if count < 0 {
+                    return Err(String::from("read length must be non-negative"));
+                }
+                let end = self
+                    .pos
+                    .saturating_add(count as usize)
+                    .min(self.data.len());
+                let out = self.data[self.pos..end].to_vec();
+                self.pos = end;
+                Ok(out)
             }
         }
     }
 
     pub fn readline(&mut self) -> Result<String, String> {
-        if self.closed {
-            return Err(String::from("I/O operation on closed file"));
+        self.check_read()?;
+        if self.binary {
+            return Err(String::from("binary file readline() returns bytes"));
         }
-        if !self.readable {
-            return Err(String::from("not readable"));
+        let bytes = self.readline_bytes_raw()?;
+        String::from_utf8(bytes).map_err(|_| String::from("file contains invalid UTF-8"))
+    }
+
+    pub fn readline_bytes(&mut self) -> Result<Vec<u8>, String> {
+        self.check_read()?;
+        if !self.binary {
+            return Err(String::from("text file readline() returns str"));
         }
+        self.readline_bytes_raw()
+    }
+
+    fn readline_bytes_raw(&mut self) -> Result<Vec<u8>, String> {
         if self.pos >= self.data.len() {
-            return Ok(String::new());
+            return Ok(Vec::new());
         }
         let rest = &self.data[self.pos..];
-        let end = match rest.find('\n') {
+        let end = match rest.iter().position(|byte| *byte == b'\n') {
             Some(offset) => self.pos + offset + 1,
             None => self.data.len(),
         };
-        let text = String::from(&self.data[self.pos..end]);
+        let out = self.data[self.pos..end].to_vec();
         self.pos = end;
-        Ok(text)
+        Ok(out)
+    }
+
+    fn write_raw(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        if self.pos >= self.data.len() {
+            self.data.extend_from_slice(bytes);
+            self.pos = self.data.len();
+        } else {
+            // Overwrite the bytes under the cursor, like a file in `r+`/`w+`
+            // mode; when the new text is longer than the rest of the file this
+            // also extends it. In `a` mode `pos == len`, so the branch above is
+            // the append path.
+            let end = self
+                .pos
+                .saturating_add(bytes.len())
+                .min(self.data.len());
+            self.data.splice(self.pos..end, bytes.iter().copied());
+            self.pos += bytes.len();
+        }
+        self.dirty = true;
+        Ok(bytes.len())
     }
 
     pub fn write(&mut self, text: &str) -> Result<usize, String> {
-        if self.closed {
-            return Err(String::from("I/O operation on closed file"));
+        self.check_write()?;
+        if self.binary {
+            return Err(String::from(
+                "write() argument must be bytes, not str (binary file)",
+            ));
         }
-        if !self.writable {
-            return Err(String::from("not writable"));
+        let bytes = text.as_bytes().to_vec();
+        self.write_raw(&bytes)
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        self.check_write()?;
+        if !self.binary {
+            return Err(String::from(
+                "write() argument must be str, not bytes (text file)",
+            ));
         }
-        if self.pos >= self.data.len() {
-            self.data.push_str(text);
-            self.pos = self.data.len();
-        } else {
-            // Overwrite the characters under the cursor, like a text file in
-            // `r+`/`w+` mode; when `text` is longer than the rest of the file
-            // this also extends it. In `a` mode `pos == len`, so the branch
-            // above is the append path.
-            let mut end = self.pos;
-            for _ in 0..text.chars().count() {
-                if end >= self.data.len() {
-                    break;
-                }
-                if let Some(ch) = self.data[end..].chars().next() {
-                    end += ch.len_utf8();
-                } else {
-                    break;
-                }
-            }
-            self.data.replace_range(self.pos..end, text);
-            self.pos += text.len();
-        }
-        self.dirty = true;
-        Ok(text.chars().count())
+        self.write_raw(bytes)
     }
 }
 
@@ -339,6 +427,14 @@ pub enum IterState {
     },
     DictKeys {
         entries: Rc<RefCell<Vec<(Value, Value)>>>,
+        index: usize,
+    },
+    SetElems {
+        items: Rc<RefCell<Vec<Value>>>,
+        index: usize,
+    },
+    Bytes {
+        data: Rc<Vec<u8>>,
         index: usize,
     },
     Enumerate {
@@ -376,6 +472,8 @@ pub enum BuiltinId {
     List,
     Dict,
     Tuple,
+    Set,
+    Bytes,
     Type,
     IsInstance,
     Open,
@@ -446,6 +544,42 @@ pub enum BuiltinId {
     DictSetdefault,
     DictClear,
     DictCopy,
+    // set methods
+    SetAdd,
+    SetRemove,
+    SetDiscard,
+    SetUnion,
+    SetIntersection,
+    SetDifference,
+    SetIssubset,
+    SetSuperset,
+    SetCopy,
+    SetClear,
+    // bytes methods
+    BytesDecode,
+    BytesHex,
+    StrEncode,
+    // map
+    Map,
+    // os module
+    OsGetpid,
+    OsGetppid,
+    OsGetcwd,
+    OsListdir,
+    OsMkdir,
+    OsMakedirs,
+    OsRemove,
+    OsRmdir,
+    OsRename,
+    OsStat,
+    OsFork,
+    OsExecv,
+    OsWaitpid,
+    OsWait,
+    OsSystem,
+    // json module
+    JsonDumps,
+    JsonLoads,
     // file methods
     FileRead,
     FileReadline,
@@ -454,6 +588,8 @@ pub enum BuiltinId {
     FileWritelines,
     FileClose,
     FileFlush,
+    FileEnter,
+    FileExit,
 }
 
 pub struct BuiltinValue {
@@ -480,6 +616,8 @@ pub fn builtin_name(id: BuiltinId) -> &'static str {
         BuiltinId::List => "list",
         BuiltinId::Dict => "dict",
         BuiltinId::Tuple => "tuple",
+        BuiltinId::Set => "set",
+        BuiltinId::Bytes => "bytes",
         BuiltinId::Type => "type",
         BuiltinId::IsInstance => "isinstance",
         BuiltinId::Open => "open",
@@ -553,6 +691,39 @@ pub fn builtin_name(id: BuiltinId) -> &'static str {
         BuiltinId::FileWritelines => "writelines",
         BuiltinId::FileClose => "close",
         BuiltinId::FileFlush => "flush",
+        BuiltinId::SetAdd => "add",
+        BuiltinId::SetRemove => "remove",
+        BuiltinId::SetDiscard => "discard",
+        BuiltinId::SetUnion => "union",
+        BuiltinId::SetIntersection => "intersection",
+        BuiltinId::SetDifference => "difference",
+        BuiltinId::SetIssubset => "issubset",
+        BuiltinId::SetSuperset => "issuperset",
+        BuiltinId::SetCopy => "copy",
+        BuiltinId::SetClear => "clear",
+        BuiltinId::BytesDecode => "decode",
+        BuiltinId::BytesHex => "hex",
+        BuiltinId::StrEncode => "encode",
+        BuiltinId::Map => "map",
+        BuiltinId::OsGetpid => "getpid",
+        BuiltinId::OsGetppid => "getppid",
+        BuiltinId::OsGetcwd => "getcwd",
+        BuiltinId::OsListdir => "listdir",
+        BuiltinId::OsMkdir => "mkdir",
+        BuiltinId::OsMakedirs => "makedirs",
+        BuiltinId::OsRemove => "remove",
+        BuiltinId::OsRmdir => "rmdir",
+        BuiltinId::OsRename => "rename",
+        BuiltinId::OsStat => "stat",
+        BuiltinId::OsFork => "fork",
+        BuiltinId::OsExecv => "execv",
+        BuiltinId::OsWaitpid => "waitpid",
+        BuiltinId::OsWait => "wait",
+        BuiltinId::OsSystem => "system",
+        BuiltinId::JsonDumps => "dumps",
+        BuiltinId::JsonLoads => "loads",
+        BuiltinId::FileEnter => "__enter__",
+        BuiltinId::FileExit => "__exit__",
     }
 }
 
@@ -568,6 +739,8 @@ pub enum Value {
     List(Rc<RefCell<Vec<Value>>>),
     Tuple(Rc<Vec<Value>>),
     Dict(Rc<RefCell<Vec<(Value, Value)>>>),
+    Set(Rc<RefCell<Vec<Value>>>),
+    Bytes(Rc<Vec<u8>>),
     Function(Rc<Function>),
     Builtin(Rc<BuiltinValue>),
     Class(Rc<Class>),
@@ -596,6 +769,14 @@ impl Value {
         Value::Dict(Rc::new(RefCell::new(entries)))
     }
 
+    pub fn set(items: Vec<Value>) -> Value {
+        Value::Set(Rc::new(RefCell::new(items)))
+    }
+
+    pub fn bytes(data: Vec<u8>) -> Value {
+        Value::Bytes(Rc::new(data))
+    }
+
     pub fn builtin(id: BuiltinId) -> Value {
         Value::Builtin(Rc::new(BuiltinValue { id, receiver: None }))
     }
@@ -622,6 +803,8 @@ impl Value {
             Value::List(items) => !items.borrow().is_empty(),
             Value::Tuple(items) => !items.is_empty(),
             Value::Dict(entries) => !entries.borrow().is_empty(),
+            Value::Set(items) => !items.borrow().is_empty(),
+            Value::Bytes(data) => !data.is_empty(),
             Value::Range(range) => range.len > 0,
             _ => true,
         }
@@ -638,6 +821,8 @@ impl Value {
             Value::List(_) => "list",
             Value::Tuple(_) => "tuple",
             Value::Dict(_) => "dict",
+            Value::Set(_) => "set",
+            Value::Bytes(_) => "bytes",
             Value::Function(_) | Value::BoundMethod(_) => "function",
             Value::Builtin(_) => "builtin_function_or_method",
             Value::Class(_) => "type",
@@ -659,6 +844,8 @@ impl Value {
             Value::List(_) => BuiltinType::List,
             Value::Tuple(_) => BuiltinType::Tuple,
             Value::Dict(_) => BuiltinType::Dict,
+            Value::Set(_) => BuiltinType::Set,
+            Value::Bytes(_) => BuiltinType::Bytes,
             Value::Function(_) | Value::BoundMethod(_) => BuiltinType::Function,
             Value::Builtin(_) => BuiltinType::Function,
             Value::Class(_) => BuiltinType::Type,
@@ -694,6 +881,7 @@ impl Value {
         match self {
             Value::None | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => true,
             Value::Tuple(items) => items.iter().all(Value::is_hashable),
+            Value::Bytes(_) => true,
             Value::Class(_) | Value::Instance(_) => true,
             _ => false,
         }
@@ -764,6 +952,22 @@ fn write_repr(out: &mut String, value: &Value, depth: usize) {
             }
             out.push('}');
         }
+        Value::Set(items) => {
+            let items = items.borrow();
+            if items.is_empty() {
+                out.push_str("set()");
+            } else {
+                out.push('{');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    write_repr(out, item, depth + 1);
+                }
+                out.push('}');
+            }
+        }
+        Value::Bytes(data) => write_bytes_repr(out, data),
         Value::Function(function) => {
             let _ = write!(out, "<function {}>", function.name);
         }
@@ -848,6 +1052,24 @@ fn write_string_repr(out: &mut String, text: &str) {
     out.push('\'');
 }
 
+fn write_bytes_repr(out: &mut String, data: &[u8]) {
+    out.push_str("b'");
+    for byte in data {
+        match *byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            b'\n' => out.push_str("\\n"),
+            b'\t' => out.push_str("\\t"),
+            b'\r' => out.push_str("\\r"),
+            0x20..=0x7e => out.push(*byte as char),
+            other => {
+                let _ = write!(out, "\\x{:02x}", other);
+            }
+        }
+    }
+    out.push('\'');
+}
+
 // ── equality and ordering ─────────────────────────────────────────────────
 
 pub fn values_equal(left: &Value, right: &Value) -> bool {
@@ -920,6 +1142,19 @@ fn equal_depth(left: &Value, right: &Value, depth: usize) -> bool {
             }
             true
         }
+        (Value::Set(a), Value::Set(b)) => {
+            if Rc::ptr_eq(a, b) {
+                return true;
+            }
+            let a = a.borrow();
+            let b = b.borrow();
+            if a.len() != b.len() {
+                return false;
+            }
+            a.iter()
+                .all(|item| set_find(&b, item).is_some())
+        }
+        (Value::Bytes(a), Value::Bytes(b)) => a.as_slice() == b.as_slice(),
         (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(a, b),
         (Value::Instance(a), Value::Instance(b)) => Rc::ptr_eq(a, b),
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
@@ -956,6 +1191,8 @@ pub fn is_same(left: &Value, right: &Value) -> bool {
         (Value::List(a), Value::List(b)) => Rc::ptr_eq(a, b),
         (Value::Tuple(a), Value::Tuple(b)) => Rc::ptr_eq(a, b),
         (Value::Dict(a), Value::Dict(b)) => Rc::ptr_eq(a, b),
+        (Value::Set(a), Value::Set(b)) => Rc::ptr_eq(a, b),
+        (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
         (Value::Builtin(a), Value::Builtin(b)) => Rc::ptr_eq(a, b),
         (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(a, b),
@@ -1070,6 +1307,25 @@ pub fn dict_set(entries: &mut Vec<(Value, Value)>, key: Value, value: Value) {
     }
 }
 
+// ── sets ───────────────────────────────────────────────────────────────────
+
+/// Linear membership test, using Python equality (and the identity shortcut
+/// that also makes a NaN element findable).
+pub fn set_find(items: &[Value], needle: &Value) -> Option<usize> {
+    items
+        .iter()
+        .position(|candidate| is_same(candidate, needle) || values_equal(candidate, needle))
+}
+
+/// Insert without duplicating; returns whether the element was new.
+pub fn set_insert(items: &mut Vec<Value>, value: Value) -> bool {
+    if set_find(items, &value).is_some() {
+        return false;
+    }
+    items.push(value);
+    true
+}
+
 // ── iteration ──────────────────────────────────────────────────────────────
 
 impl IterState {
@@ -1126,6 +1382,21 @@ impl IterState {
                 }
                 entry
             }
+            IterState::SetElems { items, index } => {
+                let borrowed = items.borrow();
+                let value = borrowed.get(*index).cloned();
+                if value.is_some() {
+                    *index += 1;
+                }
+                value
+            }
+            IterState::Bytes { data, index } => {
+                let byte = data.get(*index).copied();
+                if byte.is_some() {
+                    *index += 1;
+                }
+                byte.map(|value| Value::Int(value as i64))
+            }
             IterState::Enumerate { inner, index } => {
                 let value = iterator_next(inner)?;
                 let counter = *index;
@@ -1150,9 +1421,16 @@ impl IterState {
             }
             IterState::File { file } => {
                 let mut borrowed = file.borrow_mut();
-                match borrowed.readline() {
-                    Ok(line) if !line.is_empty() => Some(Value::Str(Rc::from(line))),
-                    _ => None,
+                if borrowed.binary {
+                    match borrowed.readline_bytes() {
+                        Ok(line) if !line.is_empty() => Some(Value::Bytes(Rc::new(line))),
+                        _ => None,
+                    }
+                } else {
+                    match borrowed.readline() {
+                        Ok(line) if !line.is_empty() => Some(Value::Str(Rc::from(line))),
+                        _ => None,
+                    }
                 }
             }
         }

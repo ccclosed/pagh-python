@@ -124,4 +124,80 @@ run: /mnt/pythonc exited with code 0
 pagh:rv64> run /mnt/pythonc -c print(1/2)
 0.5
 run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/lambda_map.py
+lambda defaults: 15 16
+lambda map: [2, 4, 6]
+sorted key: ['os', 'pagh', 'interpreter']
+sort key: [('a', 1), ('b', 2), ('c', 3)]
+lambda ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/with_open.py
+with file: alpha|beta|
+enter first
+enter second
+body first second
+exit second (None, None)
+exit first (None, None)
+events: [(None, None)] [(None, None)]
+suppressed: ('ValueError', 'suppressed')
+file exit propagates: not suppressed
+with ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/sets_demo.py
+literal: {3, 1, 2} len: 3 in: True
+add/remove: [2, 3, 4]
+union: [1, 2, 3, 4]
+intersection: [3]
+difference: [1, 2]
+constructor: {1, 2, 3}
+set comp: [0, 4, 16]
+dict comp: {'0': 0, '1': 10, '2': 20}
+iter 1
+iter 3
+iter 5
+sets ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/bytes_demo.py
+literal: b'pagh' len: 4 index: 112 slice: b'ag'
+escaped: b'line\nA\xff'
+encode/decode: b'hello' hello
+bytes(): b'ABC' b'\x00\x00'
+hex: 414243
+bytes ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/bytes_file.py
+binary write: 7 bytes
+binary read: b'\x00\x01pagh\xff' len: 7
+binary file ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/fstrings_demo.py
+hello pagh
+pi=3.14 count=42
+repr='pagh' width=   42
+braces {ok}
+fstrings ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/os_demo.py
+listdir: ['file.txt', 'nested']
+stat: 8 file True False
+rename: ['nested', 'renamed.txt']
+cwd stat: dir True
+pid: True True
+cwd: /
+os ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/json_demo.py
+dumps: {"name": "pagh", "ok": true, "count": 3, "ratio": 1.5, "items": [1, 2, null, "x"]}
+loads: {'name': 'pagh', 'ok': True, 'count': 3, 'ratio': 1.5, 'items': [1, 2, None, 'x']}
+escaped: {"quote": "he said \"hi\"", "newline": "a\nb"}
+json ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/os_proc.py
+hello from pagh-python
+arithmetic: 7 3 1 1024
+builtins: 5 7 3 4
+sep/end:-a-b-c.
+child: True status: 0
+proc ok
+run: /mnt/pythonc exited with code 0
 pagh:rv64> 
