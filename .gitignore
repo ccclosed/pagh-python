@@ -2,3 +2,5 @@
 *.img
 __pycache__/
 *.pyc
+hostcheck/target/
+
