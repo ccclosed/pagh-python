@@ -1,5 +1,3 @@
-![pythonc demo](docs/demo-python.gif)
-
 # pagh-python — нативный интерпретатор Python для pagh-riscv
 
 Собственная реализация Python (не CPython) на Rust поверх `libpagh`:
