@@ -1,0 +1,15 @@
+run /mnt/pythonc /mnt/hello.py
+run /mnt/pythonc /mnt/functions.py
+run /mnt/pythonc /mnt/collections_demo.py
+run /mnt/pythonc /mnt/classes.py
+run /mnt/pythonc /mnt/exceptions.py
+run /mnt/pythonc /mnt/fileio.py
+cat /mnt/py.txt
+cat /mnt/print.txt
+run /mnt/pythonc /mnt/import_main.py
+run /mnt/pythonc /mnt/argv.py one two
+run /mnt/pythonc -c print(6*7)
+run /mnt/pythonc
+run /mnt/pythonc /mnt/syntax_error.py
+run /mnt/pythonc /mnt/uncaught.py
+run /mnt/pythonc /mnt/float_error.py

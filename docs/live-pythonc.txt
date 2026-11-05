@@ -1,0 +1,90 @@
+pagh:rv64> run /mnt/pythonc /mnt/hello.py
+hello from pagh-python
+arithmetic: 7 3 1 1024
+builtins: 5 7 3 4
+sep/end:-a-b-c.
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/functions.py
+fact(6) = 720
+fib(10) = 55
+nested calls: 16
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/collections_demo.py
+list: [2, 3, 4, 5, 6] pop: 1 slice: [3, 4, 5] reversed: [6, 5, 4, 3, 2]
+dict: {'apple': 2, 'pear': 1, 'plum': 3} keys: ['apple', 'pear', 'plum']
+get: 0 items: [('apple', 2), ('pear', 1), ('plum', 3)]
+str: hello, python world
+split: ['a', 'b', '', 'c'] join: x-y-z
+find: 2 count: 2
+replace: bonona title: Hello World
+starts/ends: True True
+slices: bcde ace Hello
+enumerate 0 a
+enumerate 1 b
+zip 1 3
+zip 2 4
+min/max/sum: 2 6 20
+sorted: [1, 2, 5, 9] ['b', 'a']
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/classes.py
+cat makes a sound
+Rex barks
+Animal(cat) isinstance: True False
+counter: 1 2 3
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/exceptions.py
+caught ValueError: bad value
+caught ZeroDivisionError
+propagated: from fail
+try body
+finally runs
+caught KeyError: 'key'
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/fileio.py
+file lines: ['first line', 'second line', 'third line']
+readline: first line
+rest: second line|third line|
+run: /mnt/pythonc exited with code 0
+pagh:rv64> cat /mnt/py.txt
+first line
+second line
+third line
+pagh:rv64> cat /mnt/print.txt
+print to file
+pagh:rv64> run /mnt/pythonc /mnt/import_main.py
+mymod.answer = 42
+mymod.double(4) = 8
+from-import double(21) = 42
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/argv.py one two
+script: /mnt/argv.py
+args: ['one', 'two']
+count: 3
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc -c print(6*7)
+42
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc
+usage: pythonc [-c code | script.py] [args...]
+
+Runs the Python subset implemented by this interpreter. There is no
+CPython standard library, no threads, no processes and no network.
+run: /mnt/pythonc exited with code 2
+pagh:rv64> run /mnt/pythonc /mnt/syntax_error.py
+/mnt/syntax_error.py:2:5: SyntaxError: expected a parameter name, found 'return'
+run: /mnt/pythonc exited with code 1
+pagh:rv64> run /mnt/pythonc /mnt/uncaught.py
+before
+Traceback (most recent call last):
+  File "/mnt/uncaught.py", line 8, in <module>
+  File "/mnt/uncaught.py", line 5, in middle
+  File "/mnt/uncaught.py", line 2, in divide
+ZeroDivisionError: integer division or modulo by zero
+run: /mnt/pythonc exited with code 1
+pagh:rv64> run /mnt/pythonc /mnt/float_error.py
+before float
+Traceback (most recent call last):
+  File "/mnt/float_error.py", line 2, in <module>
+NotImplementedError: floating-point literal '1.5' is not supported: the pagh kernel runs U-mode with the FPU disabled, so this interpreter is integer-only
+run: /mnt/pythonc exited with code 1
+pagh:rv64> 
