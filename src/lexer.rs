@@ -14,9 +14,10 @@
 //!   a backslash-newline continues a logical line outside brackets.
 //! * Blank lines and comment-only lines never produce NEWLINE or indentation
 //!   tokens, which is what makes blank lines inside a block harmless.
-//! * Integer literals are parsed to `i64` here. Float-shaped literals still
-//!   tokenize (as `Float`) so evaluation can raise the documented Python
-//!   `NotImplementedError` instead of a generic syntax error.
+//! * Integer literals are parsed to `i64` and decimal/exponent literals to
+//!   `f64` here, so the parser and evaluator never carry numeric text. Rust's
+//!   `FromStr` for f64 supplies the correctly rounded conversion; a literal
+//!   too large for f64 becomes `inf`, exactly like CPython.
 
 use alloc::format;
 use alloc::rc::Rc;
@@ -25,11 +26,11 @@ use alloc::vec::Vec;
 
 use crate::error::SyntaxError;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum Tok {
     Name(Rc<str>),
     Int(i64),
-    Float(Rc<str>),
+    Float(f64),
     Str(Rc<str>),
     Newline,
     Indent,
@@ -423,9 +424,11 @@ impl Lexer {
             // `.5` and `.5e3`
             self.bump();
             self.consume_digits();
-            self.consume_exponent();
+            if self.exponent_ahead() {
+                self.consume_exponent();
+            }
             let raw: String = self.chars[start..self.pos].iter().collect();
-            return Ok((Tok::Float(Rc::from(raw)), line, column));
+            return self.float_token(&raw, line, column);
         }
 
         if first == '0' {
@@ -493,7 +496,7 @@ impl Lexer {
         }
         let raw: String = self.chars[start..self.pos].iter().collect();
         if is_float {
-            return Ok((Tok::Float(Rc::from(raw)), line, column));
+            return self.float_token(&raw, line, column);
         }
         let cleaned: String = raw.chars().filter(|c| *c != '_').collect();
         match cleaned.parse::<i64>() {
@@ -503,6 +506,25 @@ impl Lexer {
                     "integer literal '{}' does not fit in a signed 64-bit int",
                     raw
                 ),
+                line,
+                column,
+            )),
+        }
+    }
+
+    /// Convert a float-shaped literal to f64. `float::parse` strips legal
+    /// digit-separating underscores and accepts `.5`/`1.`/`1e-2`; the lexer
+    /// only calls it after seeing a decimal point or an exponent.
+    fn float_token(
+        &self,
+        raw: &str,
+        line: u32,
+        column: u32,
+    ) -> Result<(Tok, u32, u32), SyntaxError> {
+        match crate::float::parse(raw) {
+            Some(value) => Ok((Tok::Float(value), line, column)),
+            None => Err(self.error_at(
+                format!("invalid floating-point literal '{}'", raw),
                 line,
                 column,
             )),

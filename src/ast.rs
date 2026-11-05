@@ -108,9 +108,10 @@ pub enum Expr {
     True,
     False,
     Int(i64),
-    /// Kept as text so evaluation can raise a Python `NotImplementedError`
-    /// rather than a syntax error: the kernel disables the U-mode FPU.
-    Float(Rc<str>),
+    /// Decimal/exponent literals are parsed to f64 by the lexer. The kernel
+    /// keeps the U-mode FPU enabled (`sstatus.FS`), so evaluation is a plain
+    /// `Value::Float`.
+    Float(f64),
     Str(Rc<str>),
     Name(Name),
     List(Vec<Expr>),

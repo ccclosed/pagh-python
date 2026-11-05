@@ -3,7 +3,7 @@ name = "pythonc"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "A native, integer-only Python interpreter for the pagh-riscv native ABI"
+description = "A native Python interpreter with int and float support for the pagh-riscv native ABI"
 
 [[bin]]
 name = "pythonc"

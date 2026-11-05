@@ -126,6 +126,7 @@ pub enum BuiltinType {
     NoneType,
     Bool,
     Int,
+    Float,
     Str,
     List,
     Tuple,
@@ -145,6 +146,7 @@ impl BuiltinType {
             BuiltinType::NoneType => "NoneType",
             BuiltinType::Bool => "bool",
             BuiltinType::Int => "int",
+            BuiltinType::Float => "float",
             BuiltinType::Str => "str",
             BuiltinType::List => "list",
             BuiltinType::Tuple => "tuple",
@@ -387,8 +389,25 @@ pub enum BuiltinId {
     All,
     Divmod,
     Pow,
+    Round,
     Hex,
     Id,
+    // math module functions
+    MathSqrt,
+    MathFloor,
+    MathCeil,
+    MathTrunc,
+    MathFabs,
+    MathPow,
+    MathFmod,
+    MathSin,
+    MathCos,
+    MathTan,
+    MathLog,
+    MathLog10,
+    MathExp,
+    MathIsnan,
+    MathIsinf,
     // str methods
     StrSplit,
     StrJoin,
@@ -474,8 +493,24 @@ pub fn builtin_name(id: BuiltinId) -> &'static str {
         BuiltinId::All => "all",
         BuiltinId::Divmod => "divmod",
         BuiltinId::Pow => "pow",
+        BuiltinId::Round => "round",
         BuiltinId::Hex => "hex",
         BuiltinId::Id => "id",
+        BuiltinId::MathSqrt => "sqrt",
+        BuiltinId::MathFloor => "floor",
+        BuiltinId::MathCeil => "ceil",
+        BuiltinId::MathTrunc => "trunc",
+        BuiltinId::MathFabs => "fabs",
+        BuiltinId::MathPow => "pow",
+        BuiltinId::MathFmod => "fmod",
+        BuiltinId::MathSin => "sin",
+        BuiltinId::MathCos => "cos",
+        BuiltinId::MathTan => "tan",
+        BuiltinId::MathLog => "log",
+        BuiltinId::MathLog10 => "log10",
+        BuiltinId::MathExp => "exp",
+        BuiltinId::MathIsnan => "isnan",
+        BuiltinId::MathIsinf => "isinf",
         BuiltinId::StrSplit => "split",
         BuiltinId::StrJoin => "join",
         BuiltinId::StrStrip => "strip",
@@ -528,6 +563,7 @@ pub enum Value {
     None,
     Bool(bool),
     Int(i64),
+    Float(f64),
     Str(Rc<str>),
     List(Rc<RefCell<Vec<Value>>>),
     Tuple(Rc<Vec<Value>>),
@@ -581,6 +617,7 @@ impl Value {
             Value::None => false,
             Value::Bool(value) => *value,
             Value::Int(value) => *value != 0,
+            Value::Float(value) => *value != 0.0,
             Value::Str(text) => !text.is_empty(),
             Value::List(items) => !items.borrow().is_empty(),
             Value::Tuple(items) => !items.is_empty(),
@@ -596,6 +633,7 @@ impl Value {
             Value::None => "NoneType",
             Value::Bool(_) => "bool",
             Value::Int(_) => "int",
+            Value::Float(_) => "float",
             Value::Str(_) => "str",
             Value::List(_) => "list",
             Value::Tuple(_) => "tuple",
@@ -616,6 +654,7 @@ impl Value {
             Value::None => BuiltinType::NoneType,
             Value::Bool(_) => BuiltinType::Bool,
             Value::Int(_) => BuiltinType::Int,
+            Value::Float(_) => BuiltinType::Float,
             Value::Str(_) => BuiltinType::Str,
             Value::List(_) => BuiltinType::List,
             Value::Tuple(_) => BuiltinType::Tuple,
@@ -639,9 +678,21 @@ impl Value {
         }
     }
 
+    /// Numeric value as f64: ints, bools and floats. Used by the mixed
+    /// arithmetic and comparison paths; `as_int` stays integer-only so list
+    /// indices and `range()` still reject floats.
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            Value::Int(value) => Some(*value as f64),
+            Value::Bool(value) => Some(if *value { 1.0 } else { 0.0 }),
+            Value::Float(value) => Some(*value),
+            _ => None,
+        }
+    }
+
     pub fn is_hashable(&self) -> bool {
         match self {
-            Value::None | Value::Bool(_) | Value::Int(_) | Value::Str(_) => true,
+            Value::None | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => true,
             Value::Tuple(items) => items.iter().all(Value::is_hashable),
             Value::Class(_) | Value::Instance(_) => true,
             _ => false,
@@ -676,6 +727,7 @@ fn write_repr(out: &mut String, value: &Value, depth: usize) {
         Value::Int(number) => {
             let _ = write!(out, "{}", number);
         }
+        Value::Float(number) => out.push_str(&crate::float::format(*number)),
         Value::Str(text) => write_string_repr(out, text),
         Value::List(items) => {
             out.push('[');
@@ -809,6 +861,21 @@ fn equal_depth(left: &Value, right: &Value, depth: usize) -> bool {
     if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
         return a == b;
     }
+    // Mixed int/float equality compares the mathematical values, not two
+    // independently rounded doubles: a large i64 and an f64 that happens to
+    // round to the same double must still compare unequal.
+    match (left, right) {
+        (Value::Int(integer), Value::Float(float))
+        | (Value::Float(float), Value::Int(integer)) => {
+            return crate::float::int_equals_float(*integer, *float);
+        }
+        (Value::Bool(flag), Value::Float(float))
+        | (Value::Float(float), Value::Bool(flag)) => {
+            return crate::float::int_equals_float(if *flag { 1 } else { 0 }, *float);
+        }
+        (Value::Float(a), Value::Float(b)) => return a == b,
+        _ => {}
+    }
     match (left, right) {
         (Value::None, Value::None) => true,
         (Value::Str(a), Value::Str(b)) => a == b,
@@ -884,6 +951,7 @@ pub fn is_same(left: &Value, right: &Value) -> bool {
         (Value::None, Value::None) => true,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
         (Value::Str(a), Value::Str(b)) => Rc::ptr_eq(a, b),
         (Value::List(a), Value::List(b)) => Rc::ptr_eq(a, b),
         (Value::Tuple(a), Value::Tuple(b)) => Rc::ptr_eq(a, b),
@@ -965,6 +1033,7 @@ pub fn instance_of_class(value: &Value, target: &Rc<Class>) -> bool {
         return match tag {
             BuiltinType::Object => true,
             BuiltinType::Int => matches!(value, Value::Int(_) | Value::Bool(_)),
+            BuiltinType::Float => matches!(value, Value::Float(_)),
             BuiltinType::Bool => matches!(value, Value::Bool(_)),
             BuiltinType::Type => matches!(value, Value::Class(_)),
             BuiltinType::Function => matches!(value, Value::Function(_)),
@@ -981,9 +1050,12 @@ pub fn instance_of_class(value: &Value, target: &Rc<Class>) -> bool {
 // ── dictionaries ───────────────────────────────────────────────────────────
 
 pub fn dict_find(entries: &[(Value, Value)], key: &Value) -> Option<usize> {
+    // `is_same` first so a NaN key can be looked up (NaN != NaN, but the same
+    // inline f64 has the same bits); CPython gets the same effect through the
+    // identity shortcut in its dict lookup.
     entries
         .iter()
-        .position(|(candidate, _)| values_equal(candidate, key))
+        .position(|(candidate, _)| is_same(candidate, key) || values_equal(candidate, key))
 }
 
 pub fn dict_get(entries: &[(Value, Value)], key: &Value) -> Option<Value> {

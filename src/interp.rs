@@ -160,6 +160,7 @@ impl Interp {
         for tag in [
             BuiltinType::NoneType,
             BuiltinType::Int,
+            BuiltinType::Float,
             BuiltinType::Bool,
             BuiltinType::Str,
             BuiltinType::List,
@@ -291,6 +292,7 @@ impl Interp {
         entries.push((Rc::from("type"), Value::Class(type_class)));
         for tag in [
             BuiltinType::Int,
+            BuiltinType::Float,
             BuiltinType::Bool,
             BuiltinType::Str,
             BuiltinType::List,
@@ -323,13 +325,12 @@ impl Interp {
             ("all", BuiltinId::All),
             ("divmod", BuiltinId::Divmod),
             ("pow", BuiltinId::Pow),
+            ("round", BuiltinId::Round),
             ("hex", BuiltinId::Hex),
             ("id", BuiltinId::Id),
         ] {
             entries.push((Rc::from(name), Value::builtin(id)));
         }
-        // `float` exists only to give the documented integer-only error.
-        entries.push((Rc::from("float"), Value::builtin(BuiltinId::Float)));
         for class in &self.exceptions {
             entries.push((class.name.clone(), Value::Class(class.clone())));
         }
@@ -986,15 +987,7 @@ impl Interp {
             Expr::True => Ok(Value::Bool(true)),
             Expr::False => Ok(Value::Bool(false)),
             Expr::Int(value) => Ok(Value::Int(*value)),
-            Expr::Float(raw) => Err(self.err(
-                "NotImplementedError",
-                format!(
-                    "floating-point literal '{}' is not supported: the pagh kernel \
-                     runs U-mode with the FPU disabled, so this interpreter is \
-                     integer-only",
-                    raw
-                ),
-            )),
+            Expr::Float(value) => Ok(Value::Float(*value)),
             Expr::Str(text) => Ok(Value::Str(text.clone())),
             Expr::Name(name) => self.lookup_name(env, name),
             Expr::List(items) => {
@@ -1030,23 +1023,31 @@ impl Interp {
                 let value = self.eval_expr(value, env)?;
                 match op {
                     UnOp::Not => Ok(Value::Bool(!value.truthy())),
-                    UnOp::Minus => match value.as_int() {
-                        Some(number) => match number.checked_neg() {
-                            Some(result) => Ok(Value::Int(result)),
-                            None => Err(self
-                                .err("OverflowError", String::from("integer negation overflow"))),
+                    UnOp::Minus => match value {
+                        Value::Float(number) => Ok(Value::Float(-number)),
+                        other => match other.as_int() {
+                            Some(number) => match number.checked_neg() {
+                                Some(result) => Ok(Value::Int(result)),
+                                None => Err(self.err(
+                                    "OverflowError",
+                                    String::from("integer negation overflow"),
+                                )),
+                            },
+                            None => Err(self.err(
+                                "TypeError",
+                                format!("bad operand type for unary -: '{}'", other.type_name()),
+                            )),
                         },
-                        None => Err(self.err(
-                            "TypeError",
-                            format!("bad operand type for unary -: '{}'", value.type_name()),
-                        )),
                     },
-                    UnOp::Plus => match value.as_int() {
-                        Some(number) => Ok(Value::Int(number)),
-                        None => Err(self.err(
-                            "TypeError",
-                            format!("bad operand type for unary +: '{}'", value.type_name()),
-                        )),
+                    UnOp::Plus => match value {
+                        Value::Float(number) => Ok(Value::Float(number)),
+                        other => match other.as_int() {
+                            Some(number) => Ok(Value::Int(number)),
+                            None => Err(self.err(
+                                "TypeError",
+                                format!("bad operand type for unary +: '{}'", other.type_name()),
+                            )),
+                        },
                     },
                 }
             }
@@ -1471,6 +1472,7 @@ impl Interp {
                 }
             }
             BuiltinType::Int => self.construct_int(args, kwargs),
+            BuiltinType::Float => self.construct_float(args, kwargs),
             BuiltinType::Str => {
                 if !kwargs.is_empty() || args.len() > 1 {
                     return Err(self.err(
@@ -1536,6 +1538,53 @@ impl Interp {
         }
     }
 
+    /// `float()` / `float(x)` with no keyword arguments, mirroring CPython's
+    /// accepted inputs: int, bool, float and decimal/exponent strings
+    /// (including `inf` and `nan`). No locale is involved.
+    pub(crate) fn construct_float(
+        &mut self,
+        args: &ArgList,
+        kwargs: &[(Name, Value)],
+    ) -> PyResult<Value> {
+        if let Some((name, _)) = kwargs.first() {
+            return Err(self.err(
+                "TypeError",
+                format!("float() got an unexpected keyword argument '{}'", name),
+            ));
+        }
+        if args.len() > 1 {
+            return Err(self.err(
+                "TypeError",
+                format!(
+                    "float() takes at most 1 argument ({} given)",
+                    args.len()
+                ),
+            ));
+        }
+        let Some(value) = args.get(0) else {
+            return Ok(Value::Float(0.0));
+        };
+        match value {
+            Value::Float(number) => Ok(Value::Float(*number)),
+            Value::Int(number) => Ok(Value::Float(*number as f64)),
+            Value::Bool(flag) => Ok(Value::Float(if *flag { 1.0 } else { 0.0 })),
+            Value::Str(text) => match crate::float::parse(text) {
+                Some(number) => Ok(Value::Float(number)),
+                None => Err(self.err(
+                    "ValueError",
+                    format!("could not convert string to float: '{}'", text),
+                )),
+            },
+            other => Err(self.err(
+                "TypeError",
+                format!(
+                    "float() argument must be a string or a real number, not '{}'",
+                    other.type_name()
+                ),
+            )),
+        }
+    }
+
     pub(crate) fn construct_int(
         &mut self,
         args: &ArgList,
@@ -1584,6 +1633,25 @@ impl Interp {
         match value {
             Value::Int(number) => Ok(Value::Int(*number)),
             Value::Bool(flag) => Ok(Value::Int(if *flag { 1 } else { 0 })),
+            Value::Float(number) => {
+                if number.is_nan() {
+                    return Err(self.err(
+                        "ValueError",
+                        String::from("cannot convert float NaN to integer"),
+                    ));
+                }
+                match crate::float::to_i64(*number) {
+                    Some(value) => Ok(Value::Int(value)),
+                    None if number.is_infinite() => Err(self.err(
+                        "OverflowError",
+                        String::from("cannot convert float infinity to integer"),
+                    )),
+                    None => Err(self.err(
+                        "OverflowError",
+                        String::from("int too large to convert to a 64-bit integer"),
+                    )),
+                }
+            }
             Value::Str(text) => {
                 let explicit_base = if args.len() == 2 {
                     match args.get(1).and_then(|value| value.as_int()) {
@@ -1708,6 +1776,9 @@ impl Interp {
                 None => Err(self.err("OverflowError", String::from("integer addition overflow"))),
             };
         }
+        if let (Some(a), Some(b)) = (left.as_float(), right.as_float()) {
+            return Ok(Value::Float(a + b));
+        }
         match (&left, &right) {
             (Value::Str(a), Value::Str(b)) => {
                 let mut joined = String::with_capacity(a.len() + b.len());
@@ -1738,25 +1809,41 @@ impl Interp {
     }
 
     fn numeric_op(&self, op: BinOp, left: Value, right: Value) -> PyResult<Value> {
-        let (Some(a), Some(b)) = (left.as_int(), right.as_int()) else {
-            return Err(self.err(
-                "TypeError",
-                format!(
-                    "unsupported operand type(s) for {}: '{}' and '{}'",
-                    op_text(op),
-                    left.type_name(),
-                    right.type_name()
-                ),
-            ));
-        };
-        let result = match op {
-            BinOp::Sub => a.checked_sub(b),
-            _ => None,
-        };
-        match result {
-            Some(value) => Ok(Value::Int(value)),
-            None => Err(self.err("OverflowError", format!("integer {} overflow", op_text(op)))),
+        if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
+            let result = match op {
+                BinOp::Sub => a.checked_sub(b),
+                _ => None,
+            };
+            return match result {
+                Some(value) => Ok(Value::Int(value)),
+                None => {
+                    Err(self.err("OverflowError", format!("integer {} overflow", op_text(op))))
+                }
+            };
         }
+        if let (Some(a), Some(b)) = (left.as_float(), right.as_float()) {
+            return match op {
+                BinOp::Sub => Ok(Value::Float(a - b)),
+                _ => Err(self.err(
+                    "TypeError",
+                    format!(
+                        "unsupported operand type(s) for {}: '{}' and '{}'",
+                        op_text(op),
+                        left.type_name(),
+                        right.type_name()
+                    ),
+                )),
+            };
+        }
+        Err(self.err(
+            "TypeError",
+            format!(
+                "unsupported operand type(s) for {}: '{}' and '{}'",
+                op_text(op),
+                left.type_name(),
+                right.type_name()
+            ),
+        ))
     }
 
     fn multiply_values(&self, left: Value, right: Value) -> PyResult<Value> {
@@ -1769,10 +1856,13 @@ impl Interp {
                 )),
             };
         }
+        if let (Some(a), Some(b)) = (left.as_float(), right.as_float()) {
+            return Ok(Value::Float(a * b));
+        }
         let (text, count) = match (&left, &right) {
             (Value::Str(text), _) => match right.as_int() {
                 Some(count) => (Some(text.clone()), count),
-                None => (Some(text.clone()), 0),
+                None => (None, 0),
             },
             (_, Value::Str(text)) => match left.as_int() {
                 Some(count) => (Some(text.clone()), count),
@@ -1854,8 +1944,10 @@ impl Interp {
         Ok(Value::tuple(result))
     }
 
+    /// `/` always produces a float, including for two integers (`1 / 2` is
+    /// `0.5`), exactly like Python 3.
     fn divide_values(&self, left: Value, right: Value) -> PyResult<Value> {
-        let (Some(a), Some(b)) = (left.as_int(), right.as_int()) else {
+        let (Some(a), Some(b)) = (left.as_float(), right.as_float()) else {
             return Err(self.err(
                 "TypeError",
                 format!(
@@ -1865,29 +1957,23 @@ impl Interp {
                 ),
             ));
         };
-        if b == 0 {
+        if b == 0.0 {
             return Err(self.err("ZeroDivisionError", String::from("division by zero")));
         }
-        let remainder = a.checked_rem(b).unwrap_or(0);
-        if remainder != 0 {
-            return Err(self.err(
-                "NotImplementedError",
-                format!(
-                    "true division {} / {} is not an integer; floating point is \
-                     unavailable because the pagh kernel disables the U-mode FPU. \
-                     Use // for floor division",
-                    a, b
-                ),
-            ));
-        }
-        match a.checked_div(b) {
-            Some(result) => Ok(Value::Int(result)),
-            None => Err(self.err("OverflowError", String::from("integer division overflow"))),
-        }
+        Ok(Value::Float(a / b))
     }
 
     fn floor_divide_values(&self, left: Value, right: Value) -> PyResult<Value> {
-        let (Some(a), Some(b)) = (left.as_int(), right.as_int()) else {
+        if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
+            return match floor_div_wide(a, b) {
+                Some(result) => Ok(Value::Int(result)),
+                None => Err(self.err(
+                    "ZeroDivisionError",
+                    String::from("integer division or modulo by zero"),
+                )),
+            };
+        }
+        let (Some(a), Some(b)) = (left.as_float(), right.as_float()) else {
             return Err(self.err(
                 "TypeError",
                 format!(
@@ -1897,17 +1983,31 @@ impl Interp {
                 ),
             ));
         };
-        match floor_div_wide(a, b) {
-            Some(result) => Ok(Value::Int(result)),
-            None => Err(self.err(
+        if b == 0.0 {
+            return Err(self.err(
                 "ZeroDivisionError",
-                String::from("integer division or modulo by zero"),
-            )),
+                String::from("float floor division by zero"),
+            ));
         }
+        Ok(Value::Float(crate::float::divmod(a, b).0))
     }
 
     fn modulo_values(&self, left: Value, right: Value) -> PyResult<Value> {
-        let (Some(a), Some(b)) = (left.as_int(), right.as_int()) else {
+        if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
+            if b == 0 {
+                return Err(self.err(
+                    "ZeroDivisionError",
+                    String::from("integer division or modulo by zero"),
+                ));
+            }
+            let quotient = floor_div_i128(a, b);
+            let remainder = a as i128 - quotient * (b as i128);
+            return match i64::try_from(remainder) {
+                Ok(result) => Ok(Value::Int(result)),
+                Err(_) => Err(self.err("OverflowError", String::from("integer modulo overflow"))),
+            };
+        }
+        let (Some(a), Some(b)) = (left.as_float(), right.as_float()) else {
             return Err(self.err(
                 "TypeError",
                 format!(
@@ -1917,22 +2017,27 @@ impl Interp {
                 ),
             ));
         };
-        if b == 0 {
+        if b == 0.0 {
             return Err(self.err(
                 "ZeroDivisionError",
-                String::from("integer division or modulo by zero"),
+                String::from("float modulo by zero"),
             ));
         }
-        let quotient = floor_div_i128(a, b);
-        let remainder = a as i128 - quotient * (b as i128);
-        match i64::try_from(remainder) {
-            Ok(result) => Ok(Value::Int(result)),
-            Err(_) => Err(self.err("OverflowError", String::from("integer modulo overflow"))),
-        }
+        Ok(Value::Float(crate::float::divmod(a, b).1))
     }
 
     fn power_values(&self, left: Value, right: Value) -> PyResult<Value> {
-        let (Some(base), Some(exponent)) = (left.as_int(), right.as_int()) else {
+        let integers = match (left.as_int(), right.as_int()) {
+            (Some(base), Some(exponent)) => Some((base, exponent)),
+            _ => None,
+        };
+        if let Some((base, exponent)) = integers {
+            if exponent >= 0 {
+                return self.integer_power(base, exponent);
+            }
+            return self.float_power(base as f64, exponent as f64);
+        }
+        let (Some(base), Some(exponent)) = (left.as_float(), right.as_float()) else {
             return Err(self.err(
                 "TypeError",
                 format!(
@@ -1942,15 +2047,10 @@ impl Interp {
                 ),
             ));
         };
-        if exponent < 0 {
-            return Err(self.err(
-                "NotImplementedError",
-                String::from(
-                    "a negative exponent produces a float; floating point is \
-                     unavailable because the pagh kernel disables the U-mode FPU",
-                ),
-            ));
-        }
+        self.float_power(base, exponent)
+    }
+
+    fn integer_power(&self, base: i64, exponent: i64) -> PyResult<Value> {
         if exponent > u32::MAX as i64 {
             if base == 0 {
                 return Ok(Value::Int(0));
@@ -1975,27 +2075,102 @@ impl Interp {
         }
     }
 
+    fn float_power(&self, base: f64, exponent: f64) -> PyResult<Value> {
+        if exponent == 0.0 {
+            return Ok(Value::Float(1.0));
+        }
+        if base == 0.0 && exponent < 0.0 {
+            return Err(self.err(
+                "ZeroDivisionError",
+                String::from("zero to a negative power"),
+            ));
+        }
+        let result = crate::float::pow(base, exponent);
+        if result.is_nan() && base < 0.0 && !exponent.is_nan() {
+            return Err(self.err(
+                "ValueError",
+                String::from(
+                    "a negative base with a non-integer exponent produces a complex \
+                     number, which is not supported",
+                ),
+            ));
+        }
+        Ok(Value::Float(result))
+    }
+
     fn compare_op(&self, op: CmpOp, left: &Value, right: &Value) -> PyResult<bool> {
         match op {
             CmpOp::Eq => Ok(values_equal(left, right)),
             CmpOp::NotEq => Ok(!values_equal(left, right)),
             CmpOp::Is => Ok(is_same(left, right)),
             CmpOp::IsNot => Ok(!is_same(left, right)),
-            CmpOp::Lt => Ok(self.cmp_values(left, right)? == Ordering::Less),
-            CmpOp::Le => Ok(self.cmp_values(left, right)? != Ordering::Greater),
-            CmpOp::Gt => Ok(self.cmp_values(left, right)? == Ordering::Greater),
-            CmpOp::Ge => Ok(self.cmp_values(left, right)? != Ordering::Less),
+            CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => {
+                let ordering = match self.numeric_ordering(left, right) {
+                    Some(ordering) => ordering,
+                    None => Some(self.cmp_values(left, right)?),
+                };
+                // A NaN pair has no ordering: Python makes all four
+                // relational comparisons false.
+                let Some(ordering) = ordering else {
+                    return Ok(false);
+                };
+                Ok(match op {
+                    CmpOp::Lt => ordering == Ordering::Less,
+                    CmpOp::Le => ordering != Ordering::Greater,
+                    CmpOp::Gt => ordering == Ordering::Greater,
+                    _ => ordering != Ordering::Less,
+                })
+            }
             CmpOp::In => self.contains_value(right, left),
             CmpOp::NotIn => Ok(!self.contains_value(right, left)?),
         }
     }
 
-    /// Ordering used by comparisons, `min`, `max`, `sorted` and `list.sort`.
-    /// Only int/bool/str and list/tuple of those are orderable; everything else
-    /// is a Python `TypeError`, not an internal panic.
-    pub fn cmp_values(&self, left: &Value, right: &Value) -> PyResult<Ordering> {
+    /// Exact numeric ordering for an int/bool/float pair.
+    ///
+    /// The outer `Option` is `None` when the pair is not numeric (strings,
+    /// lists, ...); the inner one is `None` for NaN, where Python's relational
+    /// operators are all false. Int-vs-float comparisons go through
+    /// `float::cmp_int_float`, so an i64 above 2^53 is not rounded into a
+    /// different ordering.
+    fn numeric_ordering(&self, left: &Value, right: &Value) -> Option<Option<Ordering>> {
         if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
-            return Ok(a.cmp(&b));
+            return Some(Some(a.cmp(&b)));
+        }
+        let (a, b) = match (left.as_float(), right.as_float()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return None,
+        };
+        if a.is_nan() || b.is_nan() {
+            return Some(None);
+        }
+        let ordering = match (left, right) {
+            (Value::Int(integer), Value::Float(float)) => {
+                crate::float::cmp_int_float(*integer, *float)
+            }
+            (Value::Float(float), Value::Int(integer)) => {
+                crate::float::cmp_float_int(*float, *integer)
+            }
+            (Value::Bool(flag), Value::Float(float)) => {
+                crate::float::cmp_int_float(if *flag { 1 } else { 0 }, *float)
+            }
+            (Value::Float(float), Value::Bool(flag)) => {
+                crate::float::cmp_float_int(*float, if *flag { 1 } else { 0 })
+            }
+            _ => a.partial_cmp(&b)?,
+        };
+        Some(Some(ordering))
+    }
+
+    /// Ordering used by comparisons, `min`, `max`, `sorted` and `list.sort`.
+    /// Only int/bool/float/str and list/tuple of those are orderable;
+    /// everything else is a Python `TypeError`, not an internal panic. A NaN
+    /// sorts as equal to its neighbour (Python's `min`/`sorted` ordering with
+    /// NaN is unspecified; relational operators use `numeric_ordering` and
+    /// return false instead).
+    pub fn cmp_values(&self, left: &Value, right: &Value) -> PyResult<Ordering> {
+        if let Some(ordering) = self.numeric_ordering(left, right) {
+            return Ok(ordering.unwrap_or(Ordering::Equal));
         }
         match (left, right) {
             (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
@@ -2534,6 +2709,9 @@ impl Interp {
         if module == "sys" {
             return self.sys_module();
         }
+        if module == "math" {
+            return self.math_module();
+        }
         if let Some((_, value)) = self.module_cache.iter().find(|(name, _)| name == module) {
             return Ok(value.clone());
         }
@@ -2610,6 +2788,46 @@ impl Interp {
         None
     }
 
+    /// The built-in `math` module. Constants and functions are installed as
+    /// ordinary module attributes, so `import math`, `from math import *` and
+    /// `math.sqrt` all work without a `.py` file.
+    fn math_module(&mut self) -> PyResult<Value> {
+        if let Some((_, value)) = self.module_cache.iter().find(|(name, _)| name == "math") {
+            return Ok(value.clone());
+        }
+        let mut attrs: Vec<(Rc<str>, Value)> = Vec::new();
+        attrs.push((Rc::from("pi"), Value::Float(crate::float::PI)));
+        attrs.push((Rc::from("e"), Value::Float(crate::float::E)));
+        attrs.push((Rc::from("inf"), Value::Float(f64::INFINITY)));
+        attrs.push((Rc::from("nan"), Value::Float(f64::NAN)));
+        for (name, id) in [
+            ("sqrt", BuiltinId::MathSqrt),
+            ("floor", BuiltinId::MathFloor),
+            ("ceil", BuiltinId::MathCeil),
+            ("trunc", BuiltinId::MathTrunc),
+            ("fabs", BuiltinId::MathFabs),
+            ("pow", BuiltinId::MathPow),
+            ("fmod", BuiltinId::MathFmod),
+            ("sin", BuiltinId::MathSin),
+            ("cos", BuiltinId::MathCos),
+            ("tan", BuiltinId::MathTan),
+            ("log", BuiltinId::MathLog),
+            ("log10", BuiltinId::MathLog10),
+            ("exp", BuiltinId::MathExp),
+            ("isnan", BuiltinId::MathIsnan),
+            ("isinf", BuiltinId::MathIsinf),
+        ] {
+            attrs.push((Rc::from(name), Value::builtin(id)));
+        }
+        let module = Value::Module(Rc::new(ModuleValue {
+            name: Rc::from("math"),
+            attrs: RefCell::new(attrs),
+        }));
+        self.module_cache
+            .push((String::from("math"), module.clone()));
+        Ok(module)
+    }
+
     fn sys_module(&mut self) -> PyResult<Value> {
         if let Some((_, value)) = self.module_cache.iter().find(|(name, _)| name == "sys") {
             return Ok(value.clone());
@@ -2629,10 +2847,33 @@ impl Interp {
         attrs.push((Rc::from("path"), Value::list(path)));
         attrs.push((
             Rc::from("version"),
-            Value::str("3.4.0 (pagh-python, integer-only)"),
+            Value::str("3.4.0 (pagh-python, float)"),
         ));
         attrs.push((Rc::from("platform"), Value::str("pagh-riscv")));
         attrs.push((Rc::from("maxsize"), Value::Int(i64::MAX)));
+        let mut info: Vec<(Rc<str>, Value)> = Vec::new();
+        for (name, value) in [
+            ("max", Value::Float(f64::MAX)),
+            ("min", Value::Float(f64::MIN_POSITIVE)),
+            ("epsilon", Value::Float(f64::EPSILON)),
+            ("dig", Value::Int(15)),
+            ("mant_dig", Value::Int(53)),
+            ("max_exp", Value::Int(1024)),
+            ("min_exp", Value::Int(-1021)),
+            ("max_10_exp", Value::Int(308)),
+            ("min_10_exp", Value::Int(-307)),
+            ("radix", Value::Int(2)),
+            ("rounds", Value::Int(1)),
+        ] {
+            info.push((Rc::from(name), value));
+        }
+        attrs.push((
+            Rc::from("float_info"),
+            Value::Module(Rc::new(ModuleValue {
+                name: Rc::from("sys.float_info"),
+                attrs: RefCell::new(info),
+            })),
+        ));
         let module = Value::Module(Rc::new(ModuleValue {
             name: Rc::from("sys"),
             attrs: RefCell::new(attrs),

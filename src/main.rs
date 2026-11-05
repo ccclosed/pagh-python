@@ -14,6 +14,7 @@ extern crate alloc;
 mod ast;
 mod builtins;
 mod error;
+mod float;
 mod interp;
 mod lexer;
 mod parser;

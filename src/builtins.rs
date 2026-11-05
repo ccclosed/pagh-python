@@ -63,6 +63,22 @@ pub fn call(
         BuiltinId::All => builtin_any_all(interp, args, kwargs, true),
         BuiltinId::Divmod => builtin_divmod(interp, args, kwargs),
         BuiltinId::Pow => builtin_pow(interp, args, kwargs),
+        BuiltinId::Round => builtin_round(interp, args, kwargs),
+        BuiltinId::MathSqrt => math_sqrt(interp, args, kwargs),
+        BuiltinId::MathFloor => math_floor(interp, args, kwargs),
+        BuiltinId::MathCeil => math_ceil(interp, args, kwargs),
+        BuiltinId::MathTrunc => math_trunc(interp, args, kwargs),
+        BuiltinId::MathFabs => math_fabs(interp, args, kwargs),
+        BuiltinId::MathPow => math_pow(interp, args, kwargs),
+        BuiltinId::MathFmod => math_fmod(interp, args, kwargs),
+        BuiltinId::MathSin => math_sin(interp, args, kwargs),
+        BuiltinId::MathCos => math_cos(interp, args, kwargs),
+        BuiltinId::MathTan => math_tan(interp, args, kwargs),
+        BuiltinId::MathLog => math_log(interp, args, kwargs),
+        BuiltinId::MathLog10 => math_log10(interp, args, kwargs),
+        BuiltinId::MathExp => math_exp(interp, args, kwargs),
+        BuiltinId::MathIsnan => math_isnan(interp, args, kwargs),
+        BuiltinId::MathIsinf => math_isinf(interp, args, kwargs),
         BuiltinId::Hex => builtin_hex(interp, args, kwargs),
         BuiltinId::Id => builtin_id(interp, args, kwargs),
         _ => call_method(interp, builtin, args, kwargs),
@@ -372,17 +388,14 @@ fn builtin_range(interp: &Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -
     }
 }
 
-fn builtin_float(interp: &Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
-    no_kwargs(interp, kwargs, "float")?;
-    expect_args(interp, args, "float", 0, 1)?;
-    Err(interp.err(
-        "NotImplementedError",
-        String::from(
-            "float is not available: this interpreter stores integers only because the \
-             pagh kernel disables the U-mode FPU. Use int arithmetic or fixed-point \
-             scaling instead",
-        ),
-    ))
+fn builtin_float(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    // `float` is exposed as a class, so this path is only a defensive fallback
+    // for a BuiltinId::Float value created elsewhere.
+    interp.construct_float(args, kwargs)
 }
 
 fn builtin_str(
@@ -402,6 +415,9 @@ fn builtin_abs(interp: &Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> 
     no_kwargs(interp, kwargs, "abs")?;
     expect_args(interp, args, "abs", 1, 1)?;
     let value = argument(interp, args, 0, "abs")?;
+    if let Value::Float(number) = value {
+        return Ok(Value::Float(crate::float::abs(*number)));
+    }
     match value.as_int() {
         Some(number) => match number.checked_abs() {
             Some(result) => Ok(Value::Int(result)),
@@ -942,29 +958,23 @@ fn builtin_any_all(
 fn builtin_divmod(interp: &Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "divmod")?;
     expect_args(interp, args, "divmod", 2, 2)?;
-    let left = as_int(
-        interp,
-        argument(interp, args, 0, "divmod")?,
-        "divmod() argument",
-    )?;
-    let right = as_int(
-        interp,
-        argument(interp, args, 1, "divmod")?,
-        "divmod() argument",
-    )?;
-    let quotient = interp.binary_op(BinOp::FloorDiv, Value::Int(left), Value::Int(right))?;
-    let remainder = interp.binary_op(BinOp::Mod, Value::Int(left), Value::Int(right))?;
+    let left = argument(interp, args, 0, "divmod")?.clone();
+    let right = argument(interp, args, 1, "divmod")?.clone();
+    let quotient = interp.binary_op(BinOp::FloorDiv, left.clone(), right.clone())?;
+    let remainder = interp.binary_op(BinOp::Mod, left, right)?;
     Ok(Value::tuple(alloc::vec![quotient, remainder]))
 }
 
 fn builtin_pow(interp: &Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "pow")?;
     expect_args(interp, args, "pow", 2, 3)?;
-    let base = as_int(interp, argument(interp, args, 0, "pow")?, "pow() argument")?;
-    let exponent = as_int(interp, argument(interp, args, 1, "pow")?, "pow() argument")?;
+    let base_value = argument(interp, args, 0, "pow")?.clone();
+    let exponent_value = argument(interp, args, 1, "pow")?.clone();
     if args.len() == 2 {
-        return interp.binary_op(BinOp::Pow, Value::Int(base), Value::Int(exponent));
+        return interp.binary_op(BinOp::Pow, base_value, exponent_value);
     }
+    let base = as_int(interp, &base_value, "pow() argument")?;
+    let exponent = as_int(interp, &exponent_value, "pow() argument")?;
     let modulus = as_int(interp, argument(interp, args, 2, "pow")?, "pow() argument")?;
     if modulus == 0 {
         return Err(interp.err("ValueError", String::from("pow() 3rd argument cannot be 0")));
@@ -1000,6 +1010,331 @@ fn pow_mod(base: i64, mut exponent: i64, modulus: i64) -> i64 {
     } else {
         result as i64
     }
+}
+
+// ── float builtins ─────────────────────────────────────────────────────────
+
+fn as_float(interp: &Interp, value: &Value, what: &str) -> PyResult<f64> {
+    match value.as_float() {
+        Some(number) => Ok(number),
+        None => Err(interp.err(
+            "TypeError",
+            format!("{} must be a real number, not '{}'", what, value.type_name()),
+        )),
+    }
+}
+
+fn builtin_round(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    check_kwargs(interp, kwargs, "round", &["ndigits"])?;
+    expect_args(interp, args, "round", 1, 2)?;
+    let value = argument(interp, args, 0, "round")?;
+    let digits = match (args.get(1), keyword(kwargs, "ndigits")) {
+        (Some(_), Some(_)) => {
+            return Err(interp.err(
+                "TypeError",
+                String::from("round() got multiple values for argument 'ndigits'"),
+            ))
+        }
+        (Some(value), None) => Some(as_int(interp, value, "round() ndigits")?),
+        (None, Some(value)) => Some(as_int(interp, value, "round() ndigits")?),
+        (None, None) => None,
+    };
+    match value {
+        Value::Float(number) => {
+            let number = *number;
+            match digits {
+                None => {
+                    if number.is_nan() {
+                        return Err(interp.err(
+                            "ValueError",
+                            String::from("cannot convert float NaN to integer"),
+                        ));
+                    }
+                    if number.is_infinite() {
+                        return Err(interp.err(
+                            "OverflowError",
+                            String::from("cannot convert float infinity to integer"),
+                        ));
+                    }
+                    match crate::float::round_to_i64(number) {
+                        Some(result) => Ok(Value::Int(result)),
+                        None => Err(interp.err(
+                            "OverflowError",
+                            String::from("rounded value is too large for a 64-bit integer"),
+                        )),
+                    }
+                }
+                Some(digits) => Ok(Value::Float(round_float_digits(number, digits))),
+            }
+        }
+        other => match other.as_int() {
+            Some(number) => match digits {
+                None => Ok(Value::Int(number)),
+                Some(digits) if digits >= 0 => Ok(Value::Int(number)),
+                Some(digits) => round_int_digits(interp, number, digits),
+            },
+            None => Err(interp.err(
+                "TypeError",
+                format!(
+                    "type '{}' doesn't define __round__ method",
+                    other.type_name()
+                ),
+            )),
+        },
+    }
+}
+
+/// `round(integer, negative_ndigits)`: half-even on the decimal scale, using
+/// i128 so `round(15, -1)` is 20 and `round(25, -1)` is 20, not a panic.
+fn round_int_digits(interp: &Interp, value: i64, digits: i64) -> PyResult<Value> {
+    let places = digits.unsigned_abs();
+    if places > 38 {
+        return Ok(Value::Int(0));
+    }
+    let factor = match 10i128.checked_pow(places as u32) {
+        Some(factor) => factor,
+        None => return Ok(Value::Int(0)),
+    };
+    let value = value as i128;
+    let quotient = value / factor;
+    let remainder = value % factor;
+    let mut rounded = quotient;
+    let doubled = remainder.abs() * 2;
+    if doubled > factor || (doubled == factor && quotient & 1 != 0) {
+        if remainder > 0 {
+            rounded += 1;
+        } else if remainder < 0 {
+            rounded -= 1;
+        }
+    }
+    match i64::try_from(rounded * factor) {
+        Ok(result) => Ok(Value::Int(result)),
+        Err(_) => Err(interp.err(
+            "OverflowError",
+            String::from("rounded value is too large for a 64-bit integer"),
+        )),
+    }
+}
+
+fn pow10(exponent: u32) -> f64 {
+    let mut factor = 1.0;
+    for _ in 0..exponent {
+        factor *= 10.0;
+    }
+    factor
+}
+
+/// `round(float, ndigits)`, which returns a float.
+///
+/// `core::fmt` already performs correctly rounded decimal conversion and
+/// ties-to-even, so positive `ndigits` formats the value with that many
+/// fractional digits and parses it back. That reproduces CPython's visible
+/// results (`round(2.675, 2) == 2.67`, `round(0.125, 2) == 0.12`) where a
+/// naive `value * 10^n` scale would round 2.675 up. Negative `ndigits` scales
+/// by the power of ten first and then formats with zero fractional digits.
+fn round_float_digits(value: f64, digits: i64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    if digits >= 309 {
+        return value;
+    }
+    if digits <= -309 {
+        return crate::float::copysign(0.0, value);
+    }
+    if digits >= 0 {
+        let text = format!("{:.*}", digits as usize, value);
+        return text.parse::<f64>().unwrap_or(value);
+    }
+    let factor = pow10(digits.unsigned_abs() as u32);
+    let scaled = value / factor;
+    if !scaled.is_finite() {
+        return crate::float::copysign(0.0, value);
+    }
+    format!("{:.0}", scaled).parse::<f64>().unwrap_or(0.0) * factor
+}
+
+// ── math module ────────────────────────────────────────────────────────────
+
+fn math_float_argument(
+    interp: &Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+    name: &str,
+) -> PyResult<f64> {
+    no_kwargs(interp, kwargs, name)?;
+    expect_args(interp, args, name, 1, 1)?;
+    as_float(interp, argument(interp, args, 0, name)?, "math argument")
+}
+
+fn math_sqrt(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    let value = math_float_argument(interp, args, kwargs, "sqrt")?;
+    if value < 0.0 {
+        return Err(interp.err("ValueError", String::from("math domain error")));
+    }
+    Ok(Value::Float(crate::float::sqrt(value)))
+}
+
+fn math_floor(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    math_integer_result(interp, args, kwargs, "floor", crate::float::floor_to_i64)
+}
+
+fn math_ceil(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    math_integer_result(interp, args, kwargs, "ceil", crate::float::ceil_to_i64)
+}
+
+fn math_trunc(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    math_integer_result(interp, args, kwargs, "trunc", crate::float::to_i64)
+}
+
+/// `math.floor`/`ceil`/`trunc` return Python ints. An i64 argument is
+/// returned unchanged, which also avoids rounding it through f64.
+fn math_integer_result(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+    name: &str,
+    convert: fn(f64) -> Option<i64>,
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, name)?;
+    expect_args(interp, args, name, 1, 1)?;
+    let value = argument(interp, args, 0, name)?;
+    if let Some(integer) = value.as_int() {
+        return Ok(Value::Int(integer));
+    }
+    let number = as_float(interp, value, "math argument")?;
+    if number.is_nan() {
+        return Err(interp.err(
+            "ValueError",
+            String::from("cannot convert float NaN to integer"),
+        ));
+    }
+    match convert(number) {
+        Some(result) => Ok(Value::Int(result)),
+        None if number.is_infinite() => Err(interp.err(
+            "OverflowError",
+            String::from("cannot convert float infinity to integer"),
+        )),
+        None => Err(interp.err(
+            "OverflowError",
+            String::from("int too large to convert to a 64-bit integer"),
+        )),
+    }
+}
+
+fn math_fabs(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    let value = math_float_argument(interp, args, kwargs, "fabs")?;
+    Ok(Value::Float(crate::float::abs(value)))
+}
+
+fn math_pow(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "pow")?;
+    expect_args(interp, args, "pow", 2, 2)?;
+    let base = as_float(interp, argument(interp, args, 0, "pow")?, "math argument")?;
+    let exponent = as_float(interp, argument(interp, args, 1, "pow")?, "math argument")?;
+    if base == 0.0 && exponent < 0.0 {
+        return Err(interp.err("ValueError", String::from("math domain error")));
+    }
+    let result = crate::float::pow(base, exponent);
+    if result.is_nan() && base < 0.0 && !exponent.is_nan() {
+        return Err(interp.err("ValueError", String::from("math domain error")));
+    }
+    Ok(Value::Float(result))
+}
+
+fn math_fmod(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "fmod")?;
+    expect_args(interp, args, "fmod", 2, 2)?;
+    let left = as_float(interp, argument(interp, args, 0, "fmod")?, "math argument")?;
+    let right = as_float(interp, argument(interp, args, 1, "fmod")?, "math argument")?;
+    if right == 0.0 || left.is_infinite() {
+        return Err(interp.err("ValueError", String::from("math domain error")));
+    }
+    Ok(Value::Float(crate::float::fmod(left, right)))
+}
+
+/// `math.sin`/`cos`/`tan`: NaN propagates, an infinite argument is a domain
+/// error (CPython raises `ValueError` for the latter).
+fn math_trig(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+    name: &str,
+    function: fn(f64) -> f64,
+) -> PyResult<Value> {
+    let value = math_float_argument(interp, args, kwargs, name)?;
+    if value.is_nan() {
+        return Ok(Value::Float(f64::NAN));
+    }
+    if !value.is_finite() {
+        return Err(interp.err("ValueError", String::from("math domain error")));
+    }
+    Ok(Value::Float(function(value)))
+}
+
+fn math_sin(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    math_trig(interp, args, kwargs, "sin", crate::float::sin)
+}
+
+fn math_cos(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    math_trig(interp, args, kwargs, "cos", crate::float::cos)
+}
+
+fn math_tan(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    math_trig(interp, args, kwargs, "tan", crate::float::tan)
+}
+
+fn math_log(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "log")?;
+    expect_args(interp, args, "log", 1, 2)?;
+    let value = as_float(interp, argument(interp, args, 0, "log")?, "math argument")?;
+    if value < 0.0 || value == 0.0 {
+        return Err(interp.err("ValueError", String::from("math domain error")));
+    }
+    let numerator = crate::float::ln(value);
+    let Some(base_value) = args.get(1) else {
+        return Ok(Value::Float(numerator));
+    };
+    let base = as_float(interp, base_value, "math argument")?;
+    if base <= 0.0 {
+        return Err(interp.err("ValueError", String::from("math domain error")));
+    }
+    let denominator = crate::float::ln(base);
+    if denominator == 0.0 {
+        return Err(interp.err("ZeroDivisionError", String::from("division by zero")));
+    }
+    Ok(Value::Float(numerator / denominator))
+}
+
+fn math_log10(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    let value = math_float_argument(interp, args, kwargs, "log10")?;
+    if value < 0.0 || value == 0.0 {
+        return Err(interp.err("ValueError", String::from("math domain error")));
+    }
+    Ok(Value::Float(crate::float::log10(value)))
+}
+
+fn math_exp(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    let value = math_float_argument(interp, args, kwargs, "exp")?;
+    let result = crate::float::exp(value);
+    if result.is_infinite() && value.is_finite() {
+        return Err(interp.err("OverflowError", String::from("math range error")));
+    }
+    Ok(Value::Float(result))
+}
+
+fn math_isnan(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    let value = math_float_argument(interp, args, kwargs, "isnan")?;
+    Ok(Value::Bool(value.is_nan()))
+}
+
+fn math_isinf(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    let value = math_float_argument(interp, args, kwargs, "isinf")?;
+    Ok(Value::Bool(value.is_infinite()))
 }
 
 fn builtin_hex(interp: &Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {

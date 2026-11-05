@@ -72,6 +72,87 @@ fn arithmetic() -> Result<(), String> {
     Ok(())
 }
 
+fn floats() -> Result<(), String> {
+    // literals: decimal point, leading dot, exponent, underscores, signs
+    expect_repr("x = 1.5", "x", "1.5")?;
+    expect_repr("x = .5", "x", "0.5")?;
+    expect_repr("x = 1e3", "x", "1000.0")?;
+    expect_repr("x = 1.5e-2", "x", "0.015")?;
+    expect_repr("x = 1.", "x", "1.0")?;
+    expect_repr("x = 1_0.5", "x", "10.5")?;
+    expect_repr("x = -2.5 + 1.25", "x", "-1.25")?;
+
+    // true division always returns a float; floor division keeps the type
+    expect_repr("x = 1 / 2", "x", "0.5")?;
+    expect_repr("x = 7 / 2", "x", "3.5")?;
+    expect_repr("x = 7 // 2", "x", "3")?;
+    expect_repr("x = 7.0 // 2", "x", "3.0")?;
+    expect_repr("x = -7.0 // 2", "x", "-4.0")?;
+    expect_repr("x = 7.5 % 2", "x", "1.5")?;
+    expect_repr("x = -7.5 % 2", "x", "0.5")?;
+    expect_repr("x = 7.5 % -2", "x", "-0.5")?;
+    expect_repr("x = 2 ** -1", "x", "0.5")?;
+    expect_repr("x = 2.0 ** 0.5", "x", "1.4142135623730951")?;
+    expect_repr("x = (-2.0) ** 3", "x", "-8.0")?;
+    expect_repr("x = abs(-1.5)", "x", "1.5")?;
+
+    // conversions and truthiness
+    expect_repr("x = int(-3.99)", "x", "-3")?;
+    expect_repr("x = float(3)", "x", "3.0")?;
+    expect_repr("x = float(True)", "x", "1.0")?;
+    expect_repr(r#"x = float("  -1.5e2 ")"#, "x", "-150.0")?;
+    expect_repr("x = bool(0.0)", "x", "False")?;
+    expect_repr("x = bool(-0.0)", "x", "False")?;
+    expect_repr("x = bool(1.5)", "x", "True")?;
+
+    // shortest round-trip formatting, Python exponent spelling
+    expect_repr("x = str(1.0)", "x", "'1.0'")?;
+    expect_repr("x = repr(1.0)", "x", "'1.0'")?;
+    expect_repr("x = str(1e20)", "x", "'1e+20'")?;
+    expect_repr("x = str(1e-7)", "x", "'1e-07'")?;
+    expect_repr("x = str(1.5e-7)", "x", "'1.5e-07'")?;
+    expect_repr("x = str(0.1 + 0.2)", "x", "'0.30000000000000004'")?;
+    expect_repr("x = str(-0.0)", "x", "'-0.0'")?;
+
+    // mixed comparisons and exact int/float equality above 2^53
+    expect_repr("x = 1 == 1.0", "x", "True")?;
+    expect_repr("x = 1 < 1.5", "x", "True")?;
+    expect_repr("x = 9007199254740993 == 9007199254740992.0", "x", "False")?;
+    expect_repr("x = 9007199254740993 > 9007199254740992.0", "x", "True")?;
+    expect_repr(r#"x = float("nan") == float("nan")"#, "x", "False")?;
+    expect_repr(r#"x = float("nan") < 1.0"#, "x", "False")?;
+
+    // round: int/float, optional digits, ties to even
+    expect_repr("x = round(2.5)", "x", "2")?;
+    expect_repr("x = round(3.5)", "x", "4")?;
+    expect_repr("x = round(-2.5)", "x", "-2")?;
+    expect_repr("x = round(1.5, 0)", "x", "2.0")?;
+    expect_repr("x = round(2.675, 2)", "x", "2.67")?;
+    expect_repr("x = round(1234, -2)", "x", "1200")?;
+    expect_repr("x = round(15, -1)", "x", "20")?;
+
+    // math module
+    expect_repr("import math\nx = math.pi", "x", "3.141592653589793")?;
+    expect_repr("import math\nx = math.e", "x", "2.718281828459045")?;
+    expect_repr("import math\nx = math.sqrt(2)", "x", "1.4142135623730951")?;
+    expect_repr("import math\nx = math.sqrt(4)", "x", "2.0")?;
+    expect_repr("import math\nx = math.floor(-2.1)", "x", "-3")?;
+    expect_repr("import math\nx = math.ceil(-2.1)", "x", "-2")?;
+    expect_repr("import math\nx = math.trunc(-2.9)", "x", "-2")?;
+    expect_repr("import math\nx = math.fabs(-2.5)", "x", "2.5")?;
+    expect_repr("import math\nx = math.fmod(-7.5, 2)", "x", "-1.5")?;
+    expect_repr("import math\nx = math.pow(-2, 3)", "x", "-8.0")?;
+    expect_repr("import math\nx = math.sin(0)", "x", "0.0")?;
+    expect_repr("import math\nx = math.cos(0)", "x", "1.0")?;
+    expect_repr("import math\nx = math.log(math.e)", "x", "1.0")?;
+    expect_repr("import math\nx = math.log10(1000)", "x", "3.0")?;
+    expect_repr("import math\nx = math.exp(0)", "x", "1.0")?;
+    expect_repr("import math\nx = math.isnan(math.nan)", "x", "True")?;
+    expect_repr("import math\nx = math.isinf(math.inf)", "x", "True")?;
+    expect_repr("import sys\nx = sys.float_info.dig", "x", "15")?;
+    Ok(())
+}
+
 fn strings() -> Result<(), String> {
     expect_repr(r#"x = "Hello, World".lower()"#, "x", "'hello, world'")?;
     expect_repr(r#"x = "Hello".upper()"#, "x", "'HELLO'")?;
@@ -259,6 +340,7 @@ fn imports() -> Result<(), String> {
 fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
     alloc::vec![
         ("arithmetic", arithmetic as fn() -> Result<(), String>),
+        ("floats", floats),
         ("strings", strings),
         ("lists", lists),
         ("dicts", dicts),
@@ -293,6 +375,11 @@ pub fn selftest() {
 #[test]
 fn arithmetic_works() {
     arithmetic().unwrap();
+}
+
+#[test]
+fn floats_work() {
+    floats().unwrap();
 }
 
 #[test]

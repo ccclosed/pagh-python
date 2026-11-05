@@ -18,6 +18,8 @@ mod ast;
 mod builtins;
 #[path = "../../src/error.rs"]
 mod error;
+#[path = "../../src/float.rs"]
+mod float;
 #[path = "../../src/interp.rs"]
 mod interp;
 #[path = "../../src/lexer.rs"]

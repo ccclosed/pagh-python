@@ -84,7 +84,7 @@ impl Parser {
         match tok {
             Tok::Name(name) => format!("'{}'", name),
             Tok::Int(value) => format!("'{}'", value),
-            Tok::Float(raw) => format!("'{}'", raw),
+            Tok::Float(value) => format!("'{}'", crate::float::format(*value)),
             Tok::Str(_) => String::from("a string"),
             Tok::Newline => String::from("end of line"),
             Tok::Indent => String::from("indent"),
@@ -1020,10 +1020,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Int(value))
             }
-            Tok::Float(raw) => {
-                let raw = raw.clone();
+            Tok::Float(value) => {
+                let value = *value;
                 self.advance();
-                Ok(Expr::Float(raw))
+                Ok(Expr::Float(value))
             }
             Tok::Str(text) => {
                 let first = text.clone();
