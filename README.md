@@ -158,7 +158,12 @@ ZeroDivisionError: integer division or modulo by zero
   корректно округлён (целочисленный алгоритм). `exp`, `log`, `sin`, `cos`,
   `tan` — собственные полиномы без `libm`, поэтому могут отличаться от CPython
   на 1–2 ulp; `round(float, ndigits)` для очень больших величин и
-  отрицательных `ndigits` — до 1 ulp. Decimal/fractions/complex нет.
+  отрицательных `ndigits` — до 1 ulp. Для `|x| > 1e15` аргумент
+  тригонометрических функций редуцируется через `fmod`, поэтому точность на
+  больших аргументах хуже, чем у CPython. Decimal/fractions/complex нет.
+- **Float → int ограничен i64.** `int(float)`, `math.floor`/`ceil`/`trunc` и
+  `round(float)` возвращают `OverflowError` за пределами 64-битного диапазона;
+  CPython в этих случаях вернул бы произвольное целое.
 - **Зависимость от FPU.** f64-инструкции требуют, чтобы ядро оставляло
   `sstatus.FS` включённым при переходе в U-mode. На 0.11.0 это проверено;
   ядро с выключенным FPU уронит первую float-операцию по illegal instruction.
