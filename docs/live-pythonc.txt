@@ -1,3 +1,8 @@
+pagh:rv64> cat /mnt/hello.py
+print("hello from pagh-python")
+print("arithmetic:", 1 + 2 * 3, 7 // 2, 7 % 3, 2 ** 10)
+print("builtins:", len("hello"), abs(-7), max(3, 1, 2), min([9, 4, 6]))
+print("sep/end:", "a", "b", "c", sep="-", end=".\n")
 pagh:rv64> run /mnt/pythonc /mnt/hello.py
 hello from pagh-python
 arithmetic: 7 3 1 1024
@@ -81,10 +86,42 @@ Traceback (most recent call last):
   File "/mnt/uncaught.py", line 2, in divide
 ZeroDivisionError: integer division or modulo by zero
 run: /mnt/pythonc exited with code 1
-pagh:rv64> run /mnt/pythonc /mnt/float_error.py
-before float
-Traceback (most recent call last):
-  File "/mnt/float_error.py", line 2, in <module>
-NotImplementedError: floating-point literal '1.5' is not supported: the pagh kernel runs U-mode with the FPU disabled, so this interpreter is integer-only
-run: /mnt/pythonc exited with code 1
+pagh:rv64> run /mnt/pythonc /mnt/float_arithmetic.py
+literals: 1.5 0.5 1000.0 0.015 1.0 10.5
+mixed: 3.5 5.0 3.75 -1.5 1.5
+float arithmetic ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/float_division.py
+true division: 0.5 3.5 -3.5
+floor/mod: 3.0 -4.0 1.5 0.5 -0.5
+caught integer division by zero
+caught float floor division by zero
+caught float modulo by zero
+float division ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/float_format.py
+str: 1.0 1.5 1e+20 1e-07 1.5e-07
+repr: 1.0 0.30000000000000004 -0.0
+float formatting ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/float_compare.py
+mixed compare: True True True
+nan compare: False False
+float comparison ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/float_math.py
+pi/e: 3.141592653589793 2.718281828459045
+sqrt/pow: 1.4142135623730951 1.4142135623730951
+trig: 0.8414709848078965 0.5403023058681397 1.5574077246549025
+log/exp: 1.0 3.0 2.7182818284590446
+rounding: -3 -2 -2 2.5
+float math ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/float_errors.py
+typed float errors: 6
+float errors ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc -c print(1/2)
+0.5
+run: /mnt/pythonc exited with code 0
 pagh:rv64> 

@@ -1,3 +1,5 @@
+# Live suite for pythonc on the pagh 0.11.0 kernel. One boot, commands in order.
+cat /mnt/hello.py
 run /mnt/pythonc /mnt/hello.py
 run /mnt/pythonc /mnt/functions.py
 run /mnt/pythonc /mnt/collections_demo.py
@@ -12,4 +14,10 @@ run /mnt/pythonc -c print(6*7)
 run /mnt/pythonc
 run /mnt/pythonc /mnt/syntax_error.py
 run /mnt/pythonc /mnt/uncaught.py
-run /mnt/pythonc /mnt/float_error.py
+run /mnt/pythonc /mnt/float_arithmetic.py
+run /mnt/pythonc /mnt/float_division.py
+run /mnt/pythonc /mnt/float_format.py
+run /mnt/pythonc /mnt/float_compare.py
+run /mnt/pythonc /mnt/float_math.py
+run /mnt/pythonc /mnt/float_errors.py
+run /mnt/pythonc -c print(1/2)

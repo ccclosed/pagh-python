@@ -13,15 +13,17 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
 
 **Рабочая версия 0.1.0.** Язык и встроенные функции реализованы настолько,
 насколько это нужно для небольших скриптов на 1 MiB bump-heap ядра pagh.
-Интерпретатор проверен живым прогоном в QEMU на ядре 0.11.0: 13 запусков
-`pythonc` из 13 прошли, включая классы с наследованием, исключения,
-файловый ввод-вывод, импорт локального модуля и диагностику ошибок.
-Сырой транскрипт — [`docs/live-pythonc.txt`](docs/live-pythonc.txt), PASS-лист
-и детали — [`docs/live-testing.md`](docs/live-testing.md).
+Интерпретатор проверен живым прогоном в QEMU на ядре 0.11.0: 21 проверка
+из 21 прошла, включая float-арифметику и модуль `math`, классы с
+наследованием, исключения, файловый ввод-вывод, импорт локального модуля и
+диагностику ошибок. Сырой транскрипт — [`docs/live-pythonc.txt`](docs/live-pythonc.txt),
+PASS-лист и детали — [`docs/live-testing.md`](docs/live-testing.md).
 
-Размер release-ELF — 646 872 байт (≈632 КиБ; лимит ядра — 1 МиБ). Компилятор и
-интерпретатор не используют FPU, потоки, процессы, сеть или динамический
-загрузчик.
+Размер release-ELF — 781 928 байт (≈763 КиБ; лимит ядра — 1 МиБ). Потоков,
+процессов, сети и динамического загрузчика нет. Интерпретатор исполняет
+настоящие f64-инструкции в U-mode, поэтому ядро обязано оставлять `sstatus.FS`
+включённым при `sret` (в 0.11.0 это так; проверено живым запуском
+`/home/oleg/pagh-api/examples/fp.rs`: `fp product=3.375`, `fp sum=5050`, exit 0).
 
 ## Сборка
 
@@ -80,17 +82,20 @@ ZeroDivisionError: integer division or modulo by zero
 
 ## Поддерживается
 
-**Типы:** `None`, `bool`, `int` (64-битный знаковый), `str` (UTF-8),
-`list`, `tuple`, `dict` (с сохранением порядка вставки), `range`, файловые
-объекты, функции, классы и экземпляры. `float`/`set`/`bytes` отсутствуют
-осознанно (см. «Ограничения»).
+**Типы:** `None`, `bool`, `int` (64-битный знаковый), `float` (f64),
+`str` (UTF-8), `list`, `tuple`, `dict` (с сохранением порядка вставки),
+`range`, файловые объекты, функции, классы и экземпляры. `set`/`bytes`
+отсутствуют (см. «Ограничения»).
 
-**Синтаксис и операторы:** литералы, имена, `+ - * / // % **` (включая
-унарные), сравнения (`== != < <= > >= in not in is is not`), цепочки
-сравнений, `and/or/not`, тернарное `a if cond else b`, срезы `a[start:stop:step]`
-для `str`/`list`/`tuple`, индексация, атрибуты, вызовы с позиционными и
+**Синтаксис и операторы:** целые и float-литералы (`1.5`, `.5`, `1e3`,
+`1.5e-2`, `1_0.5`), имена, `+ - * / // % **` (включая унарные), сравнения
+(`== != < <= > >= in not in is is not`), цепочки сравнений, `and/or/not`,
+тернарное `a if cond else b`, срезы `a[start:stop:step]` для
+`str`/`list`/`tuple`, индексация, атрибуты, вызовы с позиционными и
 именованными аргументами. Присваивания (включая цепочки и `+=` и т.п.)
-поддерживаются.
+поддерживаются. `/` всегда возвращает float (`1 / 2 == 0.5`), `//` сохраняет
+тип (int для int, float для float), `%` следует знаку делителя, `**`
+поддерживает отрицательные и float-показатели.
 
 **Управление:** `if/elif/else`, `while` с `break`/`continue`/`pass`,
 `for` по любому итерируемому объекту, `def` с параметрами по умолчанию,
@@ -115,14 +120,19 @@ ZeroDivisionError: integer division or modulo by zero
 
 **Модули:** `import a`, `import a.b`, `from a import b`, `from a import *`;
 поиск в каталоге скрипта, текущем каталоге, `/mnt` и `/`; кеш модулей.
-Встроенный модуль `sys` даёт `argv`, `path`, `version`, `platform`, `maxsize`.
+Встроенный `sys` даёт `argv`, `path`, `version`, `platform`, `maxsize` и
+`float_info` (`max`, `min`, `epsilon`, `dig`, `mant_dig`, ...). Встроенный
+`math` даёт `pi`, `e`, `inf`, `nan`, `sqrt`, `floor`, `ceil`, `trunc`, `fabs`,
+`pow`, `fmod`, `sin`, `cos`, `tan`, `log` (включая `log(x, base)`), `log10`,
+`exp`, `isnan`, `isinf`.
 
 **Встроенные функции:** `print` (`sep`, `end`, `file`), `len`, `range`,
-`int` (включая `base`), `float` (только типизированная ошибка), `str`, `abs`,
-`min`, `max`, `sum`, `sorted` (`key`, `reverse`), `enumerate`, `zip`, `list`,
-`dict`, `tuple`, `type`, `isinstance` (класс или кортеж классов), `open`,
-`chr`, `ord`, `repr`, `bool`, `iter`, `next`, `any`, `all`, `divmod`, `pow`
-(включая трёхаргументный по модулю), `hex`, `id`.
+`int` (включая `base` и усечение float), `float` (int/bool/str/float), `str`,
+`abs` (int и float), `min`, `max`, `sum`, `sorted` (`key`, `reverse`),
+`enumerate`, `zip`, `list`, `dict`, `tuple`, `type`, `isinstance` (класс или
+кортеж классов), `open`, `chr`, `ord`, `repr`, `bool`, `iter`, `next`, `any`,
+`all`, `divmod` (int и float), `pow` (включая трёхаргументный по модулю),
+`round` (`ndigits`, ties-to-even), `hex`, `id`.
 
 **Методы `str`:** `split` (`sep`, `maxsplit`), `join`, `strip`/`lstrip`/`rstrip`,
 `upper`, `lower`, `replace`, `find`, `index`, `startswith`/`endswith`
@@ -142,13 +152,19 @@ ZeroDivisionError: integer division or modulo by zero
 
 ## Ограничения
 
-- **Нет `float`.** Ядро запускает U-mode с выключенным FPU, а `Value` хранит
-  только целые. `float()`, float-литералы и `1.5` дают
-  `NotImplementedError` с объяснением. `/` работает только для точного
-  целочисленного результата, `**` — только для неотрицательного показателя.
+- **Float — f64, но не побитово CPython.** `str`/`repr` используют самый
+  короткий round-trip формат Rust (`{:?}`) с Python-написанием экспоненты
+  (`1e+20`, `1e-07`); на 500 случайных значениях он совпал с CPython. `sqrt`
+  корректно округлён (целочисленный алгоритм). `exp`, `log`, `sin`, `cos`,
+  `tan` — собственные полиномы без `libm`, поэтому могут отличаться от CPython
+  на 1–2 ulp; `round(float, ndigits)` для очень больших величин и
+  отрицательных `ndigits` — до 1 ulp. Decimal/fractions/complex нет.
+- **Зависимость от FPU.** f64-инструкции требуют, чтобы ядро оставляло
+  `sstatus.FS` включённым при переходе в U-mode. На 0.11.0 это проверено;
+  ядро с выключенным FPU уронит первую float-операцию по illegal instruction.
 - **Нет `set`, `bytes`, `complex`, `decimal`, `fractions`.**
-- **Нет CPython-стандартной библиотеки.** Нет `os`, `math`, `json`, `re`,
-  `random`, `time`, `pathlib`, `typing` и т.д. Есть только `sys` и локальные
+- **Нет CPython-стандартной библиотеки.** Нет `os`, `json`, `re`, `random`,
+  `time`, `pathlib`, `typing` и т.д. Есть `sys`, `math` и локальные
   `.py`-модули.
 - **Нет потоков, процессов, сигналов, сокетов и сети.** ABI ядра этого не
   даёт; `threading`, `multiprocessing`, `socket`, `subprocess` отсутствуют.
@@ -174,21 +190,23 @@ ZeroDivisionError: integer division or modulo by zero
 
 ```sh
 cd hostcheck
-cargo test                 # 11 unit-тестов интерпретатора
+cargo test                 # 12 unit-тестов интерпретатора
 cargo run -- --selftest    # те же проверки с PASS/FAIL-строками
 cargo run -- ../tests/live/hello.py
 ```
 
 `hostcheck --parse file.py` и `--tokens file.py` проверяют только фронтенд.
-Живой QEMU-прогон и его PASS-лист: [`docs/live-testing.md`](docs/live-testing.md).
+Живой QEMU-прогон (21 PASS, включая шесть float-скриптов) и его PASS-лист:
+[`docs/live-testing.md`](docs/live-testing.md).
 
 ## Устройство
 
 ```text
-src/lexer.rs      токены, отступы, строковые литералы
+src/lexer.rs      токены, отступы, строковые и числовые литералы
 src/parser.rs     рекурсивный спуск, AST
 src/ast.rs        узлы AST
 src/value.rs      значения, объектная модель, dict, итераторы, repr
+src/float.rs      f64: парсинг/формат, sqrt, exp, log, trig, round без libm
 src/interp.rs     вычисление AST, области видимости, классы, исключения, импорты
 src/builtins.rs   встроенные функции и методы str/list/dict/file
 src/platform.rs   единственный слой вызовов libpagh (файлы, stdout, argv, exit)
