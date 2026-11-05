@@ -1,0 +1,19 @@
+[package]
+name = "hostcheck"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "hostcheck"
+path = "src/main.rs"
+
+# This is a separate workspace on purpose: the root crate is `no_std` for
+# riscv64, while this one is a normal std binary that includes the interpreter
+# sources and supplies a std `platform` module. `hostcheck/.cargo/config.toml`
+# pins the host target so the parent's riscv default does not leak in.
+[workspace]
+
+[profile.dev]
+opt-level = 1
+overflow-checks = true
