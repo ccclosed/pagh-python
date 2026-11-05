@@ -286,7 +286,22 @@ impl FileValue {
             self.data.push_str(text);
             self.pos = self.data.len();
         } else {
-            self.data.replace_range(self.pos..self.pos, text);
+            // Overwrite the characters under the cursor, like a text file in
+            // `r+`/`w+` mode; when `text` is longer than the rest of the file
+            // this also extends it. In `a` mode `pos == len`, so the branch
+            // above is the append path.
+            let mut end = self.pos;
+            for _ in 0..text.chars().count() {
+                if end >= self.data.len() {
+                    break;
+                }
+                if let Some(ch) = self.data[end..].chars().next() {
+                    end += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            self.data.replace_range(self.pos..end, text);
             self.pos += text.len();
         }
         self.dirty = true;
@@ -332,14 +347,22 @@ pub enum IterState {
         inners: Vec<Value>,
         done: bool,
     },
+    /// A text file iterated line by line (`for line in f`). The file owns the
+    /// cursor, so every iterator over the same file shares it, exactly like
+    /// CPython's file object.
+    File {
+        file: Rc<RefCell<FileValue>>,
+    },
 }
 
+#[allow(dead_code)] // free-class variants are reachable through `class_for` too
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinId {
     Print,
     Len,
     Range,
     Int,
+    Float,
     Str,
     Abs,
     Min,
@@ -409,6 +432,7 @@ pub enum BuiltinId {
     FileReadline,
     FileReadlines,
     FileWrite,
+    FileWritelines,
     FileClose,
     FileFlush,
 }
@@ -425,6 +449,7 @@ pub fn builtin_name(id: BuiltinId) -> &'static str {
         BuiltinId::Len => "len",
         BuiltinId::Range => "range",
         BuiltinId::Int => "int",
+        BuiltinId::Float => "float",
         BuiltinId::Str => "str",
         BuiltinId::Abs => "abs",
         BuiltinId::Min => "min",
@@ -490,6 +515,7 @@ pub fn builtin_name(id: BuiltinId) -> &'static str {
         BuiltinId::FileReadline => "readline",
         BuiltinId::FileReadlines => "readlines",
         BuiltinId::FileWrite => "write",
+        BuiltinId::FileWritelines => "writelines",
         BuiltinId::FileClose => "close",
         BuiltinId::FileFlush => "flush",
     }
@@ -535,10 +561,7 @@ impl Value {
     }
 
     pub fn builtin(id: BuiltinId) -> Value {
-        Value::Builtin(Rc::new(BuiltinValue {
-            id,
-            receiver: None,
-        }))
+        Value::Builtin(Rc::new(BuiltinValue { id, receiver: None }))
     }
 
     pub fn method(id: BuiltinId, receiver: Value) -> Value {
@@ -548,6 +571,7 @@ impl Value {
         }))
     }
 
+    #[allow(dead_code)]
     pub fn is_none(&self) -> bool {
         matches!(self, Value::None)
     }
@@ -924,6 +948,7 @@ pub fn class_is_subclass(class: &Rc<Class>, target: &Rc<Class>) -> bool {
         .any(|base| class_is_subclass(base, target))
 }
 
+#[allow(dead_code)]
 pub fn class_mro_contains(class: &Rc<Class>, target_name: &str) -> bool {
     if &*class.name == target_name {
         return true;
@@ -1051,6 +1076,13 @@ impl IterState {
                 }
                 Some(Value::tuple(values))
             }
+            IterState::File { file } => {
+                let mut borrowed = file.borrow_mut();
+                match borrowed.readline() {
+                    Ok(line) if !line.is_empty() => Some(Value::Str(Rc::from(line))),
+                    _ => None,
+                }
+            }
         }
     }
 }
@@ -1091,6 +1123,7 @@ pub fn range_length(start: i64, stop: i64, step: i64) -> Option<i64> {
 
 /// Parse a decimal/`0x`/`0o`/`0b` integer the way `int(text)` does for a
 /// single argument. Returns `None` for a malformed literal.
+#[allow(dead_code)]
 pub fn parse_int_literal(text: &str) -> Option<i64> {
     let trimmed = text.trim();
     let (sign, rest) = match trimmed.as_bytes().first() {

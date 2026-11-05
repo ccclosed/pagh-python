@@ -74,6 +74,7 @@ pub struct PyError {
     /// The exception value (class instance) when one exists.
     pub value: Option<crate::value::Value>,
     /// Re-raised marker used by a bare `raise` in a handler.
+    #[allow(dead_code)]
     pub caught: bool,
 }
 
@@ -101,11 +102,13 @@ impl PyError {
 pub type PyResult<T> = Result<T, PyError>;
 
 /// Build a builtin exception with a `&str` message.
+#[allow(dead_code)]
 pub fn error(name: &'static str, message: &str) -> PyError {
     PyError::builtin(name, String::from(message))
 }
 
 /// Build a builtin exception with an owned/formatted message.
+#[allow(dead_code)]
 pub fn error_string(name: &'static str, message: String) -> PyError {
     PyError::builtin(name, message)
 }
