@@ -1,9 +1,9 @@
 [package]
 name = "pythonc"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 publish = false
-description = "A native Python interpreter for the pagh-riscv native ABI (lambda, with, set, bytes, f-strings, os, json)"
+description = "A native Python interpreter for the pagh-riscv native ABI (variadics, str.format, lambda, with, set, bytes, f-strings, os, json)"
 
 [[bin]]
 name = "pythonc"

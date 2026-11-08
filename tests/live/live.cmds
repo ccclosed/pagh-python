@@ -30,3 +30,5 @@ run /mnt/pythonc /mnt/fstrings_demo.py
 run /mnt/pythonc /mnt/os_demo.py
 run /mnt/pythonc /mnt/json_demo.py
 run /mnt/pythonc /mnt/os_proc.py
+run /mnt/pythonc /mnt/star_args.py
+run /mnt/pythonc /mnt/str_format.py

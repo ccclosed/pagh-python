@@ -1,0 +1,14 @@
+pagh:rv64> run /mnt/pythonc /mnt/test.py
+auto: 2 + 3 = 5
+manual: b/a/b
+named: pagh-7
+escape: {literal} { }
+spec: 0007 3.142    ok
+index: one
+key: v
+attr: 2,9
+conversion: 'hi'
+FORMAT OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> halt
+halt: powering off

@@ -16,8 +16,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::ast::{
-    BinOp, BoolOp, CmpOp, CompGen, Expr, FStringPart, Handler, ImportAlias, Module, Name, Param,
-    Stmt, StmtKind, UnOp, WithItem,
+    BinOp, BoolOp, CallArg, CallKeyword, CmpOp, CompGen, Expr, FStringPart, Handler, ImportAlias,
+    Module, Name, Param, ParamKind, Stmt, StmtKind, UnOp, WithItem,
 };
 use crate::error::SyntaxError;
 use crate::lexer::{tokenize, FStringLexPart, Kw, Op, Tok, Token};
@@ -582,23 +582,73 @@ impl Parser {
         let name = self.expect_name("a function name after 'def'")?;
         self.expect_op(Op::LParen, "after the function name")?;
         let mut params = Vec::new();
+        let mut saw_default = false;
+        let mut saw_varargs = false;
+        let mut saw_kwargs = false;
         if !self.eat_op(Op::RParen) {
             loop {
-                if self.check_op(Op::Star) || self.check_op(Op::StarStar) {
-                    return self.error(String::from(
-                        "variadic parameters (*args / **kwargs) are not supported",
-                    ));
-                }
-                let param_name = self.expect_name("a parameter name")?;
-                let default = if self.eat_op(Op::Assign) {
-                    Some(self.parse_expr()?)
+                if self.eat_op(Op::Star) {
+                    if saw_varargs || saw_kwargs {
+                        return self.error(String::from(
+                            "'*args' must appear at most once and before '**kwargs'",
+                        ));
+                    }
+                    let param_name = self.expect_name("a parameter name after '*'")?;
+                    if self.check_op(Op::Assign) {
+                        return self.error(String::from("'*args' parameter cannot have a default"));
+                    }
+                    params.push(Param {
+                        name: param_name,
+                        default: None,
+                        kind: ParamKind::VarArgs,
+                    });
+                    saw_varargs = true;
+                } else if self.eat_op(Op::StarStar) {
+                    if saw_kwargs {
+                        return self.error(String::from("'**kwargs' must appear at most once"));
+                    }
+                    let param_name = self.expect_name("a parameter name after '**'")?;
+                    if self.check_op(Op::Assign) {
+                        return self.error(String::from(
+                            "'**kwargs' parameter cannot have a default",
+                        ));
+                    }
+                    params.push(Param {
+                        name: param_name,
+                        default: None,
+                        kind: ParamKind::KwArgs,
+                    });
+                    saw_kwargs = true;
                 } else {
-                    None
-                };
-                params.push(Param {
-                    name: param_name,
-                    default,
-                });
+                    if saw_kwargs {
+                        return self.error(String::from(
+                            "parameter follows the '**kwargs' parameter",
+                        ));
+                    }
+                    if saw_varargs {
+                        return self.error(String::from(
+                            "keyword-only parameters after '*args' are not supported",
+                        ));
+                    }
+                    let param_name = self.expect_name("a parameter name")?;
+                    let default = if self.eat_op(Op::Assign) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    if default.is_some() {
+                        saw_default = true;
+                    } else if saw_default {
+                        return self.error(String::from(
+                            "non-default argument follows default argument",
+                        ));
+                    }
+                    params.push(Param {
+                        name: param_name,
+                        default,
+                        kind: ParamKind::Normal,
+                    });
+                }
                 if self.eat_op(Op::Comma) {
                     if self.eat_op(Op::RParen) {
                         break;
@@ -986,23 +1036,23 @@ impl Parser {
             });
         }
         loop {
-            if self.check_op(Op::Star) || self.check_op(Op::StarStar) {
-                return self.error(String::from(
-                    "starred call arguments (*args / **kwargs) are not supported",
-                ));
-            }
-            if matches!(self.peek(), Tok::Name(_)) && self.peek_at(1) == &Tok::Op(Op::Assign) {
+            if self.eat_op(Op::Star) {
+                args.push(CallArg::Unpack(self.parse_expr()?));
+            } else if self.eat_op(Op::StarStar) {
+                kwargs.push(CallKeyword::Unpack(self.parse_expr()?));
+            } else if matches!(self.peek(), Tok::Name(_)) && self.peek_at(1) == &Tok::Op(Op::Assign)
+            {
                 let name = self.expect_name("a keyword argument name")?;
                 self.expect_op(Op::Assign, "after the keyword argument name")?;
                 let value = self.parse_expr()?;
-                kwargs.push((name, value));
+                kwargs.push(CallKeyword::Named(name, value));
             } else {
                 if !kwargs.is_empty() {
                     return self.error(String::from(
                         "positional argument follows keyword argument",
                     ));
                 }
-                args.push(self.parse_expr()?);
+                args.push(CallArg::Value(self.parse_expr()?));
             }
             if self.eat_op(Op::Comma) {
                 if self.eat_op(Op::RParen) {
@@ -1264,20 +1314,73 @@ impl Parser {
     fn parse_lambda(&mut self) -> Result<Expr, SyntaxError> {
         self.expect_kw(Kw::Lambda, "at the start of a lambda expression")?;
         let mut params = Vec::new();
+        let mut saw_default = false;
+        let mut saw_varargs = false;
+        let mut saw_kwargs = false;
         if !self.check_op(Op::Colon) {
             loop {
-                if self.check_op(Op::Star) || self.check_op(Op::StarStar) {
-                    return self.error(String::from(
-                        "variadic parameters (*args / **kwargs) are not supported",
-                    ));
-                }
-                let name = self.expect_name("a parameter name after 'lambda'")?;
-                let default = if self.eat_op(Op::Assign) {
-                    Some(self.parse_expr()?)
+                if self.eat_op(Op::Star) {
+                    if saw_varargs || saw_kwargs {
+                        return self.error(String::from(
+                            "'*args' must appear at most once and before '**kwargs'",
+                        ));
+                    }
+                    let name = self.expect_name("a parameter name after '*'")?;
+                    if self.check_op(Op::Assign) {
+                        return self.error(String::from("'*args' parameter cannot have a default"));
+                    }
+                    params.push(Param {
+                        name,
+                        default: None,
+                        kind: ParamKind::VarArgs,
+                    });
+                    saw_varargs = true;
+                } else if self.eat_op(Op::StarStar) {
+                    if saw_kwargs {
+                        return self.error(String::from("'**kwargs' must appear at most once"));
+                    }
+                    let name = self.expect_name("a parameter name after '**'")?;
+                    if self.check_op(Op::Assign) {
+                        return self.error(String::from(
+                            "'**kwargs' parameter cannot have a default",
+                        ));
+                    }
+                    params.push(Param {
+                        name,
+                        default: None,
+                        kind: ParamKind::KwArgs,
+                    });
+                    saw_kwargs = true;
                 } else {
-                    None
-                };
-                params.push(Param { name, default });
+                    if saw_kwargs {
+                        return self.error(String::from(
+                            "parameter follows the '**kwargs' parameter",
+                        ));
+                    }
+                    if saw_varargs {
+                        return self.error(String::from(
+                            "keyword-only parameters after '*args' are not supported",
+                        ));
+                    }
+                    let name = self.expect_name("a parameter name after 'lambda'")?;
+                    let default = if self.eat_op(Op::Assign) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    if default.is_some() {
+                        saw_default = true;
+                    } else if saw_default {
+                        return self.error(String::from(
+                            "non-default argument follows default argument",
+                        ));
+                    }
+                    params.push(Param {
+                        name,
+                        default,
+                        kind: ParamKind::Normal,
+                    });
+                }
                 if !self.eat_op(Op::Comma) {
                     break;
                 }

@@ -91,6 +91,17 @@ pub struct Param {
     /// The default is evaluated once, when the `def` executes (Python's
     /// mutable-default semantics), and stored in the function object.
     pub default: Option<Expr>,
+    pub kind: ParamKind,
+}
+
+/// What a parameter collects. Normal parameters bind one argument each;
+/// `*args` collects the surplus positional arguments into a tuple and
+/// `**kwargs` collects the unmatched keywords into a dict.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ParamKind {
+    Normal,
+    VarArgs,
+    KwArgs,
 }
 
 pub struct WithItem {
@@ -173,8 +184,8 @@ pub enum Expr {
     },
     Call {
         function: Box<Expr>,
-        args: Vec<Expr>,
-        kwargs: Vec<(Name, Expr)>,
+        args: Vec<CallArg>,
+        kwargs: Vec<CallKeyword>,
     },
     Index {
         target: Box<Expr>,
@@ -208,6 +219,18 @@ pub enum Expr {
         condition: Box<Expr>,
         otherwise: Box<Expr>,
     },
+}
+
+/// One positional slot of a call. `Unpack` is `*iterable`.
+pub enum CallArg {
+    Value(Expr),
+    Unpack(Expr),
+}
+
+/// One keyword slot of a call. `Unpack` is `**mapping`.
+pub enum CallKeyword {
+    Named(Name, Expr),
+    Unpack(Expr),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

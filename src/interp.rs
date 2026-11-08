@@ -23,8 +23,8 @@ use core::cell::RefCell;
 use core::cmp::Ordering;
 
 use crate::ast::{
-    BinOp, BoolOp, CmpOp, CompGen, Expr, FStringPart, Handler, Name, Param, Stmt, StmtKind, UnOp,
-    WithItem,
+    BinOp, BoolOp, CallArg, CallKeyword, CmpOp, CompGen, Expr, FStringPart, Handler, Name, Param,
+    ParamKind, Stmt, StmtKind, UnOp, WithItem,
 };
 use crate::builtins;
 use crate::error::{ErrorName, PyError, PyResult, TraceFrame};
@@ -627,12 +627,20 @@ impl Interp {
         env: &EnvRef,
     ) -> PyResult<Function> {
         let mut bound = Vec::with_capacity(params.len());
+        let mut varargs = None;
+        let mut kwargs = None;
         for parameter in params {
-            let default = match &parameter.default {
-                Some(expression) => Some(self.eval_expr(expression, env)?),
-                None => None,
-            };
-            bound.push((parameter.name.clone(), default));
+            match parameter.kind {
+                ParamKind::Normal => {
+                    let default = match &parameter.default {
+                        Some(expression) => Some(self.eval_expr(expression, env)?),
+                        None => None,
+                    };
+                    bound.push((parameter.name.clone(), default));
+                }
+                ParamKind::VarArgs => varargs = Some(parameter.name.clone()),
+                ParamKind::KwArgs => kwargs = Some(parameter.name.clone()),
+            }
         }
         let in_class_body = match &self.class_env {
             Some(class_env) => Rc::ptr_eq(class_env, env),
@@ -649,6 +657,8 @@ impl Interp {
         Ok(Function {
             name: name.clone(),
             params: bound,
+            varargs,
+            kwargs,
             body: FunctionBody::Block(body.clone()),
             closure,
             filename: self.current_filename(),
@@ -724,12 +734,20 @@ impl Interp {
         env: &EnvRef,
     ) -> PyResult<Function> {
         let mut bound = Vec::with_capacity(params.len());
+        let mut varargs = None;
+        let mut kwargs = None;
         for parameter in params {
-            let default = match &parameter.default {
-                Some(expression) => Some(self.eval_expr(expression, env)?),
-                None => None,
-            };
-            bound.push((parameter.name.clone(), default));
+            match parameter.kind {
+                ParamKind::Normal => {
+                    let default = match &parameter.default {
+                        Some(expression) => Some(self.eval_expr(expression, env)?),
+                        None => None,
+                    };
+                    bound.push((parameter.name.clone(), default));
+                }
+                ParamKind::VarArgs => varargs = Some(parameter.name.clone()),
+                ParamKind::KwArgs => kwargs = Some(parameter.name.clone()),
+            }
         }
         let in_class_body = match &self.class_env {
             Some(class_env) => Rc::ptr_eq(class_env, env),
@@ -750,6 +768,8 @@ impl Interp {
         Ok(Function {
             name: Rc::from("<lambda>"),
             params: bound,
+            varargs,
+            kwargs,
             body: FunctionBody::Expression(body.clone()),
             closure,
             filename: self.current_filename(),
@@ -1282,13 +1302,75 @@ impl Interp {
                 let function = self.eval_expr(function, env)?;
                 let mut arguments = ArgList::new();
                 for argument in args {
-                    let value = self.eval_expr(argument, env)?;
-                    arguments.push(value);
+                    match argument {
+                        CallArg::Value(expression) => {
+                            let value = self.eval_expr(expression, env)?;
+                            arguments.push(value);
+                        }
+                        CallArg::Unpack(expression) => {
+                            let iterable = self.eval_expr(expression, env)?;
+                            for value in self.collect_iterable(iterable)? {
+                                arguments.push(value);
+                            }
+                        }
+                    }
                 }
                 let mut keywords = Vec::with_capacity(kwargs.len());
-                for (name, argument) in kwargs {
-                    let value = self.eval_expr(argument, env)?;
-                    keywords.push((name.clone(), value));
+                for keyword in kwargs {
+                    match keyword {
+                        CallKeyword::Named(name, expression) => {
+                            let value = self.eval_expr(expression, env)?;
+                            if keywords.iter().any(|(key, _)| key == name) {
+                                return Err(self.err(
+                                    "TypeError",
+                                    format!(
+                                        "got multiple values for keyword argument '{}'",
+                                        name
+                                    ),
+                                ));
+                            }
+                            keywords.push((name.clone(), value));
+                        }
+                        CallKeyword::Unpack(expression) => {
+                            let mapping = self.eval_expr(expression, env)?;
+                            let entries = match &mapping {
+                                Value::Dict(entries) => entries.clone(),
+                                other => {
+                                    return Err(self.err(
+                                        "TypeError",
+                                        format!(
+                                            "argument after ** must be a mapping, not '{}'",
+                                            other.type_name()
+                                        ),
+                                    ))
+                                }
+                            };
+                            for (key, value) in entries.borrow().iter() {
+                                let name = match key {
+                                    Value::Str(text) => text.clone(),
+                                    other => {
+                                        return Err(self.err(
+                                            "TypeError",
+                                            format!(
+                                                "keywords must be strings, not '{}'",
+                                                other.type_name()
+                                            ),
+                                        ))
+                                    }
+                                };
+                                if keywords.iter().any(|(existing, _)| existing == &name) {
+                                    return Err(self.err(
+                                        "TypeError",
+                                        format!(
+                                            "got multiple values for keyword argument '{}'",
+                                            name
+                                        ),
+                                    ));
+                                }
+                                keywords.push((name, value.clone()));
+                            }
+                        }
+                    }
                 }
                 self.call_value(function, arguments, keywords)
             }
@@ -1657,7 +1739,17 @@ impl Interp {
             };
             env.borrow_mut().set_local(name.clone(), value);
         }
-        if positional < args.len() {
+        if let Some(name) = &function.varargs {
+            let mut extras = Vec::new();
+            while positional < args.len() {
+                if let Some(value) = args.get(positional) {
+                    extras.push(value.clone());
+                }
+                positional += 1;
+            }
+            env.borrow_mut()
+                .set_local(name.clone(), Value::tuple(extras));
+        } else if positional < args.len() {
             return Err(self.err(
                 "TypeError",
                 format!(
@@ -1668,15 +1760,27 @@ impl Interp {
                 ),
             ));
         }
-        for (key, _) in kwargs {
-            if !function.params.iter().any(|(name, _)| name == key) {
-                return Err(self.err(
-                    "TypeError",
-                    format!(
-                        "{}() got an unexpected keyword argument '{}'",
-                        function.name, key
-                    ),
-                ));
+        if let Some(name) = &function.kwargs {
+            let mut entries = Vec::new();
+            for (key, value) in kwargs {
+                if function.params.iter().any(|(param, _)| param == key) {
+                    continue;
+                }
+                entries.push((Value::Str(key.clone()), value.clone()));
+            }
+            env.borrow_mut()
+                .set_local(name.clone(), Value::dict(entries));
+        } else {
+            for (key, _) in kwargs {
+                if !function.params.iter().any(|(name, _)| name == key) {
+                    return Err(self.err(
+                        "TypeError",
+                        format!(
+                            "{}() got an unexpected keyword argument '{}'",
+                            function.name, key
+                        ),
+                    ));
+                }
             }
         }
         Ok(())
@@ -2744,7 +2848,7 @@ impl Interp {
 
     // ── indexing, slicing, attributes ─────────────────────────────────────
 
-    fn index_value(&mut self, target: &Value, index: &Value) -> PyResult<Value> {
+    pub(crate) fn index_value(&mut self, target: &Value, index: &Value) -> PyResult<Value> {
         match target {
             Value::List(items) => {
                 let number = self.require_int(index, "list indices must be integers")?;
@@ -3897,6 +4001,7 @@ fn string_method(name: &str) -> Option<BuiltinId> {
         "isdigit" => BuiltinId::StrIsdigit,
         "title" => BuiltinId::StrTitle,
         "splitlines" => BuiltinId::StrSplitlines,
+        "format" => BuiltinId::StrFormat,
         _ => return None,
     })
 }

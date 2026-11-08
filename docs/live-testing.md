@@ -260,6 +260,77 @@ ZeroDivisionError: integer division or modulo by zero
 run: /mnt/pythonc exited with code 1
 ```
 
+## 0.4.0: `*args`/`**kwargs` и `str.format` (живьём, ядро 0.16.2)
+
+Дата: 2026-11-08. Ядро:
+`/home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh`
+(0.16.2), QEMU 10.2.2, `virt`, 256 MiB. Release-ELF `pythonc` 0.4.0 —
+1 025 256 байт (лимит ядра 1 МиБ). Каждый прогон — отдельная загрузка;
+логи сняты `tools/run.py` из `pagh-riscv` (репозиторий ядра не менялся):
+
+```sh
+rm -rf /tmp/py-rootfs && mkdir /tmp/py-rootfs
+cp target/riscv64gc-unknown-none-elf/release/pythonc /tmp/py-rootfs/
+cp tests/live/star_args.py /tmp/py-rootfs/test.py     # затем str_format.py
+truncate -s 64M /tmp/py.img
+mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py.img
+
+python3 tools/run.py --disk /tmp/py.img \
+  --keys 'run /mnt/pythonc /mnt/test.py\nhalt\n' --settle 40 \
+  --serial-log /tmp/py-serial.log --shot /tmp/py.png \
+  --serial /tmp/s.sock --monitor /tmp/m.sock
+```
+
+`run.py` завершается с кодом 2 на попытке снять скриншот: `halt` уже
+выключил QEMU, и monitor-сокет исчез. Это не сбой теста — serial-лог полон,
+и именно он служит доказательством; обе команды `run` напечатали
+`exited with code 0`.
+
+**`*args`/`**kwargs` (`tests/live/star_args.py`)**
+
+```text
+pagh:rv64> run /mnt/pythonc /mnt/test.py
+collect: ((1, 'two', True), {'name': 'pagh', 'n': 3})
+mixed-default: (1, 20, (), {})
+mixed-full: (1, 2, (3, 4), {'z': 5})
+star-list: 30
+star-dict: 70
+both: 3
+forward: (1, 2, (3, 4), {'z': 5})
+lambda: ((7,), {'k': 8})
+STARARGS OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> halt
+halt: powering off
+```
+
+Сырой лог: [`live-pythonc-starargs.txt`](live-pythonc-starargs.txt).
+
+**`str.format` (`tests/live/str_format.py`)**
+
+```text
+pagh:rv64> run /mnt/pythonc /mnt/test.py
+auto: 2 + 3 = 5
+manual: b/a/b
+named: pagh-7
+escape: {literal} { }
+spec: 0007 3.142    ok
+index: one
+key: v
+attr: 2,9
+conversion: 'hi'
+FORMAT OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> halt
+halt: powering off
+```
+
+Сырой лог: [`live-pythonc-strformat.txt`](live-pythonc-strformat.txt).
+
+Итог: **2 PASS из 2** новых живых проверок (плюс сохранённый suite 0.1.2
+выше). Скрипты добавлены в `tests/live/live.cmds` для будущего полного
+прогона.
+
 ## Что не проверялось живьём
 
 - `os.system()`: в pagh нет shell-бинарника, поэтому функция типизированно

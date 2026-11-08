@@ -1927,6 +1927,7 @@ fn call_method(
         BuiltinId::StrIsdigit => str_isdigit(interp, builtin, args, kwargs),
         BuiltinId::StrTitle => str_title(interp, builtin, args, kwargs),
         BuiltinId::StrSplitlines => str_splitlines(interp, builtin, args, kwargs),
+        BuiltinId::StrFormat => str_format(interp, builtin, args, kwargs),
         BuiltinId::ListAppend => list_append(interp, builtin, args, kwargs),
         BuiltinId::ListExtend => list_extend(interp, builtin, args, kwargs),
         BuiltinId::ListPop => list_pop(interp, builtin, args, kwargs),
@@ -2043,6 +2044,343 @@ fn find_chars(hay: &[char], needle: &[char], start: usize, end: usize) -> Option
         position += 1;
     }
     None
+}
+
+// ── str.format ─────────────────────────────────────────────────────────────
+
+/// Find `target` outside `[...]` keys and quoted strings. Format fields put
+/// attribute/index paths before the conversion and the spec, so splitting on
+/// the first top-level `!` or `:` is enough for this subset.
+fn find_top_level(chars: &[char], target: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    for (index, ch) in chars.iter().enumerate() {
+        if let Some(open) = quote {
+            if *ch == open {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(*ch),
+            '[' => depth += 1,
+            ']' if depth > 0 => depth -= 1,
+            ch if *ch == target && depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn take_field_name(chars: &[char], start: usize) -> usize {
+    let mut end = start;
+    if end < chars.len() && (chars[end].is_ascii_alphabetic() || chars[end] == '_') {
+        end += 1;
+        while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+            end += 1;
+        }
+    }
+    end
+}
+
+fn field_key_value(interp: &Interp, chars: &[char]) -> PyResult<Value> {
+    if chars.is_empty() {
+        return Err(interp.err(
+            "ValueError",
+            String::from("empty index in replacement field"),
+        ));
+    }
+    let first = chars[0];
+    if first == '\'' || first == '"' {
+        if chars.len() < 2 || chars[chars.len() - 1] != first {
+            return Err(interp.err(
+                "ValueError",
+                String::from("unterminated string index in replacement field"),
+            ));
+        }
+        let mut text = String::new();
+        let mut index = 1usize;
+        while index + 1 < chars.len() {
+            if chars[index] == '\\' && index + 2 < chars.len() {
+                index += 1;
+                match chars[index] {
+                    'n' => text.push('\n'),
+                    'r' => text.push('\r'),
+                    't' => text.push('\t'),
+                    other => text.push(other),
+                }
+            } else {
+                text.push(chars[index]);
+            }
+            index += 1;
+        }
+        return Ok(Value::Str(Rc::from(text.as_str())));
+    }
+    let start = if first == '-' { 1 } else { 0 };
+    if start < chars.len() && chars[start..].iter().all(|ch| ch.is_ascii_digit()) {
+        let text: String = chars.iter().collect();
+        return match text.parse::<i64>() {
+            Ok(number) => Ok(Value::Int(number)),
+            Err(_) => Err(interp.err(
+                "ValueError",
+                format!("invalid index '{}' in replacement field", text),
+            )),
+        };
+    }
+    Ok(Value::Str(Rc::from(
+        chars.iter().collect::<String>().as_str(),
+    )))
+}
+
+fn resolve_format_field(
+    interp: &mut Interp,
+    field: &str,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+    automatic: &mut usize,
+    used_automatic: &mut bool,
+    used_manual: &mut bool,
+) -> PyResult<Value> {
+    let chars: Vec<char> = field.chars().collect();
+    let mut value;
+    let mut rest;
+    if chars.is_empty() {
+        if *used_manual {
+            return Err(interp.err(
+                "ValueError",
+                String::from(
+                    "cannot switch from manual field specification to automatic field numbering",
+                ),
+            ));
+        }
+        let index = *automatic;
+        *automatic += 1;
+        *used_automatic = true;
+        value = match args.get(index) {
+            Some(value) => value.clone(),
+            None => {
+                return Err(interp.err(
+                    "IndexError",
+                    format!(
+                        "Replacement index {} out of range for positional args tuple",
+                        index
+                    ),
+                ))
+            }
+        };
+        rest = 0usize;
+    } else if chars[0].is_ascii_digit() {
+        if *used_automatic {
+            return Err(interp.err(
+                "ValueError",
+                String::from(
+                    "cannot switch from automatic field numbering to manual field specification",
+                ),
+            ));
+        }
+        *used_manual = true;
+        let mut end = 1usize;
+        while end < chars.len() && chars[end].is_ascii_digit() {
+            end += 1;
+        }
+        let text: String = chars[..end].iter().collect();
+        let index: usize = match text.parse() {
+            Ok(index) => index,
+            Err(_) => {
+                return Err(interp.err(
+                    "ValueError",
+                    format!("invalid replacement field index '{}'", text),
+                ))
+            }
+        };
+        value = match args.get(index) {
+            Some(value) => value.clone(),
+            None => {
+                return Err(interp.err(
+                    "IndexError",
+                    format!(
+                        "Replacement index {} out of range for positional args tuple",
+                        index
+                    ),
+                ))
+            }
+        };
+        rest = end;
+    } else {
+        let end = take_field_name(&chars, 0);
+        if end == 0 {
+            return Err(interp.err(
+                "ValueError",
+                format!("invalid replacement field '{}'", field),
+            ));
+        }
+        let name: String = chars[..end].iter().collect();
+        value = match keyword(kwargs, &name) {
+            Some(value) => value.clone(),
+            None => return Err(interp.err("KeyError", name)),
+        };
+        rest = end;
+    }
+    while rest < chars.len() {
+        match chars[rest] {
+            '.' => {
+                let end = take_field_name(&chars, rest + 1);
+                if end == rest + 1 {
+                    return Err(interp.err(
+                        "ValueError",
+                        String::from("empty attribute name in replacement field"),
+                    ));
+                }
+                let attribute: String = chars[rest + 1..end].iter().collect();
+                value = interp.get_attribute(&value, &attribute)?;
+                rest = end;
+            }
+            '[' => {
+                let mut end = rest + 1;
+                while end < chars.len() && chars[end] != ']' {
+                    end += 1;
+                }
+                if end >= chars.len() {
+                    return Err(interp.err(
+                        "ValueError",
+                        String::from("missing ']' in replacement field"),
+                    ));
+                }
+                let key = field_key_value(interp, &chars[rest + 1..end])?;
+                value = interp.index_value(&value, &key)?;
+                rest = end + 1;
+            }
+            other => {
+                return Err(interp.err(
+                    "ValueError",
+                    format!("unexpected character '{}' in replacement field", other),
+                ))
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn str_format(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    let text = String::from(str_receiver(interp, builtin, "format")?);
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut automatic = 0usize;
+    let mut used_automatic = false;
+    let mut used_manual = false;
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '{' => {
+                if chars.get(index + 1) == Some(&'{') {
+                    out.push('{');
+                    index += 2;
+                    continue;
+                }
+                let start = index + 1;
+                let mut end = start;
+                let mut depth = 1usize;
+                while end < chars.len() {
+                    match chars[end] {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                if end >= chars.len() {
+                    return Err(interp.err(
+                        "ValueError",
+                        String::from("expected '}' before end of string"),
+                    ));
+                }
+                let content: String = chars[start..end].iter().collect();
+                if content.contains('{') || content.contains('}') {
+                    return Err(interp.err(
+                        "ValueError",
+                        String::from("nested replacement fields are not supported"),
+                    ));
+                }
+                let (field, spec) = match find_top_level(&content.chars().collect::<Vec<_>>(), ':')
+                {
+                    Some(position) => {
+                        let chars: Vec<char> = content.chars().collect();
+                        (
+                            chars[..position].iter().collect::<String>(),
+                            Some(chars[position + 1..].iter().collect::<String>()),
+                        )
+                    }
+                    None => (content, None),
+                };
+                let field_chars: Vec<char> = field.chars().collect();
+                let (name, conversion) = match find_top_level(&field_chars, '!') {
+                    Some(position) => {
+                        let conversion: Vec<char> = field_chars[position + 1..].to_vec();
+                        if conversion.is_empty() {
+                            return Err(interp.err(
+                                "ValueError",
+                                String::from(
+                                    "end of string while looking for conversion specifier",
+                                ),
+                            ));
+                        }
+                        if conversion.len() != 1 || !matches!(conversion[0], 'r' | 's' | 'a') {
+                            return Err(interp.err(
+                                "ValueError",
+                                format!(
+                                    "unknown conversion specifier '{}'",
+                                    conversion.iter().collect::<String>()
+                                ),
+                            ));
+                        }
+                        (
+                            field_chars[..position].iter().collect::<String>(),
+                            Some(conversion[0]),
+                        )
+                    }
+                    None => (field, None),
+                };
+                let value = resolve_format_field(
+                    interp,
+                    &name,
+                    args,
+                    kwargs,
+                    &mut automatic,
+                    &mut used_automatic,
+                    &mut used_manual,
+                )?;
+                let formatted = format_value(interp, &value, spec.as_deref(), conversion)?;
+                out.push_str(&formatted);
+                index = end + 1;
+            }
+            '}' => {
+                if chars.get(index + 1) == Some(&'}') {
+                    out.push('}');
+                    index += 2;
+                } else {
+                    return Err(interp.err(
+                        "ValueError",
+                        String::from("Single '}' encountered in format string"),
+                    ));
+                }
+            }
+            ch => {
+                out.push(ch);
+                index += 1;
+            }
+        }
+    }
+    Ok(Value::Str(Rc::from(out.as_str())))
 }
 
 fn str_split(

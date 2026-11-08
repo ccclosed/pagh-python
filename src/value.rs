@@ -116,6 +116,10 @@ pub struct Function {
     pub name: Rc<str>,
     /// Parameters with defaults already evaluated at `def` time.
     pub params: Vec<(Rc<str>, Option<Value>)>,
+    /// The `*args` parameter, if the signature has one.
+    pub varargs: Option<Rc<str>>,
+    /// The `**kwargs` parameter, if the signature has one.
+    pub kwargs: Option<Rc<str>>,
     pub body: FunctionBody,
     pub closure: EnvRef,
     /// The module the function was defined in, for traceback lines.
@@ -523,6 +527,7 @@ pub enum BuiltinId {
     StrIsdigit,
     StrTitle,
     StrSplitlines,
+    StrFormat,
     // list methods
     ListAppend,
     ListExtend,
@@ -665,6 +670,7 @@ pub fn builtin_name(id: BuiltinId) -> &'static str {
         BuiltinId::StrIsdigit => "isdigit",
         BuiltinId::StrTitle => "title",
         BuiltinId::StrSplitlines => "splitlines",
+        BuiltinId::StrFormat => "format",
         BuiltinId::ListAppend => "append",
         BuiltinId::ListExtend => "extend",
         BuiltinId::ListPop => "pop",

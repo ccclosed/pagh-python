@@ -236,6 +236,78 @@ fn functions() -> Result<(), String> {
     Ok(())
 }
 
+fn variadics() -> Result<(), String> {
+    expect_repr(
+        "def gather(*args, **kwargs):\n    return (args, kwargs)\nx = gather(1, 2, name=\"n\")",
+        "x",
+        "((1, 2), {'name': 'n'})",
+    )?;
+    expect_repr(
+        "def mixed(a, b=10, *rest, **kw):\n    return (a, b, rest, kw)\nx = mixed(1, 2, 3, 4, z=5)",
+        "x",
+        "(1, 2, (3, 4), {'z': 5})",
+    )?;
+    expect_repr(
+        "def add(a, b):\n    return a + b\nx = (add(*[1, 2]), add(**{\"a\": 3, \"b\": 4}), add(*[1], **{\"b\": 5}))",
+        "x",
+        "(3, 7, 6)",
+    )?;
+    expect_repr(
+        "def f(a, b, c=0):\n    return a + b + c\nx = f(*[1, 2], c=3)",
+        "x",
+        "6",
+    )?;
+    expect_repr(
+        "f = lambda *args, **kwargs: (args, kwargs)\nx = f(1, k=2)",
+        "x",
+        "((1,), {'k': 2})",
+    )?;
+    expect_repr(
+        "def empty(*args, **kwargs):\n    return (args, kwargs)\nx = empty()",
+        "x",
+        "((), {})",
+    )?;
+    Ok(())
+}
+
+fn formatting() -> Result<(), String> {
+    expect_repr(
+        r#"x = "{} {}".format("a", 1)"#,
+        "x",
+        "'a 1'",
+    )?;
+    expect_repr(
+        r#"x = "{0}-{1}-{0}".format("a", "b")"#,
+        "x",
+        "'a-b-a'",
+    )?;
+    expect_repr(
+        r#"x = "{name}={value}".format(name="n", value=3)"#,
+        "x",
+        "'n=3'",
+    )?;
+    expect_repr(r#"x = "{{}} {}".format(5)"#, "x", "'{} 5'")?;
+    expect_repr(r#"x = "{:.2f}".format(3.14159)"#, "x", "'3.14'")?;
+    expect_repr(r#"x = "{0[1]}".format([10, 20, 30])"#, "x", "'20'")?;
+    expect_repr(
+        r#"x = "{d[z]}".format(d={"z": 9})"#,
+        "x",
+        "'9'",
+    )?;
+    expect_repr(
+        r#"class P:
+    def __init__(self):
+        self.name = "Rex"
+p = P()
+x = "{p.name}".format(p=p)"#,
+        "x",
+        "'Rex'",
+    )?;
+    expect_repr(r#"x = "{:>6}".format("x")"#, "x", "'     x'")?;
+    expect_repr(r#"x = "{0!r}".format("x")"#, "x", "'\\'x\\''")?;
+    Ok(())
+}
+
 fn classes() -> Result<(), String> {
     expect_repr(
         "class Animal:\n    def __init__(self, name):\n        self.name = name\n    def speak(self):\n        return self.name + \" makes a sound\"\nclass Dog(Animal):\n    def speak(self):\n        return self.name + \" barks\"\nd = Dog(\"Rex\")\nx = d.speak()\ny = isinstance(d, Animal)",
@@ -662,6 +734,8 @@ fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
         ("files", files),
         ("imports", imports),
         ("lambdas", lambdas),
+        ("variadics", variadics),
+        ("format", formatting),
         ("with", with_statement),
         ("sets", sets),
         ("bytes", bytes_values),
@@ -753,6 +827,16 @@ fn imports_work() {
 #[test]
 fn lambdas_work() {
     lambdas().unwrap();
+}
+
+#[test]
+fn variadics_work() {
+    variadics().unwrap();
+}
+
+#[test]
+fn formatting_works() {
+    formatting().unwrap();
 }
 
 #[test]
