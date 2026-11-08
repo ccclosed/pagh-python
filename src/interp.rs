@@ -446,7 +446,8 @@ impl Interp {
                 }
                 self.exec_block(else_body, env)
             }
-            StmtKind::While { condition, body } => {
+            StmtKind::While { condition, body, else_body } => {
+                let mut broke = false;
                 loop {
                     self.set_line(statement.line);
                     if !self.eval_expr(condition, env)?.truthy() {
@@ -455,19 +456,21 @@ impl Interp {
                     match self.exec_block(body, env)? {
                         Flow::Normal => {}
                         Flow::Continue => continue,
-                        Flow::Break => break,
+                        Flow::Break => { broke = true; break; }
                         other => return Ok(other),
                     }
                 }
-                Ok(Flow::Normal)
+                if !broke { self.exec_block(else_body, env) } else { Ok(Flow::Normal) }
             }
             StmtKind::For {
                 target,
                 iterable,
                 body,
+                else_body,
             } => {
                 let iterable_value = self.eval_expr(iterable, env)?;
                 let iterator = self.make_iterator(iterable_value)?;
+                let mut broke = false;
                 loop {
                     self.set_line(statement.line);
                     match self.next_from_iterator(&iterator)? {
@@ -477,13 +480,13 @@ impl Interp {
                             match self.exec_block(body, env)? {
                                 Flow::Normal => {}
                                 Flow::Continue => continue,
-                                Flow::Break => break,
+                                Flow::Break => { broke = true; break; }
                                 other => return Ok(other),
                             }
                         }
                     }
                 }
-                Ok(Flow::Normal)
+                if !broke { self.exec_block(else_body, env) } else { Ok(Flow::Normal) }
             }
             StmtKind::Del(targets) => {
                 for target in targets {

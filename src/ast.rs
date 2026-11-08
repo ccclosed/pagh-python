@@ -36,11 +36,13 @@ pub enum StmtKind {
     While {
         condition: Expr,
         body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
     },
     For {
         target: Expr,
         iterable: Expr,
         body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
     },
     Break,
     Continue,

@@ -500,9 +500,15 @@ impl Parser {
             let condition = self.parse_expr()?;
             self.expect_op(Op::Colon, "after the while condition")?;
             let body = self.parse_block()?;
+            let else_body = if self.eat_kw(Kw::Else) {
+                self.expect_op(Op::Colon, "after else")?;
+                self.parse_block()?
+            } else {
+                Vec::new()
+            };
             return Ok(Stmt {
                 line,
-                kind: StmtKind::While { condition, body },
+                kind: StmtKind::While { condition, body, else_body },
             });
         }
         if self.eat_kw(Kw::For) {
@@ -513,12 +519,19 @@ impl Parser {
             let iterable = self.parse_or()?;
             self.expect_op(Op::Colon, "after the for iterable")?;
             let body = self.parse_block()?;
+            let else_body = if self.eat_kw(Kw::Else) {
+                self.expect_op(Op::Colon, "after else")?;
+                self.parse_block()?
+            } else {
+                Vec::new()
+            };
             return Ok(Stmt {
                 line,
                 kind: StmtKind::For {
                     target,
                     iterable,
                     body,
+                    else_body,
                 },
             });
         }
