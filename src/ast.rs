@@ -44,6 +44,8 @@ pub enum StmtKind {
     },
     Break,
     Continue,
+    /// `del a, b[0], c.attr` — targets are validated by the parser.
+    Del(Vec<Expr>),
     Pass,
     Def {
         name: Name,

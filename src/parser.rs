@@ -433,7 +433,18 @@ impl Parser {
             });
         }
         if self.eat_kw(Kw::Del) {
-            return self.error(String::from("'del' statements are not supported"));
+            let parsed = self.parse_testlist()?;
+            let targets = match parsed {
+                Expr::Tuple(items) => items,
+                other => alloc::vec![other],
+            };
+            for target in &targets {
+                self.check_del_target(target)?;
+            }
+            return Ok(Stmt {
+                line,
+                kind: StmtKind::Del(targets),
+            });
         }
         if self.eat_kw(Kw::Yield) {
             return self.error(String::from("generators ('yield') are not supported"));
@@ -1337,6 +1348,19 @@ impl Parser {
         self.parse_postfix()
     }
 
+    fn check_del_target(&self, expression: &Expr) -> Result<(), SyntaxError> {
+        match expression {
+            Expr::Name(_) | Expr::Attribute { .. } | Expr::Index { .. } | Expr::Slice { .. } => Ok(()),
+            Expr::Tuple(items) | Expr::List(items) => {
+                for item in items {
+                    self.check_del_target(item)?;
+                }
+                Ok(())
+            }
+            _ => self.error(String::from("cannot delete this expression")),
+        }
+    }
+
     fn check_target(&self, expression: &Expr) -> Result<(), SyntaxError> {
         match expression {
             Expr::Name(_) | Expr::Attribute { .. } | Expr::Index { .. } => Ok(()),
@@ -1346,9 +1370,7 @@ impl Parser {
                 }
                 Ok(())
             }
-            Expr::Slice { .. } => self.error(String::from(
-                "assigning to a slice is not supported",
-            )),
+            Expr::Slice { .. } => Ok(()),
             _ => self.error(String::from("cannot assign to this expression")),
         }
     }

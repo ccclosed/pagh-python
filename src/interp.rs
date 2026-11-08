@@ -485,6 +485,12 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
+            StmtKind::Del(targets) => {
+                for target in targets {
+                    self.delete_target(target, env)?;
+                }
+                Ok(Flow::Normal)
+            }
             StmtKind::Break => Ok(Flow::Break),
             StmtKind::Continue => Ok(Flow::Continue),
             StmtKind::Pass => Ok(Flow::Normal),
@@ -1054,6 +1060,13 @@ impl Interp {
                 let object = self.eval_expr(target, env)?;
                 let index_value = self.eval_expr(index, env)?;
                 self.set_index(object, index_value, value)
+            }
+            Expr::Slice { target, start, stop, step } => {
+                let object = self.eval_expr(target, env)?;
+                let start = match start { Some(e) => Some(self.eval_slice_bound(e, env)?), None => None };
+                let stop = match stop { Some(e) => Some(self.eval_slice_bound(e, env)?), None => None };
+                let step = match step { Some(e) => Some(self.eval_slice_bound(e, env)?), None => None };
+                self.set_slice(object, start, stop, step, value)
             }
             _ => Err(self.err(
                 "SyntaxError",
@@ -2796,6 +2809,105 @@ impl Interp {
                 "TypeError",
                 format!("'{}' object is not subscriptable", target.type_name()),
             )),
+        }
+    }
+
+    fn delete_target(&mut self, target: &Expr, env: &EnvRef) -> PyResult<()> {
+        match target {
+            Expr::Name(name) => {
+                let mut frame = env.clone();
+                loop {
+                    let found = {
+                        let mut borrowed = frame.borrow_mut();
+                        match borrowed.vars.iter().position(|(key, _)| key == name) {
+                            Some(index) => { borrowed.vars.remove(index); true }
+                            None => false,
+                        }
+                    };
+                    if found { return Ok(()); }
+                    let parent = frame.borrow().parent.clone();
+                    match parent {
+                        Some(parent) => frame = parent,
+                        None => break,
+                    }
+                }
+                Err(self.err("NameError", format!("name '{}' is not defined", name)))
+            }
+            Expr::Index { target, index } => {
+                let object = self.eval_expr(target, env)?;
+                let index_value = self.eval_expr(index, env)?;
+                match &object {
+                    Value::List(items) => {
+                        let number = self.require_int(&index_value, "list indices must be integers")?;
+                        let mut items = items.borrow_mut();
+                        let position = normalize_index(number, items.len()).ok_or_else(|| {
+                            self.err("IndexError", String::from("list assignment index out of range"))
+                        })?;
+                        items.remove(position);
+                        Ok(())
+                    }
+                    Value::Dict(entries) => {
+                        if !index_value.is_hashable() {
+                            return Err(self.err("TypeError", format!("unhashable type: '{}'", index_value.type_name())));
+                        }
+                        {
+                            let mut entries = entries.borrow_mut();
+                            if let Some(index) = crate::value::dict_find(&entries, &index_value) {
+                                entries.remove(index);
+                            }
+                        }
+                        Ok(())
+                    }
+                    _ => Err(self.err("TypeError", format!("'{}' object doesn't support item deletion", object.type_name()))),
+                }
+            }
+            Expr::Attribute { target, name } => {
+                let object = self.eval_expr(target, env)?;
+                match &object {
+                    Value::Instance(instance) => {
+                        let mut attributes = instance.attrs.borrow_mut();
+                        if let Some(index) = attributes.iter().position(|(key, _)| key == name) {
+                            attributes.remove(index);
+                        }
+                        Ok(())
+                    }
+                    _ => Err(self.err("AttributeError", format!("'{}' object has no attribute '{}'", object.type_name(), name))),
+                }
+            }
+            Expr::Slice { target, start, stop, step } => {
+                let object = self.eval_expr(target, env)?;
+                let start = match start { Some(e) => Some(self.eval_slice_bound(e, env)?), None => None };
+                let stop = match stop { Some(e) => Some(self.eval_slice_bound(e, env)?), None => None };
+                let step = match step { Some(e) => Some(self.eval_slice_bound(e, env)?), None => None };
+                match &object {
+                    Value::List(items) => {
+                        let (start, stop, step) = self.slice_bounds(items.borrow().len() as i64, start, stop, step)?;
+                        if step != 1 {
+                            return Err(self.err("ValueError", String::from("extended slice deletion is not supported")));
+                        }
+                        items.borrow_mut().drain(start as usize..stop as usize);
+                        Ok(())
+                    }
+                    _ => Err(self.err("TypeError", format!("'{}' object doesn't support slice deletion", object.type_name()))),
+                }
+            }
+            _ => Err(self.err("SyntaxError", String::from("cannot delete this expression"))),
+        }
+    }
+
+    fn set_slice(&mut self, target: Value, start: Option<i64>, stop: Option<i64>, step: Option<i64>, value: Value) -> PyResult<()> {
+        match &target {
+            Value::List(items) => {
+                let (start, stop, step) = self.slice_bounds(items.borrow().len() as i64, start, stop, step)?;
+                if step != 1 {
+                    return Err(self.err("ValueError", String::from("extended slice assignment is not supported")));
+                }
+                let values = self.collect_iterable(value)?;
+                let mut items = items.borrow_mut();
+                items.splice(start as usize..stop as usize, values);
+                Ok(())
+            }
+            _ => Err(self.err("TypeError", format!("'{}' object doesn't support slice assignment", target.type_name()))),
         }
     }
 
