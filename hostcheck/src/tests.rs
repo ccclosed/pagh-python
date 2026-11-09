@@ -527,6 +527,429 @@ with Name("a") as a, Name("b") as b:
     Ok(())
 }
 
+// ── the fiber primitive ────────────────────────────────────────────────────
+//
+// The generator tests exercise these coroutines through the evaluator; this
+// one drives the switch itself, so a broken save/restore is named as such
+// instead of surfacing as a confusing generator result.
+
+use crate::fiber::Fiber;
+use core::ptr;
+
+static mut FIBER_SLOT: *mut Fiber = ptr::null_mut();
+static mut FIBER_LOG: [i64; 8] = [0; 8];
+static mut FIBER_STEPS: usize = 0;
+
+fn fiber_steps() -> usize {
+    // SAFETY: single-threaded test, no reference outlives the call.
+    unsafe { ptr::read_volatile(ptr::addr_of!(FIBER_STEPS)) }
+}
+
+fn fiber_log(index: usize) -> i64 {
+    // SAFETY: as `fiber_steps`; `index` is always in bounds.
+    unsafe { ptr::read_volatile(ptr::addr_of!(FIBER_LOG).cast::<i64>().add(index)) }
+}
+
+unsafe extern "C" fn fiber_probe(_argument: *mut u8) -> ! {
+    let fiber = ptr::read_volatile(ptr::addr_of!(FIBER_SLOT));
+    for value in 0..3i64 {
+        ptr::write_volatile(ptr::addr_of_mut!(FIBER_LOG).cast::<i64>().add(fiber_steps()), value);
+        ptr::write_volatile(ptr::addr_of_mut!(FIBER_STEPS), fiber_steps() + 1);
+        (*fiber).yield_to_caller();
+    }
+    (*fiber).finished = true;
+    (*fiber).yield_to_caller();
+    loop {
+        (*fiber).yield_to_caller();
+    }
+}
+
+fn fibers() -> Result<(), String> {
+    // SAFETY: a single fiber is alive and one thread runs the test; the fiber
+    // only reaches statics this test owns.
+    unsafe {
+        let mut fiber = Fiber::new().ok_or_else(|| String::from("no fiber capacity"))?;
+        ptr::write_volatile(ptr::addr_of_mut!(FIBER_SLOT), &mut *fiber as *mut Fiber);
+        fiber.start(fiber_probe, ptr::null_mut());
+        if fiber_steps() != 1 || fiber_log(0) != 0 {
+            return Err(format!("first entry logged {} steps", fiber_steps()));
+        }
+        if fiber.finished {
+            return Err(String::from("fiber finished after the first yield"));
+        }
+        fiber.resume();
+        fiber.resume();
+        if fiber_steps() != 3 {
+            return Err(format!("expected 3 yields, got {}", fiber_steps()));
+        }
+        fiber.resume();
+        if !fiber.finished {
+            return Err(String::from("fiber did not report completion"));
+        }
+        let log = [fiber_log(0), fiber_log(1), fiber_log(2)];
+        if log != [0, 1, 2] {
+            return Err(format!("fiber log is {:?}", log));
+        }
+        // A finished fiber keeps its stack only until it is dropped; dropping
+        // must return it to the pool and keep the live count honest.
+        drop(fiber);
+        let mut second = Fiber::new().ok_or_else(|| String::from("pool did not recycle"))?;
+        second.finished = true;
+        drop(second);
+    }
+    Ok(())
+}
+
+fn generators() -> Result<(), String> {
+    // Basic lazy iteration, `next`, and the StopIteration contract.
+    expect_repr(
+        "def counter(n):\n    i = 0\n    while i < n:\n        yield i\n        i += 1\nx = list(counter(3))",
+        "x",
+        "[0, 1, 2]",
+    )?;
+    expect_repr(
+        "def counter(n):\n    i = 0\n    while i < n:\n        yield i\n        i += 1\ng = counter(3)\nx = (next(g), next(g), next(g))",
+        "x",
+        "(0, 1, 2)",
+    )?;
+    expect_repr(
+        "def counter(n):\n    i = 0\n    while i < n:\n        yield i\n        i += 1\ng = counter(1)\nnext(g)\ntry:\n    next(g)\n    x = 'no error'\nexcept StopIteration:\n    x = 'stopped'",
+        "x",
+        "'stopped'",
+    )?;
+    // `for ... else` over a generator, and the default of `next(g, default)`.
+    expect_repr(
+        "def two():\n    yield 1\n    yield 2\nseen = []\nfor value in two():\n    seen.append(value)\nelse:\n    seen.append('else')\nx = seen",
+        "x",
+        "[1, 2, 'else']",
+    )?;
+    expect_repr(
+        "def one():\n    yield 1\ng = one()\nnext(g)\nx = next(g, 'default')",
+        "x",
+        "'default'",
+    )?;
+    // Real laziness: the loop never ends, so only a lazy generator finishes.
+    expect_repr(
+        "def naturals():\n    n = 0\n    while True:\n        yield n\n        n += 1\ng = naturals()\nx = [next(g) for _ in range(4)]\ndel g",
+        "x",
+        "[0, 1, 2, 3]",
+    )?;
+    // A `yield` expression evaluates to the value the caller sent (None).
+    expect_repr(
+        "def echo():\n    first = yield 1\n    yield first\ng = echo()\na = next(g)\nb = next(g)\ndel g\nx = (a, b)",
+        "x",
+        "(1, None)",
+    )?;
+    // `finally` runs when the generator is exhausted.
+    expect_repr(
+        "log = []\ndef guarded():\n    try:\n        yield 'a'\n    finally:\n        log.append('cleanup')\nx = (list(guarded()), log)",
+        "x",
+        "(['a'], ['cleanup'])",
+    )?;
+    // An exception inside the generator surfaces from `next()` and ends it.
+    expect_repr(
+        "def boom():\n    yield 1\n    raise ValueError('bad')\ng = boom()\nnext(g)\ntry:\n    next(g)\n    x = 'no error'\nexcept ValueError as error:\n    x = str(error)",
+        "x",
+        "'bad'",
+    )?;
+    // Generators nest: the inner one is resumed from inside the outer one.
+    expect_repr(
+        "def inner():\n    yield 1\n    yield 2\ndef outer():\n    for value in inner():\n        yield value * 10\nx = list(outer())",
+        "x",
+        "[10, 20]",
+    )?;
+    // A generator is its own iterator: `iter(g) is g`, and it is not a list.
+    expect_repr(
+        "def one():\n    yield 1\ng = one()\nx = (iter(g) is g, type(g).__name__)\ndel g",
+        "x",
+        "(True, 'generator')",
+    )?;
+    // Calling a generator function binds its parameters; a bad call is a
+    // TypeError at call time, before any body runs.
+    expect_repr(
+        "def one(a):\n    yield a\ntry:\n    one()\n    x = 'no error'\nexcept TypeError:\n    x = 'arity'",
+        "x",
+        "'arity'",
+    )?;
+    // Re-entering a running generator is refused instead of corrupting it.
+    expect_repr(
+        "me = None\ndef selfish():\n    yield next(me)\nme = selfish()\ntry:\n    next(me)\n    x = 'no error'\nexcept ValueError as error:\n    x = str(error)\ndel me",
+        "x",
+        "'generator already executing'",
+    )?;
+    // The stack of an exhausted generator is recycled: this loop creates and
+    // finishes 300 generators without running out of fibers.
+    expect_repr(
+        "def pair():\n    yield 1\n    yield 2\ntotal = 0\nfor _ in range(300):\n    for value in pair():\n        total += value\nx = total",
+        "x",
+        "900",
+    )?;
+    Ok(())
+}
+
+fn generator_expressions() -> Result<(), String> {
+    expect_repr("x = list(v * v for v in range(4))", "x", "[0, 1, 4, 9]")?;
+    expect_repr("x = sum(v for v in range(6) if v % 2 == 0)", "x", "6")?;
+    // The parenthesized form is a lazy iterator, not a list.
+    expect_repr("x = type(v for v in range(2)).__name__", "x", "'generator'")?;
+    expect_repr("x = sorted(v for v in [3, 1, 2])", "x", "[1, 2, 3]")?;
+    expect_repr(
+        "x = list((a, b) for a in range(2) for b in range(2))",
+        "x",
+        "[(0, 0), (0, 1), (1, 0), (1, 1)]",
+    )?;
+    // Laziness over an unbounded source.
+    expect_repr(
+        "def naturals():\n    n = 0\n    while True:\n        yield n\n        n += 1\ng = (v * 2 for v in naturals())\nx = [next(g) for _ in range(3)]\ndel g",
+        "x",
+        "[0, 2, 4]",
+    )?;
+    // A generator expression captures the surrounding scope at creation time.
+    expect_repr(
+        "def make(limit):\n    return (v for v in range(limit))\nx = list(make(3))",
+        "x",
+        "[0, 1, 2]",
+    )?;
+    // ... and it is consumed only once.
+    expect_repr(
+        "g = (v for v in range(3))\nx = (list(g), list(g))",
+        "x",
+        "([0, 1, 2], [])",
+    )?;
+    Ok(())
+}
+
+fn decorators() -> Result<(), String> {
+    expect_repr(
+        "def double(f):\n    def wrapper(*args, **kwargs):\n        return f(*args, **kwargs) * 2\n    return wrapper\n@double\ndef five():\n    return 5\nx = five()",
+        "x",
+        "10",
+    )?;
+    // Bottom-up order: the decorator written last is applied first.
+    expect_repr(
+        "log = []\ndef mark(label):\n    def decorate(f):\n        def wrapper(*args, **kwargs):\n            log.append(label)\n            return f(*args, **kwargs)\n        return wrapper\n    return decorate\n@mark('top')\n@mark('bottom')\ndef target():\n    return 'value'\nx = (target(), log)",
+        "x",
+        "('value', ['top', 'bottom'])",
+    )?;
+    // A decorator may replace the function with a non-function callable or a
+    // value: the name binds whatever the decorator returns.
+    expect_repr(
+        "def constant(f):\n    return 42\n@constant\ndef ignored():\n    return 1\nx = ignored",
+        "x",
+        "42",
+    )?;
+    // A decorator that returns the function unchanged still works, and the
+    // decorated function keeps its parameters.
+    expect_repr(
+        "def passthrough(f):\n    return f\n@passthrough\ndef add(a, b=2):\n    return a + b\nx = (add(1), add(1, 5))",
+        "x",
+        "(3, 6)",
+    )?;
+    // Decorating a method: the wrapper receives self like any function.
+    expect_repr(
+        "def double(f):\n    def wrapper(*args, **kwargs):\n        return f(*args, **kwargs) * 2\n    return wrapper\nclass Point:\n    def __init__(self, x):\n        self.x = x\n    @double\n    def scaled(self):\n        return self.x\nx = Point(3).scaled()",
+        "x",
+        "6",
+    )?;
+    // A decorated generator function is still a generator function.
+    expect_repr(
+        "def passthrough(f):\n    return f\n@passthrough\ndef counter(n):\n    for i in range(n):\n        yield i\nx = list(counter(3))",
+        "x",
+        "[0, 1, 2]",
+    )?;
+    // @staticmethod: no implicit self, callable from the class and instance.
+    expect_repr(
+        "class Tools:\n    @staticmethod\n    def add(a, b):\n        return a + b\n    def twice(self, value):\n        return value * 2\nx = (Tools.add(1, 2), Tools().add(3, 4), Tools().twice(5))",
+        "x",
+        "(3, 7, 10)",
+    )?;
+    // Decorating a class binds the decorator's result.
+    expect_repr(
+        "def rename(cls):\n    cls.label = 'decorated'\n    return cls\n@rename\nclass Thing:\n    pass\nx = Thing.label",
+        "x",
+        "'decorated'",
+    )?;
+    // Only definitions may be decorated.
+    let error = run_source("@double\nx = 1", None).err().unwrap_or_default();
+    if !error.contains("decorated") {
+        return Err(format!("expected a decoration error, got {:?}", error));
+    }
+    Ok(())
+}
+
+fn percent_formatting() -> Result<(), String> {
+    expect_repr(r#"x = "%s and %d" % ("text", 42)"#, "x", "'text and 42'")?;
+    expect_repr(r#"x = "%5d|%-5d|%05d" % (42, 42, 42)"#, "x", "'   42|42   |00042'")?;
+    expect_repr(r#"x = "%.2f|%8.3f" % (3.14159, 3.14159)"#, "x", "'3.14|   3.142'")?;
+    expect_repr(r#"x = "%x %X %o %b" % (255, 255, 8, 5)"#, "x", "'ff FF 10 101'")?;
+    expect_repr(r#"x = "%s %r" % (3.5, "quo")"#, "x", r#"'3.5 \'quo\''"#)?;
+    expect_repr(r#"x = "%d%%" % 50"#, "x", "'50%'")?;
+    expect_repr(r#"x = "%c%c" % (65, "b")"#, "x", "'Ab'")?;
+    expect_repr(r#"x = "%s" % ((1, 2),)"#, "x", "'(1, 2)'")?;
+    expect_repr(r#"x = "%s" % [1, 2]"#, "x", "'[1, 2]'")?;
+    expect_repr(r#"x = "%+d % d" % (5, 5)"#, "x", "'+5  5'")?;
+    expect_repr(r#"x = "%e" % 12345.678"#, "x", "'1.234568e+04'")?;
+    expect_repr(
+        r#"try:
+    "%d" % "text"
+except TypeError:
+    x = "type"
+"#,
+        "x",
+        "'type'",
+    )?;
+    expect_repr(
+        r#"try:
+    "%d %d" % (1,)
+except TypeError:
+    x = "missing"
+"#,
+        "x",
+        "'missing'",
+    )?;
+    expect_repr(
+        r#"try:
+    "%d" % (1, 2)
+except TypeError:
+    x = "extra"
+"#,
+        "x",
+        "'extra'",
+    )?;
+    expect_repr(
+        r#"try:
+    "%q" % 1
+except ValueError:
+    x = "bad char"
+"#,
+        "x",
+        "'bad char'",
+    )?;
+    // `%` between integers is still modulo, and `%` on floats still works.
+    expect_repr("x = (7 % 3, 7.5 % 2)", "x", "(1, 1.5)")?;
+    Ok(())
+}
+
+fn path_module() -> Result<(), String> {
+    expect_repr("from os.path import join\nx = join('a', 'b', 'c')", "x", "'a/b/c'")?;
+    expect_repr("import os.path\nx = os.path.join('/root', 'x')", "x", "'/root/x'")?;
+    expect_repr("from os.path import join\nx = join('a', '/abs', 'b')", "x", "'/abs/b'")?;
+    expect_repr("from os.path import join\nx = join('dir/', 'file')", "x", "'dir/file'")?;
+    expect_repr(
+        "from os.path import basename, dirname\nx = (basename('/mnt/test.py'), dirname('/mnt/test.py'))",
+        "x",
+        "('test.py', '/mnt')",
+    )?;
+    expect_repr(
+        "from os.path import basename, dirname\nx = (basename('x'), dirname('x'))",
+        "x",
+        "('x', '')",
+    )?;
+    expect_repr(
+        "from os.path import basename, dirname\nx = (basename('/'), dirname('/'), dirname('a/b/'))",
+        "x",
+        "('', '/', 'a')",
+    )?;
+    expect_repr("import os.path\nx = os.path.sep", "x", "'/'")?;
+    // The existence probes run against the real filesystem.
+    let path = "/tmp/pagh-python-pathcheck";
+    let _ = std::fs::remove_dir_all(path);
+    std::fs::create_dir(path).map_err(|error| format!("mkdir: {}", error))?;
+    std::fs::write(format!("{}/file.txt", path), b"x").map_err(|e| format!("write: {}", e))?;
+    let source = format!(
+        "from os.path import exists, isfile, isdir\nx = (exists('{0}'), isfile('{0}/file.txt'), isdir('{0}'), exists('{0}/nope'), isfile('{0}'))",
+        path
+    );
+    let result = expect_repr(&source, "x", "(True, True, True, False, False)");
+    let _ = std::fs::remove_dir_all(path);
+    result?;
+    Ok(())
+}
+
+fn time_module() -> Result<(), String> {
+    // `time()` is a positive wall clock; `monotonic()` never goes backwards
+    // and `sleep` really waits on the monotonic clock.
+    expect_repr("import time\nx = time.time() > 0", "x", "True")?;
+    expect_repr(
+        "import time\nstart = time.monotonic()\ntime.sleep(0.01)\nx = time.monotonic() >= start",
+        "x",
+        "True",
+    )?;
+    expect_repr(
+        "import time\nstart = time.monotonic()\ntime.sleep(0.02)\nx = time.monotonic() - start >= 0.015",
+        "x",
+        "True",
+    )?;
+    expect_repr("import time\nx = time.monotonic() >= 0.0", "x", "True")?;
+    expect_repr(
+        "import time\ntry:\n    time.sleep(-1)\n    x = 'no error'\nexcept ValueError:\n    x = 'negative'",
+        "x",
+        "'negative'",
+    )?;
+    Ok(())
+}
+
+fn random_module() -> Result<(), String> {
+    // Deterministic: the same seed gives the same sequence, and the default
+    // seed is fixed, so two runs of the same script agree.
+    expect_repr(
+        "import random\nrandom.seed(7)\na = [random.random() for _ in range(3)]\nrandom.seed(7)\nb = [random.random() for _ in range(3)]\nx = a == b",
+        "x",
+        "True",
+    )?;
+    expect_repr(
+        "import random\nrandom.seed(7)\na = random.random()\nrandom.seed(7)\nb = random.random()\nx = a == b",
+        "x",
+        "True",
+    )?;
+    expect_repr(
+        "import random\nx = 0.0 <= random.random() < 1.0",
+        "x",
+        "True",
+    )?;
+    expect_repr(
+        "import random\nrandom.seed(1)\nvalues = [random.randint(1, 6) for _ in range(200)]\nx = (min(values) >= 1, max(values) <= 6, len(values))",
+        "x",
+        "(True, True, 200)",
+    )?;
+    expect_repr(
+        "import random\nrandom.seed(3)\nvalues = [random.randint(5, 5) for _ in range(10)]\nx = values",
+        "x",
+        "[5, 5, 5, 5, 5, 5, 5, 5, 5, 5]",
+    )?;
+    expect_repr(
+        "import random\nrandom.seed(2)\nx = random.choice('abc') in 'abc'",
+        "x",
+        "True",
+    )?;
+    expect_repr(
+        "import random\nrandom.seed(2)\nitems = [1, 2, 3, 4, 5, 6]\nrandom.shuffle(items)\nx = (sorted(items), len(items))",
+        "x",
+        "([1, 2, 3, 4, 5, 6], 6)",
+    )?;
+    expect_repr(
+        "import random\nrandom.seed(11)\na = [1, 2, 3, 4, 5]\nrandom.shuffle(a)\nrandom.seed(11)\nb = [1, 2, 3, 4, 5]\nrandom.shuffle(b)\nx = a == b",
+        "x",
+        "True",
+    )?;
+    expect_repr(
+        "import random\nrandom.seed(5)\nvalue = random.uniform(1.0, 2.0)\nx = 1.0 <= value <= 2.0",
+        "x",
+        "True",
+    )?;
+    expect_repr(
+        "import random\ntry:\n    random.choice([])\n    x = 'no error'\nexcept IndexError:\n    x = 'empty'",
+        "x",
+        "'empty'",
+    )?;
+    expect_repr(
+        "import random\ntry:\n    random.randint(5, 1)\n    x = 'no error'\nexcept ValueError:\n    x = 'reversed'",
+        "x",
+        "'reversed'",
+    )?;
+    Ok(())
+}
+
 fn sets() -> Result<(), String> {
     expect_repr("x = {1, 2, 2, 3}", "x", "{1, 2, 3}")?;
     expect_repr("x = set([1, 2, 2])", "x", "{1, 2}")?;
@@ -722,6 +1145,14 @@ fn binary_files() -> Result<(), String> {
 fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
     alloc::vec![
         ("arithmetic", arithmetic as fn() -> Result<(), String>),
+        ("generators", generators),
+        ("generator expressions", generator_expressions),
+        ("decorators", decorators),
+        ("percent format", percent_formatting),
+        ("os.path", path_module),
+        ("time", time_module),
+        ("random", random_module),
+        ("fibers", fibers),
         ("floats", floats),
         ("strings", strings),
         ("lists", lists),
@@ -752,7 +1183,7 @@ pub fn selftest() {
         match check() {
             Ok(()) => println!("PASS {}", name),
             Err(message) => {
-                println!("FAIL {}: {}", name, message);
+                println!("FAIL {}: {} (fibers {})", name, message, crate::fiber::live_fibers());
                 failed += 1;
             }
         }
@@ -872,4 +1303,44 @@ fn os_works() {
 #[test]
 fn binary_files_work() {
     binary_files().unwrap();
+}
+
+#[test]
+fn fibers_work() {
+    fibers().unwrap();
+}
+
+#[test]
+fn generators_work() {
+    generators().unwrap();
+}
+
+#[test]
+fn generator_expressions_work() {
+    generator_expressions().unwrap();
+}
+
+#[test]
+fn decorators_work() {
+    decorators().unwrap();
+}
+
+#[test]
+fn percent_formatting_works() {
+    percent_formatting().unwrap();
+}
+
+#[test]
+fn path_module_works() {
+    path_module().unwrap();
+}
+
+#[test]
+fn time_module_works() {
+    time_module().unwrap();
+}
+
+#[test]
+fn random_module_works() {
+    random_module().unwrap();
 }

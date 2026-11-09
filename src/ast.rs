@@ -14,15 +14,18 @@ use alloc::vec::Vec;
 /// An identifier, also used for keyword-argument and attribute names.
 pub type Name = Rc<str>;
 
+#[derive(Clone)]
 pub struct Module {
     pub body: Vec<Stmt>,
 }
 
+#[derive(Clone)]
 pub struct Stmt {
     pub line: u32,
     pub kind: StmtKind,
 }
 
+#[derive(Clone)]
 pub enum StmtKind {
     Expr(Expr),
     /// `a = b = value`; every target is validated by the parser.
@@ -53,12 +56,22 @@ pub enum StmtKind {
         name: Name,
         params: Vec<Param>,
         body: Rc<Vec<Stmt>>,
+        /// `@decorator` expressions, outermost first. They are evaluated in
+        /// the enclosing scope after the function object is built, so the
+        /// decorator on top of the list is applied last.
+        decorators: Vec<Expr>,
+        /// The body contains a `yield`, so calling the function returns a
+        /// generator instead of running the body. Decided by the parser: it is
+        /// the only stage that can tell a `yield` of this function from one
+        /// inside a nested function.
+        is_generator: bool,
     },
     Return(Option<Expr>),
     Class {
         name: Name,
         bases: Vec<Expr>,
         body: Vec<Stmt>,
+        decorators: Vec<Expr>,
     },
     Try {
         body: Vec<Stmt>,
@@ -86,6 +99,7 @@ pub enum StmtKind {
     },
 }
 
+#[derive(Clone)]
 pub struct Param {
     pub name: Name,
     /// The default is evaluated once, when the `def` executes (Python's
@@ -104,11 +118,13 @@ pub enum ParamKind {
     KwArgs,
 }
 
+#[derive(Clone)]
 pub struct WithItem {
     pub context: Expr,
     pub target: Option<Expr>,
 }
 
+#[derive(Clone)]
 pub struct Handler {
     /// `None` is a bare `except:`.
     pub kind: Option<Expr>,
@@ -116,6 +132,7 @@ pub struct Handler {
     pub body: Vec<Stmt>,
 }
 
+#[derive(Clone)]
 pub struct ImportAlias {
     /// The dotted module path for `import a.b`, or the dotted source module in
     /// `from a.b import c` (unused for the imported-name entry itself).
@@ -126,6 +143,7 @@ pub struct ImportAlias {
 /// One piece of an f-string literal. Text pieces are already unescaped;
 /// expression pieces keep the source text until the parser turns it into an
 /// `Expr`, so the lexer never depends on the parser.
+#[derive(Clone)]
 pub enum FStringPart {
     Text(Rc<str>),
     Value {
@@ -137,12 +155,16 @@ pub enum FStringPart {
     },
 }
 
+#[derive(Clone)]
+/// One `for ... in ... if ...` clause of a comprehension. Generator
+/// expressions and the list/set/dict comprehensions share it.
 pub struct CompGen {
     pub target: Expr,
     pub iterable: Expr,
     pub conditions: Vec<Expr>,
 }
 
+#[derive(Clone)]
 pub enum Expr {
     None,
     True,
@@ -163,6 +185,15 @@ pub enum Expr {
     Lambda {
         params: Vec<Param>,
         body: Rc<Expr>,
+    },
+    /// `yield` / `yield value`: an expression, so `x = yield` works. Only
+    /// valid inside a generator function; the parser enforces that.
+    Yield(Option<Box<Expr>>),
+    /// `(element for target in iterable ...)`. Lazy: the interpreter turns it
+    /// into a generator, not a list.
+    GeneratorExp {
+        element: Box<Expr>,
+        generators: Vec<CompGen>,
     },
     Unary {
         op: UnOp,
@@ -222,12 +253,14 @@ pub enum Expr {
 }
 
 /// One positional slot of a call. `Unpack` is `*iterable`.
+#[derive(Clone)]
 pub enum CallArg {
     Value(Expr),
     Unpack(Expr),
 }
 
 /// One keyword slot of a call. `Unpack` is `**mapping`.
+#[derive(Clone)]
 pub enum CallKeyword {
     Named(Name, Expr),
     Unpack(Expr),

@@ -26,6 +26,7 @@ use crate::ast::{
     BinOp, BoolOp, CallArg, CallKeyword, CmpOp, CompGen, Expr, FStringPart, Handler, Name, Param,
     ParamKind, Stmt, StmtKind, UnOp, WithItem,
 };
+use crate::fiber;
 use crate::builtins;
 use crate::error::{ErrorName, PyError, PyResult, TraceFrame};
 use crate::parser;
@@ -34,7 +35,8 @@ use crate::value;
 use crate::value::{
     attr_get, attr_set, class_is_subclass, class_lookup, dict_get, dict_set, env_find_nonlocal,
     env_lookup, is_same, set_find, set_insert, values_equal, BuiltinId, BuiltinType, BuiltinValue,
-    Class, Env, EnvRef, Function, FunctionBody, Instance, IterState, ModuleValue, RangeValue, Value,
+    Class, Env, EnvRef, Function, FunctionBody, Generator, Instance, IterState, ModuleValue,
+    RangeValue, Value,
 };
 
 /// Maximum number of nested Python calls. See the module docs.
@@ -107,6 +109,17 @@ impl ArgList {
         out
     }
 
+    /// A copy, for the rare call that must forward its arguments.
+    pub fn duplicate(&self) -> ArgList {
+        let mut out = ArgList::new();
+        for index in 0..self.len {
+            if let Some(value) = self.get(index) {
+                out.push(value.clone());
+            }
+        }
+        out
+    }
+
     /// A list with `receiver` prepended (method calls).
     pub fn with_receiver(receiver: Value, args: &ArgList) -> ArgList {
         let mut out = ArgList::new();
@@ -118,6 +131,27 @@ impl ArgList {
         }
         out
     }
+}
+
+/// The seed `random` starts from: a fixed constant, so every boot that does
+/// not call `random.seed()` sees the same sequence.
+const RNG_SEED: u64 = 0x5041_4748_5059_5448; // "PAGHPYTH"
+
+/// What a generator's fiber body needs on its first entry. The fiber copies
+/// both pointers out immediately: this record lives in the resumer's frame.
+struct GeneratorStart {
+    interp: *mut Interp,
+    generator: *mut Generator,
+}
+
+/// Bookkeeping for one running generator body.
+#[derive(Clone, Copy)]
+struct ActiveFiber {
+    fiber: *mut fiber::Fiber,
+    generator: *mut Generator,
+    /// `call_stack` length just below the generator's own frame: a `yield`
+    /// parks the frames above it so the resumer's tracebacks stay its own.
+    frame_depth: usize,
 }
 
 pub struct Frame {
@@ -153,6 +187,13 @@ pub struct Interp {
     /// Lazily created `os.stat_result` class, shared by every call.
     stat_class: Option<Rc<Class>>,
     module_cache: Vec<(String, Value)>,
+    /// The `random` module's xorshift64* state. Seeded with a fixed constant so
+    /// the module is deterministic until a script calls `random.seed()`.
+    pub rng_state: u64,
+    /// The fibers currently running, innermost last. `yield` needs the
+    /// innermost one to switch back to its resumer, and each entry remembers
+    /// where the generator's traceback frames start.
+    active_fibers: Vec<ActiveFiber>,
 }
 
 impl Interp {
@@ -178,6 +219,7 @@ impl Interp {
             BuiltinType::File,
             BuiltinType::Range,
             BuiltinType::Iterator,
+            BuiltinType::Generator,
         ] {
             let base = if tag == BuiltinType::Bool {
                 // `bool` is a subclass of `int`, exactly as in Python.
@@ -285,6 +327,8 @@ impl Interp {
             ids: Vec::new(),
             stat_class: None,
             module_cache: Vec::new(),
+            rng_state: RNG_SEED,
+            active_fibers: Vec::new(),
         };
         interp.init_search_paths(script_dir);
         interp.init_builtins(object_class, type_class);
@@ -344,6 +388,7 @@ impl Interp {
             ("ord", BuiltinId::Ord),
             ("repr", BuiltinId::Repr),
             ("iter", BuiltinId::Iter),
+            ("staticmethod", BuiltinId::StaticMethod),
             ("next", BuiltinId::Next),
             ("any", BuiltinId::Any),
             ("all", BuiltinId::All),
@@ -497,17 +542,33 @@ impl Interp {
             StmtKind::Break => Ok(Flow::Break),
             StmtKind::Continue => Ok(Flow::Continue),
             StmtKind::Pass => Ok(Flow::Normal),
-            StmtKind::Def { name, params, body } => {
-                let function = self.make_function(name, params, body, statement.line, env)?;
-                self.set_name(env, name.clone(), Value::Function(Rc::new(function)))?;
+            StmtKind::Def {
+                name,
+                params,
+                body,
+                decorators,
+                is_generator,
+            } => {
+                let function =
+                    self.make_function(name, params, body, *is_generator, statement.line, env)?;
+                let value =
+                    self.apply_decorators(Value::Function(Rc::new(function)), decorators, env)?;
+                self.set_name(env, name.clone(), value)?;
                 Ok(Flow::Normal)
             }
             StmtKind::Return(expression) => match expression {
                 Some(expression) => Ok(Flow::Return(self.eval_expr(expression, env)?)),
                 None => Ok(Flow::Return(Value::None)),
             },
-            StmtKind::Class { name, bases, body } => {
-                self.exec_class(name, bases, body, env)?;
+            StmtKind::Class {
+                name,
+                bases,
+                body,
+                decorators,
+            } => {
+                let value = self.exec_class(name, bases, body, env)?;
+                let value = self.apply_decorators(value, decorators, env)?;
+                self.set_name(env, name.clone(), value)?;
                 Ok(Flow::Normal)
             }
             StmtKind::Try {
@@ -538,12 +599,17 @@ impl Interp {
             },
             StmtKind::Import(names) => {
                 for alias in names {
+                    // `import os.path` loads the submodule but binds the top
+                    // package, exactly as Python does; the only way to bind
+                    // `path` itself is `import os.path as path`.
                     let module = self.import_module(&alias.name)?;
-                    let bind_name = match &alias.alias {
-                        Some(alias) => alias.clone(),
+                    let (bind_name, module) = match &alias.alias {
+                        Some(alias) => (alias.clone(), module),
                         None => match alias.name.split('.').next() {
-                            Some(first) => Rc::from(first),
-                            None => alias.name.clone(),
+                            Some(first) if first.len() < alias.name.len() => {
+                                (Rc::from(first), self.import_module(first)?)
+                            }
+                            _ => (alias.name.clone(), module),
                         },
                     };
                     self.set_name(env, bind_name, module)?;
@@ -623,6 +689,7 @@ impl Interp {
         name: &Name,
         params: &[Param],
         body: &Rc<Vec<Stmt>>,
+        is_generator: bool,
         def_line: u32,
         env: &EnvRef,
     ) -> PyResult<Function> {
@@ -661,6 +728,7 @@ impl Interp {
             kwargs,
             body: FunctionBody::Block(body.clone()),
             closure,
+            is_generator,
             filename: self.current_filename(),
             def_line,
         })
@@ -772,18 +840,21 @@ impl Interp {
             kwargs,
             body: FunctionBody::Expression(body.clone()),
             closure,
+            is_generator: false,
             filename: self.current_filename(),
             def_line,
         })
     }
 
+    /// Execute a class body and build the class object. The caller binds the
+    /// name, because a decorated class is bound to the decorator's result.
     fn exec_class(
         &mut self,
         name: &Name,
         base_expressions: &[Expr],
         body: &[Stmt],
         env: &EnvRef,
-    ) -> PyResult<()> {
+    ) -> PyResult<Value> {
         let mut bases = Vec::new();
         let object_class = match self.class_for(BuiltinType::Object) {
             Some(class) => class,
@@ -838,8 +909,7 @@ impl Interp {
         for (attr_name, value) in vars {
             attr_set(&class.attrs, attr_name, value);
         }
-        self.set_name(env, name.clone(), Value::Class(class))?;
-        Ok(())
+        Ok(Value::Class(class))
     }
 
     fn exec_try(
@@ -1223,6 +1293,16 @@ impl Interp {
                 let function = self.make_lambda_function(params, body, env)?;
                 Ok(Value::Function(Rc::new(function)))
             }
+            Expr::Yield(value) => {
+                let produced = match value {
+                    Some(expression) => self.eval_expr(expression, env)?,
+                    None => Value::None,
+                };
+                self.fiber_yield(produced)
+            }
+            Expr::GeneratorExp { element, generators } => {
+                self.make_generator_expression(element, generators, env)
+            }
             Expr::Unary { op, value } => {
                 let value = self.eval_expr(value, env)?;
                 match op {
@@ -1605,6 +1685,321 @@ impl Interp {
         Ok(())
     }
 
+    /// Apply `@decorator` expressions to a freshly created function or class.
+    ///
+    /// Python applies them bottom-up: the decorator written last is called
+    /// first, and each one receives the previous result. They are evaluated
+    /// here, in the enclosing scope, after the definition was built.
+    fn apply_decorators(
+        &mut self,
+        value: Value,
+        decorators: &[Expr],
+        env: &EnvRef,
+    ) -> PyResult<Value> {
+        let mut value = value;
+        for expression in decorators.iter().rev() {
+            let decorator = self.eval_expr(expression, env)?;
+            let mut args = ArgList::new();
+            args.push(value);
+            value = self.call_value(decorator, args, Vec::new())?;
+        }
+        Ok(value)
+    }
+
+    // ── generators ─────────────────────────────────────────────────────────
+
+    /// The entry the fiber runs: the generator body, on the fiber's own stack.
+    ///
+    /// It copies the two pointers out of the start record first, because that
+    /// record lives in the resumer's frame and dies when the body first yields.
+    unsafe extern "C" fn generator_fiber_entry(start: *mut u8) -> ! {
+        let start = &*(start as *const GeneratorStart);
+        let interp = &mut *start.interp;
+        let generator = start.generator;
+        let function = (*generator).function.clone();
+        let env = (*generator).env.clone();
+        let fiber = (*generator)
+            .fiber
+            .as_mut()
+            .map(|boxed| &mut **boxed as *mut fiber::Fiber);
+        let outcome = match interp.run_generator_body(&function, &env) {
+            Ok(flow) => match flow {
+                Flow::Return(value) => Ok(value),
+                Flow::Normal => Ok(Value::None),
+                _ => Err(interp.err(
+                    "SyntaxError",
+                    String::from("'break' or 'return' outside a loop/function"),
+                )),
+            },
+            Err(error) => Err(error),
+        };
+        if let Some(fiber) = fiber {
+            (*generator).finished = true;
+            (*generator).running = false;
+            match outcome {
+                Ok(value) => (*generator).yielded = Some(value),
+                Err(error) => (*generator).failed = Some(error),
+            }
+            // Hand control back for the last time, then park: a finished
+            // generator is never resumed, so this is a safety net rather than
+            // a real path.
+            loop {
+                (*fiber).yield_to_caller();
+            }
+        }
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Run one generator body: a statement block, a lambda expression, or a
+    /// generator expression. Called on the fiber's stack.
+    fn run_generator_body(&mut self, function: &Rc<Function>, env: &EnvRef) -> PyResult<Flow> {
+        self.call_stack.push(Frame {
+            filename: function.filename.clone(),
+            name: function.name.clone(),
+            line: function.def_line,
+        });
+        self.depth += 1;
+        let outcome = match &function.body {
+            FunctionBody::Block(body) => self.exec_block(body, env),
+            FunctionBody::Expression(expression) => {
+                self.eval_expr(expression, env).map(Flow::Return)
+            }
+            FunctionBody::GeneratorExpr { element, generators } => self
+                .run_generator_expression(element, generators, env)
+                .map(|_| Flow::Normal),
+        };
+        self.depth -= 1;
+        self.call_stack.pop();
+        outcome
+    }
+
+    /// Walk a comprehension, yielding each produced element.
+    fn run_generator_expression(
+        &mut self,
+        element: &Expr,
+        generators: &Rc<Vec<CompGen>>,
+        env: &EnvRef,
+    ) -> PyResult<()> {
+        self.run_generator_clauses(generators, 0, env, element)
+    }
+
+    fn run_generator_clauses(
+        &mut self,
+        generators: &[CompGen],
+        index: usize,
+        env: &EnvRef,
+        element: &Expr,
+    ) -> PyResult<()> {
+        if index >= generators.len() {
+            let value = self.eval_expr(element, env)?;
+            self.fiber_yield(value)?;
+            return Ok(());
+        }
+        let generator = &generators[index];
+        let iterable = self.eval_expr(&generator.iterable, env)?;
+        let iterator = self.make_iterator(iterable)?;
+        while let Some(item) = self.next_from_iterator(&iterator)? {
+            self.assign_target(&generator.target, item, env)?;
+            let mut keep = true;
+            for condition in &generator.conditions {
+                if !self.eval_expr(condition, env)?.truthy() {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                self.run_generator_clauses(generators, index + 1, env, element)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a generator from a generator function and its bound arguments.
+    ///
+    /// The parameters bind here, at call time, exactly as they do for a
+    /// normal call: `f(1)` with a bad signature still raises `TypeError`
+    /// immediately, and the body does not run until the first `next()`.
+    fn make_generator(
+        &mut self,
+        function: &Rc<Function>,
+        args: &ArgList,
+        kwargs: &[(Name, Value)],
+    ) -> PyResult<Value> {
+        let env = Env::new(None);
+        env.borrow_mut().parent = Some(function.closure.clone());
+        self.bind_parameters(&env, function, args, kwargs)?;
+        // No fiber yet: the 64 KiB stack is allocated by the first `next()`,
+        // so a generator that is created and never iterated costs nothing.
+        let generator = Value::Generator(Rc::new(RefCell::new(Generator {
+            function: function.clone(),
+            env,
+            name: function.name.clone(),
+            fiber: None,
+            running: false,
+            finished: false,
+            failed: None,
+            yielded: None,
+            sent: Value::None,
+        })));
+        Ok(generator)
+    }
+
+    /// Build the generator a `(element for ...)` expression evaluates to.
+    fn make_generator_expression(
+        &mut self,
+        element: &Expr,
+        generators: &[CompGen],
+        env: &EnvRef,
+    ) -> PyResult<Value> {
+        let function = Rc::new(Function {
+            name: Rc::from("<genexpr>"),
+            params: Vec::new(),
+            varargs: None,
+            kwargs: None,
+            body: FunctionBody::GeneratorExpr {
+                element: Rc::new(element.clone()),
+                generators: Rc::new(generators.to_vec()),
+            },
+            closure: env.clone(),
+            is_generator: true,
+            filename: self.current_filename(),
+            def_line: self.current_line(),
+        });
+        self.make_generator(&function, &ArgList::new(), &[])
+    }
+
+    /// `next()` on a generator: resume the fiber and bring back what it did.
+    pub fn generator_resume(
+        &mut self,
+        generator: &Rc<RefCell<Generator>>,
+    ) -> PyResult<Option<Value>> {
+        {
+            let borrowed = generator.borrow();
+            if borrowed.running {
+                return Err(self.err(
+                    "ValueError",
+                    String::from("generator already executing"),
+                ));
+            }
+            if borrowed.finished {
+                return match &borrowed.failed {
+                    Some(error) => Err(error.clone()),
+                    None => Ok(None),
+                };
+            }
+        }
+        // The raw pointer stays valid: `keep` holds the generator for the
+        // whole resume, and the fiber only runs inside this function.
+        let keep = generator.clone();
+        let cell: &RefCell<Generator> = &generator;
+        let generator_ptr = cell.as_ptr();
+        // SAFETY: `keep` owns the generator for the whole resume, so the raw
+        // pointer stays valid and `start`/`resume` only touch disjoint fields.
+        let fiber_ptr = unsafe {
+            match (*generator_ptr).fiber.as_deref_mut() {
+                Some(fiber) => fiber as *mut fiber::Fiber,
+                None => {
+                    let fiber = match fiber::Fiber::new() {
+                        Some(fiber) => fiber,
+                        None => {
+                            return Err(self.err(
+                                "MemoryError",
+                                format!(
+                                    "cannot start a generator: {} are already suspended ({} KiB each)",
+                                    fiber::MAX_LIVE,
+                                    fiber::STACK_SIZE / 1024
+                                ),
+                            ))
+                        }
+                    };
+                    let raw = &*fiber as *const fiber::Fiber as *mut fiber::Fiber;
+                    (*generator_ptr).fiber = Some(fiber);
+                    raw
+                }
+            }
+        };
+        let mut start = GeneratorStart {
+            interp: self as *mut Interp,
+            generator: generator_ptr,
+        };
+        // SAFETY: as above; `start` is read by the first entry, which copies
+        // its two pointers before it can yield.
+        unsafe {
+            (*generator_ptr).running = true;
+            (*generator_ptr).yielded = None;
+        }
+        self.active_fibers.push(ActiveFiber {
+            fiber: fiber_ptr,
+            generator: generator_ptr,
+            frame_depth: self.call_stack.len(),
+        });
+        // SAFETY: the fiber is suspended (checked above) and this is the only
+        // running context; the resumer's frame outlives the switch.
+        unsafe {
+            if !(*fiber_ptr).started() {
+                (*fiber_ptr).start(
+                    Self::generator_fiber_entry,
+                    &mut start as *mut GeneratorStart as *mut u8,
+                );
+            } else {
+                (*fiber_ptr).resume();
+            }
+        }
+        self.active_fibers.pop();
+        // A finished generator never runs again, so its stack goes back to the
+        // pool immediately: without this, a script that creates generators in
+        // a loop would run out of fiber slots, because these generators are
+        // often still reachable from the namespace that their own closure
+        // chain points at (a reference cycle the interpreter has no GC for).
+        if unsafe { (*generator_ptr).finished } {
+            unsafe {
+                (*generator_ptr).fiber = None;
+                // Drop the captured frame too: it is one half of that cycle,
+                // and a finished body cannot need it again.
+                (*generator_ptr).env = Env::new(None);
+            }
+        }
+        let mut borrowed = keep.borrow_mut();
+        borrowed.running = false;
+        if let Some(error) = borrowed.failed.take() {
+            return Err(error);
+        }
+        if borrowed.finished {
+            return Ok(None);
+        }
+        Ok(borrowed.yielded.take())
+    }
+
+    /// Suspend the running generator at a `yield`, handing `value` to its
+    /// resumer. Returns the value the resumer sends back (always `None`).
+    fn fiber_yield(&mut self, value: Value) -> PyResult<Value> {
+        let active = match self.active_fibers.last().copied() {
+            Some(active) => active,
+            None => {
+                return Err(self.err(
+                    "SyntaxError",
+                    String::from("'yield' outside a function"),
+                ))
+            }
+        };
+        // The resumer must not see the generator's frames in a traceback while
+        // the generator is suspended; they come back on resume.
+        let parked = self.call_stack.split_off(active.frame_depth);
+        unsafe {
+            (*active.generator).yielded = Some(value);
+            (*active.generator).running = false;
+            (*active.fiber).yield_to_caller();
+            (*active.generator).running = true;
+        }
+        self.call_stack.extend(parked);
+        Ok(core::mem::replace(
+            unsafe { &mut (*active.generator).sent },
+            Value::None,
+        ))
+    }
+
     // ── calls ──────────────────────────────────────────────────────────────
 
     pub fn call_value(
@@ -1661,6 +2056,12 @@ impl Interp {
                 ),
             ));
         }
+        if function.is_generator {
+            // No body runs here; the generator binds its parameters and waits
+            // for the first `next()`.
+            return self.make_generator(function, args, kwargs);
+        }
+        self.check_fiber_headroom()?;
         let env = match self.pool.pop() {
             Some(env) => env,
             None => Env::new(None),
@@ -1684,6 +2085,12 @@ impl Interp {
             FunctionBody::Expression(expression) => self
                 .eval_expr(expression, &env)
                 .map(Flow::Return),
+            // A generator expression's synthetic function is always a
+            // generator, so `call_user_function` diverts it before this point.
+            FunctionBody::GeneratorExpr { .. } => Err(self.err(
+                "RuntimeError",
+                String::from("a generator expression body ran as a call"),
+            )),
         };
         self.call_stack.pop();
         self.depth -= 1;
@@ -2298,7 +2705,7 @@ impl Interp {
 
     // ── operators ──────────────────────────────────────────────────────────
 
-    pub fn binary_op(&self, op: BinOp, left: Value, right: Value) -> PyResult<Value> {
+    pub fn binary_op(&mut self, op: BinOp, left: Value, right: Value) -> PyResult<Value> {
         match op {
             BinOp::Add => self.add_values(left, right),
             BinOp::Sub => self.numeric_op(op, left, right),
@@ -2570,7 +2977,11 @@ impl Interp {
         Ok(Value::Float(crate::float::divmod(a, b).0))
     }
 
-    fn modulo_values(&self, left: Value, right: Value) -> PyResult<Value> {
+    fn modulo_values(&mut self, left: Value, right: Value) -> PyResult<Value> {
+        if let Value::Str(format) = &left {
+            // `str % args` is printf-style formatting, not arithmetic.
+            return self.percent_format(format, right);
+        }
         if let (Some(a), Some(b)) = (left.as_int(), right.as_int()) {
             if b == 0 {
                 return Err(self.err(
@@ -2602,6 +3013,230 @@ impl Interp {
             ));
         }
         Ok(Value::Float(crate::float::divmod(a, b).1))
+    }
+
+    /// `fmt % args`: printf-style string formatting.
+    ///
+    /// The conversion is a thin translation of the `%` syntax onto the
+    /// f-string formatter ([`builtins::format_value`]), so `%5.2f`, `%+d`,
+    /// `%#x` and friends pad, sign and round exactly like the equivalent
+    /// replacement field. Supported conversions: `s r a d i u f F e E g G x X
+    /// o b c %`. The `%(name)s` mapping form is not implemented and reports
+    /// the unsupported character.
+    fn percent_format(&mut self, format: &Rc<str>, right: Value) -> PyResult<Value> {
+        let values: Vec<Value> = match right {
+            // A tuple supplies one argument per conversion; every other value
+            // (including a list) is a single argument.
+            Value::Tuple(items) => items.as_ref().clone(),
+            other => alloc::vec![other],
+        };
+        let chars: Vec<char> = format.chars().collect();
+        let mut out = String::new();
+        let mut index = 0usize;
+        let mut argument = 0usize;
+        while index < chars.len() {
+            if chars[index] != '%' {
+                out.push(chars[index]);
+                index += 1;
+                continue;
+            }
+            index += 1;
+            if index >= chars.len() {
+                return Err(self.err("ValueError", String::from("incomplete format")));
+            }
+            if chars[index] == '%' {
+                out.push('%');
+                index += 1;
+                continue;
+            }
+            let mut left_align = false;
+            let mut zero_pad = false;
+            let mut plus = false;
+            let mut space = false;
+            let mut alternate = false;
+            loop {
+                match chars.get(index) {
+                    Some('-') => left_align = true,
+                    Some('0') => zero_pad = true,
+                    Some('+') => plus = true,
+                    Some(' ') => space = true,
+                    Some('#') => alternate = true,
+                    _ => break,
+                }
+                index += 1;
+            }
+            let mut width = String::new();
+            while let Some(ch) = chars.get(index) {
+                if ch.is_ascii_digit() {
+                    width.push(*ch);
+                    index += 1;
+                } else {
+                    break;
+                }
+            }
+            let mut precision: Option<String> = None;
+            if chars.get(index) == Some(&'.') {
+                index += 1;
+                let mut digits = String::new();
+                while let Some(ch) = chars.get(index) {
+                    if ch.is_ascii_digit() {
+                        digits.push(*ch);
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                precision = Some(if digits.is_empty() {
+                    String::from("0")
+                } else {
+                    digits
+                });
+            }
+            let kind = match chars.get(index) {
+                Some(kind) => *kind,
+                None => return Err(self.err("ValueError", String::from("incomplete format"))),
+            };
+            let position = index;
+            index += 1;
+            if argument >= values.len() {
+                return Err(self.err(
+                    "TypeError",
+                    String::from("not enough arguments for format string"),
+                ));
+            }
+            let value = values[argument].clone();
+            argument += 1;
+            if kind == 'c' {
+                let text = self.percent_character(value)?;
+                out.push_str(&self.percent_pad(text, &width, left_align));
+                continue;
+            }
+            let mut spec = String::new();
+            if left_align {
+                spec.push('<');
+            }
+            if plus {
+                spec.push('+');
+            } else if space {
+                spec.push(' ');
+            }
+            if alternate {
+                spec.push('#');
+            }
+            if zero_pad && !left_align {
+                spec.push('0');
+            }
+            spec.push_str(&width);
+            // `%r`/`%a` reuse the formatter's `!r` conversion; everything else
+            // is a plain spec. `%a` is `repr` here: there is no `ascii()`.
+            let conversion = match kind {
+                's' | 'r' | 'a' => {
+                    if let Some(precision) = &precision {
+                        spec.push('.');
+                        spec.push_str(precision);
+                    }
+                    spec.push('s');
+                    if kind == 's' {
+                        None
+                    } else {
+                        Some('r')
+                    }
+                }
+                'd' | 'i' | 'u' => {
+                    spec.push('d');
+                    None
+                }
+                'f' | 'F' => {
+                    spec.push('.');
+                    spec.push_str(precision.as_deref().unwrap_or("6"));
+                    spec.push('f');
+                    None
+                }
+                'e' | 'E' => {
+                    spec.push('.');
+                    spec.push_str(precision.as_deref().unwrap_or("6"));
+                    spec.push('e');
+                    None
+                }
+                'g' | 'G' => {
+                    spec.push('.');
+                    spec.push_str(precision.as_deref().unwrap_or("6"));
+                    spec.push('g');
+                    None
+                }
+                'x' | 'X' | 'o' | 'b' => {
+                    spec.push(kind);
+                    None
+                }
+                other => {
+                    return Err(self.err(
+                        "ValueError",
+                        format!(
+                            "unsupported format character '{}' (0x{:x}) at index {}",
+                            other, other as u32, position
+                        ),
+                    ))
+                }
+            };
+            let text = builtins::format_value(self, &value, Some(&spec), conversion)?;
+            if matches!(kind, 'E' | 'G') {
+                out.push_str(&text.to_uppercase());
+            } else {
+                out.push_str(&text);
+            }
+        }
+        if argument < values.len() {
+            return Err(self.err(
+                "TypeError",
+                String::from("not all arguments converted during string formatting"),
+            ));
+        }
+        Ok(Value::Str(Rc::from(out.as_str())))
+    }
+
+    /// The `%c` argument: a code point or a one-character string.
+    fn percent_character(&self, value: Value) -> PyResult<String> {
+        if let Some(number) = value.as_int() {
+            let code = match u32::try_from(number) {
+                Ok(code) => code,
+                Err(_) => {
+                    return Err(self.err(
+                        "OverflowError",
+                        String::from("%c arg not in range(0x110000)"),
+                    ))
+                }
+            };
+            return match char::from_u32(code) {
+                Some(ch) => Ok(String::from(ch)),
+                None => Err(self.err(
+                    "OverflowError",
+                    String::from("%c arg not in range(0x110000)"),
+                )),
+            };
+        }
+        match &value {
+            Value::Str(text) if text.chars().count() == 1 => Ok(String::from(&**text)),
+            _ => Err(self.err("TypeError", String::from("%c requires int or char"))),
+        }
+    }
+
+    /// `%5c`-style padding for the one conversion the formatter cannot take.
+    fn percent_pad(&self, text: String, width: &str, left_align: bool) -> String {
+        let width: usize = width.parse().unwrap_or(0);
+        let len = text.chars().count();
+        if len >= width {
+            return text;
+        }
+        let padding = " ".repeat(width - len);
+        if left_align {
+            let mut out = text;
+            out.push_str(&padding);
+            out
+        } else {
+            let mut padding = padding;
+            padding.push_str(&text);
+            padding
+        }
     }
 
     fn power_values(&self, left: Value, right: Value) -> PyResult<Value> {
@@ -3399,7 +4034,7 @@ impl Interp {
 
     pub fn make_iterator(&mut self, value: Value) -> PyResult<Value> {
         match &value {
-            Value::Iterator(_) => Ok(value),
+            Value::Iterator(_) | Value::Generator(_) => Ok(value),
             Value::Range(range) => Ok(Value::Iterator(Rc::new(RefCell::new(IterState::Range {
                 current: range.start,
                 stop: range.stop,
@@ -3464,6 +4099,7 @@ impl Interp {
     pub fn next_from_iterator(&mut self, iterator: &Value) -> PyResult<Option<Value>> {
         match iterator {
             Value::Iterator(state) => Ok(state.borrow_mut().next()),
+            Value::Generator(generator) => self.generator_resume(generator),
             _ => Err(self.err(
                 "TypeError",
                 format!("'{}' object is not an iterator", iterator.type_name()),
@@ -3483,6 +4119,16 @@ impl Interp {
     // ── imports ────────────────────────────────────────────────────────────
 
     fn import_module(&mut self, module: &str) -> PyResult<Value> {
+        // `import os.path` / `from os.path import join`: import the head and
+        // walk the attributes, which is what makes `os.path` a module object
+        // inside `os` rather than a name the loader has to know about.
+        if let Some((head, rest)) = module.split_once('.') {
+            let mut value = self.import_module(head)?;
+            for part in rest.split('.') {
+                value = self.get_attribute(&value, part)?;
+            }
+            return Ok(value);
+        }
         if module == "sys" {
             return self.sys_module();
         }
@@ -3494,6 +4140,12 @@ impl Interp {
         }
         if module == "json" {
             return self.json_module();
+        }
+        if module == "time" {
+            return self.time_module();
+        }
+        if module == "random" {
+            return self.random_module();
         }
         if let Some((_, value)) = self.module_cache.iter().find(|(name, _)| name == module) {
             return Ok(value.clone());
@@ -3656,6 +4308,8 @@ impl Interp {
                 Value::Str(Rc::from(platform::current_dir().as_str())),
             );
         }
+        let path_module = self.path_module()?;
+        attrs.push((Rc::from("path"), path_module));
         attrs.push((Rc::from("environ"), Value::dict(environment)));
         attrs.push((Rc::from("sep"), Value::str("/")));
         attrs.push((Rc::from("linesep"), Value::str("\n")));
@@ -3667,6 +4321,81 @@ impl Interp {
         }));
         self.module_cache
             .push((String::from("os"), module.clone()));
+        Ok(module)
+    }
+
+    /// `os.path`: the pure path helpers plus the existence probes. It is a
+    /// module object (`os.path.join`, `from os.path import basename`) and is
+    /// cached under its dotted name.
+    fn path_module(&mut self) -> PyResult<Value> {
+        if let Some((_, value)) = self.module_cache.iter().find(|(name, _)| name == "os.path") {
+            return Ok(value.clone());
+        }
+        let mut attrs: Vec<(Rc<str>, Value)> = Vec::new();
+        for (name, id) in [
+            ("join", BuiltinId::PathJoin),
+            ("basename", BuiltinId::PathBasename),
+            ("dirname", BuiltinId::PathDirname),
+            ("exists", BuiltinId::PathExists),
+            ("isfile", BuiltinId::PathIsfile),
+            ("isdir", BuiltinId::PathIsdir),
+        ] {
+            attrs.push((Rc::from(name), Value::builtin(id)));
+        }
+        attrs.push((Rc::from("sep"), Value::str("/")));
+        let module = Value::Module(Rc::new(ModuleValue {
+            name: Rc::from("os.path"),
+            attrs: RefCell::new(attrs),
+        }));
+        self.module_cache
+            .push((String::from("os.path"), module.clone()));
+        Ok(module)
+    }
+
+    /// `time`: the two ABI clocks and `sleep`.
+    fn time_module(&mut self) -> PyResult<Value> {
+        if let Some((_, value)) = self.module_cache.iter().find(|(name, _)| name == "time") {
+            return Ok(value.clone());
+        }
+        let mut attrs: Vec<(Rc<str>, Value)> = Vec::new();
+        for (name, id) in [
+            ("time", BuiltinId::TimeTime),
+            ("monotonic", BuiltinId::TimeMonotonic),
+            ("sleep", BuiltinId::TimeSleep),
+        ] {
+            attrs.push((Rc::from(name), Value::builtin(id)));
+        }
+        let module = Value::Module(Rc::new(ModuleValue {
+            name: Rc::from("time"),
+            attrs: RefCell::new(attrs),
+        }));
+        self.module_cache
+            .push((String::from("time"), module.clone()));
+        Ok(module)
+    }
+
+    /// `random`: a deterministic xorshift64* generator (see `RNG_SEED`).
+    fn random_module(&mut self) -> PyResult<Value> {
+        if let Some((_, value)) = self.module_cache.iter().find(|(name, _)| name == "random") {
+            return Ok(value.clone());
+        }
+        let mut attrs: Vec<(Rc<str>, Value)> = Vec::new();
+        for (name, id) in [
+            ("random", BuiltinId::RandomRandom),
+            ("seed", BuiltinId::RandomSeed),
+            ("randint", BuiltinId::RandomRandint),
+            ("choice", BuiltinId::RandomChoice),
+            ("shuffle", BuiltinId::RandomShuffle),
+            ("uniform", BuiltinId::RandomUniform),
+        ] {
+            attrs.push((Rc::from(name), Value::builtin(id)));
+        }
+        let module = Value::Module(Rc::new(ModuleValue {
+            name: Rc::from("random"),
+            attrs: RefCell::new(attrs),
+        }));
+        self.module_cache
+            .push((String::from("random"), module.clone()));
         Ok(module)
     }
 
@@ -3790,9 +4519,44 @@ impl Interp {
 
     // ── tracebacks ─────────────────────────────────────────────────────────
 
+    /// Refuse to start another Python call when the running generator's fiber
+    /// stack is nearly exhausted.
+    ///
+    /// A fiber has no guard page under it and overrunning it would corrupt the
+    /// interpreter's heap, so a generator body that recurses too deeply gets
+    /// the `RecursionError` Python expects. (The *process* stack, which plain
+    /// calls use, is not checked: see [`fiber::PROCESS_STACK`].)
+    fn check_fiber_headroom(&self) -> PyResult<()> {
+        let active = match self.active_fibers.last() {
+            Some(active) => active,
+            None => return Ok(()),
+        };
+        // SAFETY: the pointer refers to the fiber that is running right now
+        // (it was pushed before the switch and is popped after it).
+        let headroom = unsafe { (*active.fiber).headroom() };
+        if headroom < fiber::STACK_MARGIN {
+            return Err(self.err(
+                "RecursionError",
+                format!(
+                    "generator stack exhausted ({} bytes left of {} KiB)",
+                    headroom,
+                    fiber::STACK_SIZE / 1024
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn set_line(&mut self, line: u32) {
         if let Some(frame) = self.call_stack.last_mut() {
             frame.line = line;
+        }
+    }
+
+    fn current_line(&self) -> u32 {
+        match self.call_stack.last() {
+            Some(frame) => frame.line,
+            None => 1,
         }
     }
 
@@ -3977,10 +4741,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn is_utf8_name(name: &str) -> bool {
-    matches!(
-        name,
-        "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8"
-    )
+    matches!(name, "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8")
 }
 
 fn string_method(name: &str) -> Option<BuiltinId> {

@@ -144,6 +144,47 @@ pub fn vars() -> Vec<(String, String)> {
     libpagh::env::vars().collect()
 }
 
+// ── clock and sleeping (time module) ───────────────────────────────────────
+//
+// ABI clocks: 0 is the realtime/uptime clock, 1 is monotonic. Both report
+// `(seconds, nanoseconds)`; the interpreter converts to a float second count.
+
+/// The realtime clock in seconds since its epoch.
+pub fn realtime_seconds() -> Result<f64, String> {
+    let mut ts = libpagh::abi::Timespec::default();
+    libpagh::sys::clock_gettime(libpagh::sys::CLOCK_REALTIME, &mut ts)
+        .map_err(|error| format!("clock_gettime: {}", error))?;
+    Ok(ts.seconds as f64 + ts.nanos as f64 / 1_000_000_000.0)
+}
+
+/// The monotonic clock in seconds.
+pub fn monotonic_seconds() -> Result<f64, String> {
+    let mut ts = libpagh::abi::Timespec::default();
+    libpagh::sys::clock_gettime(libpagh::sys::CLOCK_MONOTONIC, &mut ts)
+        .map_err(|error| format!("clock_gettime: {}", error))?;
+    Ok(ts.seconds as f64 + ts.nanos as f64 / 1_000_000_000.0)
+}
+
+/// `nanosleep` for a non-negative number of seconds.
+pub fn sleep_seconds(seconds: f64) -> Result<(), String> {
+    if !(seconds >= 0.0) {
+        return Err(String::from("sleep length must be non-negative"));
+    }
+    let total = seconds * 1_000_000_000.0;
+    // Saturate rather than wrap: an absurd sleep is still a sleep, and the
+    // kernel clamps what it can.
+    let nanos = if total >= 9_000_000_000_000_000_000.0 {
+        9_000_000_000_000_000_000u64
+    } else {
+        total as u64
+    };
+    let request = libpagh::abi::Timespec {
+        seconds: (nanos / 1_000_000_000) as i64,
+        nanos: (nanos % 1_000_000_000) as i64,
+    };
+    libpagh::sys::nanosleep(&request).map_err(|error| format!("nanosleep: {}", error))
+}
+
 // ── processes (os module) ──────────────────────────────────────────────────
 
 pub fn getpid() -> i64 {

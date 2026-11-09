@@ -1,0 +1,229 @@
+Serial transcript of the pythonc 0.5.0 live run.
+
+Kernel: /home/oleg/pagh-riscv (0.19.0), debug ELF, QEMU virt, 256 MiB, ext2 64 MiB
+image built on the host with `truncate -s 64M` +
+`mke2fs -q -t ext2 -F -b 4096 -d <rootfs>`, driven by the kernel repository's
+own tool: `python3 tools/run.py --disk <image> --keys 'run /mnt/pythonc /mnt/<script>.py'`.
+
+Each block is one boot of that tool (the boot banner is kept only in the first
+block). The typed command follows the `pagh:rv64>` prompt, and the kernel's
+`run:` line after the program's output is pythonc's exit status.
+
+==============================================================================
+## generators.py — generator functions: yield, next(), StopIteration, for/else, laziness, finally, nesting
+==============================================================================
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 1
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 317 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 61 KB
+Firmware Heap Offset        : 0x46000
+Firmware Heap Size          : 37 KB (total), 2 KB (reserved), 11 KB (used), 23 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008004ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x000000008fe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+framebuffer  ramfb 1280x800 stride 5120 cells 100x37
+
+========================================
+   pagh OS ��� RISC-V (RV64)
+========================================
+boot hart   0
+device tree 0x8fe00000
+memory      0x80000000..0x90000000 (256 MiB)
+timebase    10000000 Hz
+console     NS16550 @ 0x10000000
+pmm         62258/65536 frames free (256 MiB tracked), heap 0 KiB in 0 chunk(s)
+sv39        on, satp=0x8000000000080ccc, identity 0x80000000..0x90000000 (RWX below 0x80ccc000, RW above), 65549 pages, 13 device
+rtc         goldfish @ 0x101000 - 2026-11-09 13:39:15 UTC
+rtc         raw 0xf3215250 0x18e66417 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000
+entropy     32 bytes from /chosen/rng-seed - TLS session keys available
+timer       10 ms ticks (100 Hz, timebase 10000000 Hz)
+plic        0xc000000 context 1, uart irq 10 (rx interrupt on)
+task        16 slots, 16 KiB stack + 4 KiB guard, quantum 8 ticks, timer clock
+virtio-blk: virtio-blk0 at 0x10007000: 131072 sectors (64 MiB)
+virtio-input: tablet at 0x10008000, abs X 0..32767, Y 0..32767
+fs          virtio-blk0 (131072 sectors, 65536 KiB)
+fs          ext2 on /mnt, 4096 B blocks, 15174/16384 blocks free, 16334/16384 inodes free
+virtio-net: no device
+net         no network device
+
+Type 'help' for the command list.
+
+pagh:rv64> run /mnt/pythonc /mnt/generators.py
+list: [0, 1, 2, 3]
+next: 0 1 2
+stopiteration: True
+for/else: 110
+lazy: [0, 1, 2, 3, 4]
+yield expr: first None
+finally: ['a', 'b'] ['cleanup']
+raise: generator failed
+nested: [10, 20]
+identity: True generator
+reentrant: generator already executing
+arity: TypeError
+recycled: 1200
+GENERATORS OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> 
+
+==============================================================================
+## genexpr.py — generator expressions (x for x in ...)
+==============================================================================
+pagh:rv64> run /mnt/pythonc /mnt/genexpr.py
+squares: [0, 1, 4, 9, 16]
+filtered sum: 20
+type: generator
+nested loops: [(0, 0), (0, 1), (1, 0), (1, 1)]
+lazy: [0, 2, 4, 6]
+bare in call: 18
+closure: [0, 1, 2]
+single pass: [0, 1, 2] []
+GENEXPR OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> 
+
+==============================================================================
+## decorators.py — @decorator at def time, stacked, on methods, @staticmethod, on classes
+==============================================================================
+pagh:rv64> run /mnt/pythonc /mnt/decorators.py
+double: 10
+order: value ['top', 'bottom']
+replaced: 42
+signature: 3 6
+method: 6
+generator decorator: [0, 1, 2]
+staticmethod: 3 7 10
+class decorator: decorated
+DECORATORS OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> 
+
+==============================================================================
+## percent_format.py — printf-style % string formatting
+==============================================================================
+pagh:rv64> run /mnt/pythonc /mnt/percent_format.py
+basic: pagh and 42
+widths:    42|42   |00042
+floats: 3.14|   3.142|+7
+radix: ff FF 10 101
+repr: 'quo\'te' 5
+percent: 50%
+char: Ab
+single: [1, 2] | (1, 2)
+scientific: 1.234568e+04 1.23e-05 2.2
+signs: +5  5
+nested: 3
+bad type: type
+missing arg: missing
+extra arg: extra
+bad conversion: character
+modulo: 1 1.5
+PERCENT OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> 
+
+==============================================================================
+## stdlib_modules.py — os.path / time / random
+==============================================================================
+pagh:rv64> run /mnt/pythonc /mnt/stdlib_modules.py
+join: a/b/c /root/x /abs/b
+split: test.py /mnt x 
+sep: /
+stat probes: /mnt/stdlib_modules.py True False
+sleep: 0.04999999999999982 True
+clocks: True True
+negative sleep: rejected
+deterministic: True [0.8202466665411988, 0.9282901565044228, 0.08934959275158794]
+unit interval: True
+randint: 1 6 200
+degenerate randint: [5, 5, 5, 5]
+choice: b
+shuffle: [5, 1, 3, 4, 2] [1, 2, 3, 4, 5]
+uniform: 1.2585765664404798
+empty choice: IndexError
+STDLIB OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> 
+
+==============================================================================
+## stack_depth.py — the fiber stack guard: too-deep recursion in a generator raises RecursionError
+==============================================================================
+pagh:rv64> run /mnt/pythonc /mnt/stack_depth.py
+shallow plain recursion: 1 4 8
+max depth inside a generator: 10
+generator failure: generator stack exhausted (5408 bytes left of 64 KiB)
+fiber stack KiB: 64
+recursion ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> 
+
+==============================================================================
+## generator_syntax.py — front end: yield outside a function
+==============================================================================
+pagh:rv64> run /mnt/pythonc /mnt/generator_syntax.py
+/mnt/generator_syntax.py:3:7: SyntaxError: 'yield' outside a function: only a def body can be a generator
+run: /mnt/pythonc exited with code 1
+pagh:rv64> 
+
+==============================================================================
+## decorator_syntax.py — front end: @ on a non-definition
+==============================================================================
+pagh:rv64> run /mnt/pythonc /mnt/decorator_syntax.py
+/mnt/decorator_syntax.py:4:1: SyntaxError: only a function or class definition can be decorated, found 'x'
+run: /mnt/pythonc exited with code 1
+pagh:rv64> 
+

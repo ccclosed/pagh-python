@@ -359,3 +359,107 @@ python3 tests/live/qemu_driver.py \
 
 Драйвер поднимает QEMU с serial-сокетом, ждёт приглашение `pagh:rv64>`,
 отправляет команды из `live.cmds` и сохраняет ответ ядра.
+
+---
+
+# Живой прогон pythonc 0.5.0 на ядре 0.19.0
+
+Дата: 2026-11-09. Ядро:
+`/home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh`
+(0.19.0), QEMU `qemu-system-riscv64` 10.2.2, машина `virt`, 256 MiB, serial на
+Unix-сокете, драйвер — **`tools/run.py` самого ядра** (не
+`tests/live/qemu_driver.py`). Диск: 64 MiB ext2,
+
+```sh
+truncate -s 64M /tmp/py-live-0.5.0.img
+mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py-live-0.5.0.img
+```
+
+а каждая команда отправлялась отдельной загрузкой:
+
+```sh
+python3 tools/run.py --disk /tmp/py-live-0.5.0.img \
+  --keys "run /mnt/pythonc /mnt/generators.py\n" \
+  --serial-log /tmp/live050-generators.txt --timeout 90
+```
+
+Сырой транскрипт (8 блоков, по блоку на загрузку):
+[`live-pythonc-050.txt`](live-pythonc-050.txt). Скрипты —
+[`../tests/live/`](../tests/live/), список команд —
+[`../tests/live/live05.cmds`](../tests/live/live05.cmds), обёртка —
+[`../tests/live/live05.sh`](../tests/live/live05.sh).
+
+## Итог 0.5.0
+
+| Скрипт | Что проверяет | Результат |
+|---|---|---|
+| `generators.py` | `yield`/`yield`-выражение, `next()`, `StopIteration`, `for/else`, ленивость, `finally`, вложенные генераторы, повторный вход, арность, рецикл стеков | `GENERATORS OK`, exit 0 |
+| `genexpr.py` | generator expressions: ленивость, фильтры, вложенные `for`, голый вид в вызове, однократность | `GENEXPR OK`, exit 0 |
+| `decorators.py` | `@dec` при определении, порядок снизу вверх, замена значения, метод, генераторная функция, `@staticmethod`, класс | `DECORATORS OK`, exit 0 |
+| `percent_format.py` | `%s %r %d %f %e %x %X %o %b %c %%`, флаги/ширина/точность, три ошибки CPython | `PERCENT OK`, exit 0 |
+| `stdlib_modules.py` | `os.path` (join/basename/dirname/exists/isfile/isdir/sep), `time` (time/monotonic/sleep), `random` (seed/random/randint/choice/shuffle/uniform) | `STDLIB OK`, exit 0 |
+| `stack_depth.py` | предохранитель стека файбера: слишком глубокая рекурсия в генераторе — `RecursionError`, а не порча памяти | `recursion ok`, exit 0 |
+| `generator_syntax.py` | `yield` вне функции — ошибка фронтенда | `SyntaxError: 'yield' outside a function…`, exit 1 |
+| `decorator_syntax.py` | `@` перед не-определением — ошибка фронтенда | `SyntaxError: only a function or class definition can be decorated…`, exit 1 |
+
+Ключевые строки серийного лога (полностью — в транскрипте):
+
+```text
+list: [0, 1, 2, 3]                     # generators.py
+lazy: [0, 1, 2, 3, 4]
+reentrant: generator already executing
+recycled: 1200
+GENERATORS OK
+
+squares: [0, 1, 4, 9, 16]              # genexpr.py
+lazy: [0, 2, 4, 6]
+GENEXPR OK
+
+order: value ['top', 'bottom']         # decorators.py
+staticmethod: 3 7 10
+DECORATORS OK
+
+widths:    42|42   |00042              # percent_format.py
+floats: 3.14|   3.142|+7
+PERCENT OK
+
+join: a/b/c /root/x /abs/b             # stdlib_modules.py
+sleep: 0.04999999999999982 True
+deterministic: True [0.8202466665411988, 0.9282901565044228, 0.08934959275158794]
+STDLIB OK
+
+max depth inside a generator: 10       # stack_depth.py
+generator failure: generator stack exhausted (5408 bytes left of 64 KiB)
+```
+
+`random` детерминирован: те же три числа для `seed(7)` печатает и hostcheck на
+хосте — xorshift64* не зависит от платформы.
+
+## Регрессия старого suite на бинарнике 0.5.0
+
+30 команд из [`live.cmds`](../tests/live/live.cmds) (0.1.2–0.4.0) прогнаны на
+том же бинарнике 0.5.0: 27 из них завершились кодом 0, ожидаемые диагностики
+— `run /mnt/pythonc` без аргументов (код 2), `syntax_error.py` (1) и
+`uncaught.py` (1) — как и раньше. Исключение:
+
+- `os_proc.py` (`os.fork`/`os.execv`/`os.waitpid`) на ядре 0.19.0 не печатает
+  ничего даже за 240 с. Тот же скрипт с **бинарником 0.4.0**, собранным из
+  предыдущего коммита, ведёт себя так же — то есть это расхождение ядра и
+  ABI, а не регрессия 0.5.0; в отчёте о релизе это записано как непроверенное.
+
+## Честные пробелы 0.5.0
+
+- **Рекурсия на стеке процесса.** `RECURSION_LIMIT = 56` недостижим: кадры
+  интерпретатора стоят несколько КиБ, 64 КиБ стека хватает примерно на
+  двенадцать вложенных вызовов, глубже ядро убивает процесс по store page
+  fault. Это унаследовано от 0.4.0 и в 0.5.0 не менялось; проверка стека есть
+  только у генераторов (там переполнение испортило бы кучу).
+- **Генераторы:** не более 8 одновременно приостановленных (у каждого стек
+  64 КиБ), нет `send`/`close`/`throw`/`yield from`; брошенный
+  (не исчерпанный) генератор, достижимый из своей же области видимости,
+  держит слот до конца процесса, и его `finally` не исполняется.
+- **`os_proc.py`** — см. выше: живьём на 0.19.0 не подтверждён ни одним из
+  бинарников.
+- Не проверялись живьём: `os.path` на путях со спецсимволами, `time.sleep`
+  под нагрузкой планировщика, генераторы с исключением в `finally`,
+  одновременные 8 генераторов (проверено только «6 из 8» и лимит).

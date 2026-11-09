@@ -55,6 +55,7 @@ impl ErrorName {
 }
 
 /// One line of a Python traceback, outermost frame first.
+#[derive(Clone)]
 pub struct TraceFrame {
     pub filename: Rc<str>,
     pub name: Rc<str>,
@@ -67,6 +68,7 @@ pub struct TraceFrame {
 /// (and `try` handlers) cannot erase the traceback. `value` is the exception
 /// instance when the user raised one; builtin errors construct a fresh
 /// instance only if a handler binds it with `as`.
+#[derive(Clone)]
 pub struct PyError {
     pub name: ErrorName,
     pub message: String,

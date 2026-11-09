@@ -14,6 +14,7 @@ extern crate alloc;
 mod ast;
 mod builtins;
 mod error;
+mod fiber;
 mod float;
 mod interp;
 mod json;

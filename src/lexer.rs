@@ -87,6 +87,8 @@ pub enum Op {
     Colon,
     Dot,
     Semi,
+    /// `@`, only used by decorators today.
+    At,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1405,6 +1407,7 @@ impl Lexer {
             ':' => (Op::Colon, 1),
             '.' => (Op::Dot, 1),
             ';' => (Op::Semi, 1),
+            '@' => (Op::At, 1),
             _ => {
                 return Err(self.error(&format!(
                     "unexpected character {:?} in source",

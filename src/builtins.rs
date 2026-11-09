@@ -84,6 +84,11 @@ pub fn call(
         BuiltinId::Hex => builtin_hex(interp, args, kwargs),
         BuiltinId::Id => builtin_id(interp, args, kwargs),
         BuiltinId::Map => builtin_map(interp, args, kwargs),
+        BuiltinId::StaticMethod => builtin_staticmethod(interp, args, kwargs),
+        BuiltinId::StaticMethodCall => {
+            let function = receiver(interp, builtin, "staticmethod")?.clone();
+            interp.call_value(function, args.duplicate(), kwargs.to_vec())
+        }
         BuiltinId::OsGetpid => os_getpid(interp, args, kwargs),
         BuiltinId::OsGetppid => os_getppid(interp, args, kwargs),
         BuiltinId::OsGetcwd => os_getcwd(interp, args, kwargs),
@@ -101,6 +106,21 @@ pub fn call(
         BuiltinId::OsSystem => os_system(interp, args, kwargs),
         BuiltinId::JsonDumps => json_dumps(interp, args, kwargs),
         BuiltinId::JsonLoads => json_loads(interp, args, kwargs),
+        BuiltinId::PathJoin => path_join(interp, args, kwargs),
+        BuiltinId::PathBasename => path_basename(interp, args, kwargs),
+        BuiltinId::PathDirname => path_dirname(interp, args, kwargs),
+        BuiltinId::PathExists => path_exists(interp, args, kwargs),
+        BuiltinId::PathIsfile => path_isfile(interp, args, kwargs),
+        BuiltinId::PathIsdir => path_isdir(interp, args, kwargs),
+        BuiltinId::TimeTime => time_time(interp, args, kwargs),
+        BuiltinId::TimeMonotonic => time_monotonic(interp, args, kwargs),
+        BuiltinId::TimeSleep => time_sleep(interp, args, kwargs),
+        BuiltinId::RandomRandom => random_random(interp, args, kwargs),
+        BuiltinId::RandomSeed => random_seed(interp, args, kwargs),
+        BuiltinId::RandomRandint => random_randint(interp, args, kwargs),
+        BuiltinId::RandomChoice => random_choice(interp, args, kwargs),
+        BuiltinId::RandomShuffle => random_shuffle(interp, args, kwargs),
+        BuiltinId::RandomUniform => random_uniform(interp, args, kwargs),
         _ => call_method(interp, builtin, args, kwargs),
     }
 }
@@ -391,10 +411,7 @@ fn parse_format_spec(interp: &Interp, spec: &str) -> PyResult<FormatSpec> {
         index += 1;
     }
     if index != chars.len() {
-        return Err(interp.err(
-            "ValueError",
-            format!("invalid format specifier '{}'", spec),
-        ));
+        return Err(interp.err("ValueError", format!("invalid format specifier '{}'", spec)));
     }
     Ok(parsed)
 }
@@ -680,10 +697,7 @@ pub(crate) fn format_value(
                 ),
             )),
         },
-        Some(other) => Err(interp.err(
-            "ValueError",
-            format!("unknown format code '{}'", other),
-        )),
+        Some(other) => Err(interp.err("ValueError", format!("unknown format code '{}'", other))),
         None => match value {
             Value::Str(_) => format_text_value(interp, value, &parsed),
             Value::Bool(_) | Value::Int(_) => match value.as_int() {
@@ -1408,7 +1422,11 @@ fn builtin_any_all(
     Ok(Value::Bool(want_all))
 }
 
-fn builtin_divmod(interp: &Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+fn builtin_divmod(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "divmod")?;
     expect_args(interp, args, "divmod", 2, 2)?;
     let left = argument(interp, args, 0, "divmod")?.clone();
@@ -1418,7 +1436,11 @@ fn builtin_divmod(interp: &Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) 
     Ok(Value::tuple(alloc::vec![quotient, remainder]))
 }
 
-fn builtin_pow(interp: &Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+fn builtin_pow(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "pow")?;
     expect_args(interp, args, "pow", 2, 3)?;
     let base_value = argument(interp, args, 0, "pow")?.clone();
@@ -3333,7 +3355,12 @@ fn dict_method_copy(
 
 // ── os module ──────────────────────────────────────────────────────────────
 
-fn os_failure(interp: &Interp, operation: &str, path: &str, message: String) -> crate::error::PyError {
+fn os_failure(
+    interp: &Interp,
+    operation: &str,
+    path: &str,
+    message: String,
+) -> crate::error::PyError {
     let name = if platform::path_exists(path) {
         "OSError"
     } else {
@@ -3342,41 +3369,25 @@ fn os_failure(interp: &Interp, operation: &str, path: &str, message: String) -> 
     interp.err(name, format!("{} '{}': {}", operation, path, message))
 }
 
-fn os_getpid(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_getpid(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "getpid")?;
     expect_args(interp, args, "getpid", 0, 0)?;
     Ok(Value::Int(platform::getpid()))
 }
 
-fn os_getppid(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_getppid(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "getppid")?;
     expect_args(interp, args, "getppid", 0, 0)?;
     Ok(Value::Int(platform::getppid()))
 }
 
-fn os_getcwd(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_getcwd(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "getcwd")?;
     expect_args(interp, args, "getcwd", 0, 0)?;
     Ok(Value::Str(Rc::from(platform::current_dir().as_str())))
 }
 
-fn os_listdir(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_listdir(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "listdir")?;
     expect_args(interp, args, "listdir", 0, 1)?;
     let path = match args.get(0) {
@@ -3400,11 +3411,7 @@ fn os_listdir(
     }
 }
 
-fn os_mkdir(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_mkdir(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "mkdir")?;
     expect_args(interp, args, "mkdir", 1, 2)?;
     let path = as_str(interp, argument(interp, args, 0, "mkdir")?, "mkdir() path")?;
@@ -3454,32 +3461,25 @@ fn os_makedirs(
     }
     match platform::create_dir_all(&path) {
         Ok(()) => Ok(Value::None),
-        Err(message) => Err(interp.err(
-            "OSError",
-            format!("makedirs '{}': {}", path, message),
-        )),
+        Err(message) => Err(interp.err("OSError", format!("makedirs '{}': {}", path, message))),
     }
 }
 
-fn os_remove(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_remove(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "remove")?;
     expect_args(interp, args, "remove", 1, 1)?;
-    let path = as_str(interp, argument(interp, args, 0, "remove")?, "remove() path")?;
+    let path = as_str(
+        interp,
+        argument(interp, args, 0, "remove")?,
+        "remove() path",
+    )?;
     match platform::remove_file(path) {
         Ok(()) => Ok(Value::None),
         Err(message) => Err(os_failure(interp, "remove", path, message)),
     }
 }
 
-fn os_rmdir(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_rmdir(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "rmdir")?;
     expect_args(interp, args, "rmdir", 1, 1)?;
     let path = as_str(interp, argument(interp, args, 0, "rmdir")?, "rmdir() path")?;
@@ -3489,11 +3489,7 @@ fn os_rmdir(
     }
 }
 
-fn os_rename(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_rename(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "rename")?;
     expect_args(interp, args, "rename", 2, 2)?;
     let from = as_str(interp, argument(interp, args, 0, "rename")?, "rename() src")?;
@@ -3504,11 +3500,7 @@ fn os_rename(
     }
 }
 
-fn os_stat(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_stat(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "stat")?;
     expect_args(interp, args, "stat", 1, 1)?;
     let path = as_str(interp, argument(interp, args, 0, "stat")?, "stat() path")?;
@@ -3518,11 +3510,7 @@ fn os_stat(
     }
 }
 
-fn os_fork(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_fork(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "fork")?;
     expect_args(interp, args, "fork", 0, 0)?;
     match platform::fork_process() {
@@ -3531,11 +3519,7 @@ fn os_fork(
     }
 }
 
-fn os_execv(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_execv(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "execv")?;
     expect_args(interp, args, "execv", 2, 2)?;
     let path = String::from(as_str(
@@ -3563,20 +3547,23 @@ fn os_execv(
     match platform::execv_replace(&path, &arguments) {
         Ok(()) => Err(interp.err(
             "OSError",
-            format!("execv '{}': execve returned without replacing the process", path),
+            format!(
+                "execv '{}': execve returned without replacing the process",
+                path
+            ),
         )),
         Err(message) => Err(interp.err("OSError", format!("execv '{}': {}", path, message))),
     }
 }
 
-fn os_waitpid(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_waitpid(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "waitpid")?;
     expect_args(interp, args, "waitpid", 1, 2)?;
-    let pid = as_int(interp, argument(interp, args, 0, "waitpid")?, "waitpid() pid")?;
+    let pid = as_int(
+        interp,
+        argument(interp, args, 0, "waitpid")?,
+        "waitpid() pid",
+    )?;
     let options = match args.get(1) {
         Some(value) => as_int(interp, value, "waitpid() options")?,
         None => 0,
@@ -3590,11 +3577,7 @@ fn os_waitpid(
     }
 }
 
-fn os_wait(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_wait(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "wait")?;
     expect_args(interp, args, "wait", 0, 0)?;
     match platform::wait_child(-1, false) {
@@ -3606,11 +3589,7 @@ fn os_wait(
     }
 }
 
-fn os_system(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn os_system(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "system")?;
     expect_args(interp, args, "system", 1, 1)?;
     Err(interp.err(
@@ -3624,11 +3603,7 @@ fn os_system(
 
 // ── json module ────────────────────────────────────────────────────────────
 
-fn json_dumps(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn json_dumps(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "dumps")?;
     expect_args(interp, args, "dumps", 1, 1)?;
     let value = argument(interp, args, 0, "dumps")?;
@@ -3645,11 +3620,7 @@ fn json_dumps(
     }
 }
 
-fn json_loads(
-    interp: &mut Interp,
-    args: &ArgList,
-    kwargs: &[(Rc<str>, Value)],
-) -> PyResult<Value> {
+fn json_loads(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
     no_kwargs(interp, kwargs, "loads")?;
     expect_args(interp, args, "loads", 1, 1)?;
     let value = argument(interp, args, 0, "loads")?;
@@ -3908,11 +3879,7 @@ fn bytes_receiver<'a>(
     }
 }
 
-fn decode_arguments(
-    interp: &Interp,
-    args: &ArgList,
-    function: &str,
-) -> PyResult<()> {
+fn decode_arguments(interp: &Interp, args: &ArgList, function: &str) -> PyResult<()> {
     if args.len() > 2 {
         return Err(interp.err(
             "TypeError",
@@ -3923,10 +3890,7 @@ fn decode_arguments(
         match value {
             Value::Str(name) if is_utf8_name(name) => {}
             Value::Str(name) => {
-                return Err(interp.err(
-                    "LookupError",
-                    format!("unknown encoding: {}", name),
-                ))
+                return Err(interp.err("LookupError", format!("unknown encoding: {}", name)))
             }
             other => {
                 return Err(interp.err(
@@ -4027,6 +3991,26 @@ fn is_utf8_name(name: &str) -> bool {
 /// This implementation is eager: it collects into a list instead of returning
 /// a lazy iterator. The values and the call semantics are Python's; only the
 /// evaluation time differs, which the README documents.
+/// `staticmethod(function)`: the decorator itself.
+///
+/// The interpreter binds a plain `Value::Function` found on a class as a
+/// method, so this returns a small wrapper the attribute path passes through
+/// untouched. `@staticmethod` therefore behaves like the real thing for
+/// methods that do not mention `self`, without a descriptor protocol.
+fn builtin_staticmethod(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "staticmethod")?;
+    expect_args(interp, args, "staticmethod", 1, 1)?;
+    let function = argument(interp, args, 0, "staticmethod")?.clone();
+    Ok(Value::Builtin(Rc::new(BuiltinValue {
+        id: BuiltinId::StaticMethodCall,
+        receiver: Some(function),
+    })))
+}
+
 fn builtin_map(
     interp: &mut Interp,
     args: &ArgList,
@@ -4408,4 +4392,294 @@ fn file_exit(
             Err(file_error(interp, message))
         }
     }
+}
+
+// ── os.path ────────────────────────────────────────────────────────────────
+//
+// `os.path` is a module object inside `os`, built by `Interp::path_module`.
+// The functions are pure string/stat helpers over the one path separator this
+// ABI has, so they live beside the platform calls they wrap.
+
+/// `os.path.join(*parts)`: join with `/`, restarting at an absolute part.
+fn path_join(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "os.path.join")?;
+    expect_args(interp, args, "os.path.join", 1, usize::MAX)?;
+    let mut joined = String::new();
+    for index in 0..args.len() {
+        let part = as_str(
+            interp,
+            argument(interp, args, index, "os.path.join")?,
+            "path",
+        )?;
+        if part.starts_with('/') || joined.is_empty() {
+            joined = String::from(part);
+        } else if part.is_empty() {
+            continue;
+        } else if joined.ends_with('/') {
+            joined.push_str(part);
+        } else {
+            joined.push('/');
+            joined.push_str(part);
+        }
+    }
+    Ok(Value::Str(Rc::from(joined.as_str())))
+}
+
+fn path_basename(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "os.path.basename")?;
+    expect_args(interp, args, "os.path.basename", 1, 1)?;
+    let path = as_str(
+        interp,
+        argument(interp, args, 0, "os.path.basename")?,
+        "path",
+    )?;
+    Ok(Value::str(split_path(path).1))
+}
+
+fn path_dirname(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "os.path.dirname")?;
+    expect_args(interp, args, "os.path.dirname", 1, 1)?;
+    let path = as_str(
+        interp,
+        argument(interp, args, 0, "os.path.dirname")?,
+        "path",
+    )?;
+    Ok(Value::str(split_path(path).0))
+}
+
+/// Split `path` into (dirname, basename) following POSIX rules: trailing
+/// slashes belong to neither, and the root's dirname is itself.
+fn split_path(path: &str) -> (&str, &str) {
+    if path.is_empty() {
+        return ("", "");
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        // "/" or "///": the whole path is the root.
+        return ("/", "");
+    }
+    match trimmed.rfind('/') {
+        None => ("", trimmed),
+        Some(0) => ("/", &trimmed[1..]),
+        Some(index) => (&trimmed[..index], &trimmed[index + 1..]),
+    }
+}
+
+fn path_exists(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "os.path.exists")?;
+    expect_args(interp, args, "os.path.exists", 1, 1)?;
+    let path = as_str(interp, argument(interp, args, 0, "os.path.exists")?, "path")?;
+    Ok(Value::Bool(platform::path_exists(path)))
+}
+
+fn path_isfile(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "os.path.isfile")?;
+    expect_args(interp, args, "os.path.isfile", 1, 1)?;
+    let path = as_str(interp, argument(interp, args, 0, "os.path.isfile")?, "path")?;
+    Ok(Value::Bool(path_kind(path) == Some(0)))
+}
+
+fn path_isdir(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "os.path.isdir")?;
+    expect_args(interp, args, "os.path.isdir", 1, 1)?;
+    let path = as_str(interp, argument(interp, args, 0, "os.path.isdir")?, "path")?;
+    Ok(Value::Bool(path_kind(path) == Some(1)))
+}
+
+/// The ABI kind of `path` (0 file, 1 directory, 2 symlink), or `None` when it
+/// does not exist.
+fn path_kind(path: &str) -> Option<u32> {
+    match platform::stat_path(path) {
+        Ok((_, _, kind)) => Some(kind),
+        Err(_) => None,
+    }
+}
+
+// ── time ───────────────────────────────────────────────────────────────────
+
+fn time_time(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "time.time")?;
+    expect_args(interp, args, "time.time", 0, 0)?;
+    match platform::realtime_seconds() {
+        Ok(seconds) => Ok(Value::Float(seconds)),
+        Err(message) => Err(interp.err("OSError", message)),
+    }
+}
+
+fn time_monotonic(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "time.monotonic")?;
+    expect_args(interp, args, "time.monotonic", 0, 0)?;
+    match platform::monotonic_seconds() {
+        Ok(seconds) => Ok(Value::Float(seconds)),
+        Err(message) => Err(interp.err("OSError", message)),
+    }
+}
+
+fn time_sleep(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "time.sleep")?;
+    expect_args(interp, args, "time.sleep", 1, 1)?;
+    let seconds = as_float(interp, argument(interp, args, 0, "time.sleep")?, "seconds")?;
+    if !(seconds >= 0.0) {
+        return Err(interp.err(
+            "ValueError",
+            String::from("sleep length must be non-negative"),
+        ));
+    }
+    match platform::sleep_seconds(seconds) {
+        Ok(()) => Ok(Value::None),
+        Err(message) => Err(interp.err("OSError", message)),
+    }
+}
+
+// ── random ─────────────────────────────────────────────────────────────────
+//
+// A deterministic xorshift64\* generator seeded with a fixed constant, so a
+// script that never calls `seed()` produces the same sequence on every boot.
+// This is a test-friendly choice, not a cryptographic one, and the module says
+// so in the README.
+
+fn random_step(state: &mut u64) -> u64 {
+    let mut x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
+fn random_integer(interp: &mut Interp, high: i64) -> PyResult<i64> {
+    if high <= 0 {
+        return Err(interp.err("ValueError", String::from("empty range for randrange()")));
+    }
+    // Modulo bias is irrelevant for the scripts this interpreter runs and is
+    // documented; the alternative is rejection sampling for a negligible gain.
+    let draw = random_step(&mut interp.rng_state) >> 11;
+    Ok((draw as i64) % high)
+}
+
+fn random_random(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "random.random")?;
+    expect_args(interp, args, "random.random", 0, 0)?;
+    let draw = random_step(&mut interp.rng_state) >> 11;
+    Ok(Value::Float(draw as f64 / (1u64 << 53) as f64))
+}
+
+fn random_seed(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "random.seed")?;
+    expect_args(interp, args, "random.seed", 1, 1)?;
+    let value = as_int(interp, argument(interp, args, 0, "random.seed")?, "seed")?;
+    interp.rng_state = if value == 0 {
+        0x9E37_79B9_7F4A_7C15
+    } else {
+        value as u64
+    };
+    Ok(Value::None)
+}
+
+fn random_randint(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "random.randint")?;
+    expect_args(interp, args, "random.randint", 2, 2)?;
+    let low = as_int(interp, argument(interp, args, 0, "random.randint")?, "a")?;
+    let high = as_int(interp, argument(interp, args, 1, "random.randint")?, "b")?;
+    if low > high {
+        return Err(interp.err("ValueError", String::from("empty range for randint()")));
+    }
+    let span = (high as i128) - (low as i128) + 1;
+    if span > i64::MAX as i128 {
+        return Err(interp.err(
+            "OverflowError",
+            String::from("randint() range is too large"),
+        ));
+    }
+    let offset = random_integer(interp, span as i64)?;
+    Ok(Value::Int(low + offset))
+}
+
+fn random_uniform(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "random.uniform")?;
+    expect_args(interp, args, "random.uniform", 2, 2)?;
+    let low = as_float(interp, argument(interp, args, 0, "random.uniform")?, "a")?;
+    let high = as_float(interp, argument(interp, args, 1, "random.uniform")?, "b")?;
+    let draw = random_step(&mut interp.rng_state) >> 11;
+    let unit = draw as f64 / (1u64 << 53) as f64;
+    Ok(Value::Float(low + (high - low) * unit))
+}
+
+fn random_choice(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "random.choice")?;
+    expect_args(interp, args, "random.choice", 1, 1)?;
+    let sequence = argument(interp, args, 0, "random.choice")?.clone();
+    let items = interp.collect_iterable(sequence)?;
+    if items.is_empty() {
+        return Err(interp.err("IndexError", String::from("list index out of range")));
+    }
+    let index = random_integer(interp, items.len() as i64)? as usize;
+    Ok(items[index].clone())
+}
+
+fn random_shuffle(
+    interp: &mut Interp,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "random.shuffle")?;
+    expect_args(interp, args, "random.shuffle", 1, 1)?;
+    let receiver = argument(interp, args, 0, "random.shuffle")?;
+    let Value::List(items) = receiver else {
+        return Err(interp.err(
+            "TypeError",
+            format!(
+                "random.shuffle() needs a list, not '{}'",
+                receiver.type_name()
+            ),
+        ));
+    };
+    let items = items.clone();
+    let mut borrowed = items.borrow_mut();
+    // Fisher-Yates, in place, exactly like CPython's shuffle.
+    for index in (1..borrowed.len()).rev() {
+        let swap = random_integer(interp, index as i64 + 1)? as usize;
+        borrowed.swap(index, swap);
+    }
+    Ok(Value::None)
 }

@@ -24,13 +24,26 @@ use crate::lexer::{tokenize, FStringLexPart, Kw, Op, Tok, Token};
 
 pub fn parse(source: &str) -> Result<Module, SyntaxError> {
     let tokens = tokenize(source)?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        function_yields: Vec::new(),
+        comprehension_depth: 0,
+    };
     parser.parse_module()
 }
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// One entry per `def`/`lambda` body currently being parsed; the flag says
+    /// whether that body contained a `yield`, which is what makes the function
+    /// a generator. Nested functions push their own entry, so a `yield` in an
+    /// inner function does not make the outer one a generator.
+    function_yields: Vec<bool>,
+    /// Non-zero while parsing a comprehension. `yield` there is a syntax error
+    /// in Python 3 and stays one here.
+    comprehension_depth: usize,
 }
 
 impl Parser {
@@ -207,6 +220,9 @@ impl Parser {
     }
 
     fn parse_statement_line(&mut self) -> Result<Vec<Stmt>, SyntaxError> {
+        if matches!(self.peek(), Tok::Op(Op::At)) {
+            return Ok(alloc::vec![self.parse_decorated()?]);
+        }
         if matches!(
             self.peek(),
             Tok::Kw(Kw::If | Kw::While | Kw::For | Kw::Def | Kw::Class | Kw::Try | Kw::With)
@@ -215,6 +231,30 @@ impl Parser {
         } else {
             self.parse_simple_statements()
         }
+    }
+
+    /// `@decorator` lines followed by a `def` or `class`.
+    ///
+    /// Only definitions may be decorated (Python's `decorated: decorators
+    /// (classdef | funcdef)`), so `@f` before a statement is a specific error
+    /// rather than an "expected a compound statement" surprise.
+    fn parse_decorated(&mut self) -> Result<Stmt, SyntaxError> {
+        let mut decorators = Vec::new();
+        while self.eat_op(Op::At) {
+            decorators.push(self.parse_expr()?);
+            self.expect_newline("after the decorator expression")?;
+            self.skip_newlines();
+        }
+        if self.eat_kw(Kw::Def) {
+            return self.parse_def(decorators);
+        }
+        if self.eat_kw(Kw::Class) {
+            return self.parse_class(decorators);
+        }
+        self.error(format!(
+            "only a function or class definition can be decorated, found {}",
+            self.found()
+        ))
     }
 
     fn parse_block(&mut self) -> Result<Vec<Stmt>, SyntaxError> {
@@ -446,9 +486,6 @@ impl Parser {
                 kind: StmtKind::Del(targets),
             });
         }
-        if self.eat_kw(Kw::Yield) {
-            return self.error(String::from("generators ('yield') are not supported"));
-        }
 
         // Expression statement or assignment.
         let first = self.parse_testlist()?;
@@ -536,10 +573,10 @@ impl Parser {
             });
         }
         if self.eat_kw(Kw::Def) {
-            return self.parse_def();
+            return self.parse_def(Vec::new());
         }
         if self.eat_kw(Kw::Class) {
-            return self.parse_class();
+            return self.parse_class(Vec::new());
         }
         if self.eat_kw(Kw::Try) {
             return self.parse_try();
@@ -577,7 +614,7 @@ impl Parser {
         })
     }
 
-    fn parse_def(&mut self) -> Result<Stmt, SyntaxError> {
+    fn parse_def(&mut self, decorators: Vec<Expr>) -> Result<Stmt, SyntaxError> {
         let line = self.line();
         let name = self.expect_name("a function name after 'def'")?;
         self.expect_op(Op::LParen, "after the function name")?;
@@ -660,18 +697,22 @@ impl Parser {
             }
         }
         self.expect_op(Op::Colon, "after the function signature")?;
+        self.function_yields.push(false);
         let body = self.parse_block()?;
+        let is_generator = self.function_yields.pop().unwrap_or(false);
         Ok(Stmt {
             line,
             kind: StmtKind::Def {
                 name,
                 params,
                 body: Rc::new(body),
+                decorators,
+                is_generator,
             },
         })
     }
 
-    fn parse_class(&mut self) -> Result<Stmt, SyntaxError> {
+    fn parse_class(&mut self, decorators: Vec<Expr>) -> Result<Stmt, SyntaxError> {
         let line = self.line();
         let name = self.expect_name("a class name after 'class'")?;
         let mut bases = Vec::new();
@@ -694,7 +735,12 @@ impl Parser {
         let body = self.parse_block()?;
         Ok(Stmt {
             line,
-            kind: StmtKind::Class { name, bases, body },
+            kind: StmtKind::Class {
+                name,
+                bases,
+                body,
+                decorators,
+            },
         })
     }
 
@@ -1052,7 +1098,22 @@ impl Parser {
                         "positional argument follows keyword argument",
                     ));
                 }
-                args.push(CallArg::Value(self.parse_expr()?));
+                let value = self.parse_expr()?;
+                // `sum(x * x for x in values)`: the parenthesized generator
+                // expression is optional when it is the only argument.
+                if args.is_empty() && self.check_kw(Kw::For) {
+                    let generators = self.parse_comp_generators()?;
+                    self.expect_op(Op::RParen, "after the generator expression")?;
+                    return Ok(Expr::Call {
+                        function: Box::new(function),
+                        args: alloc::vec![CallArg::Value(Expr::GeneratorExp {
+                            element: Box::new(value),
+                            generators,
+                        })],
+                        kwargs,
+                    });
+                }
+                args.push(CallArg::Value(value));
             }
             if self.eat_op(Op::Comma) {
                 if self.eat_op(Op::RParen) {
@@ -1187,17 +1248,40 @@ impl Parser {
                 Ok(Expr::False)
             }
             Tok::Kw(Kw::Lambda) => self.parse_lambda(),
-            Tok::Kw(Kw::Yield) => {
-                self.error(String::from("generators ('yield') are not supported"))
-            }
+            Tok::Kw(Kw::Yield) => self.parse_yield(),
             Tok::Op(Op::LParen) => {
                 self.advance();
                 if self.eat_op(Op::RParen) {
                     return Ok(Expr::Tuple(Vec::new()));
                 }
-                let value = self.parse_testlist()?;
-                self.expect_op(Op::RParen, "after the parenthesized expression")?;
-                Ok(value)
+                let first = self.parse_expr()?;
+                // `(element for target in iterable ...)` is a generator
+                // expression, not a parenthesized tuple: it must be checked
+                // before the comma, because `(x for x in y)` has neither.
+                if self.check_kw(Kw::For) {
+                    let generators = self.parse_comp_generators()?;
+                    self.expect_op(Op::RParen, "after the generator expression")?;
+                    return Ok(Expr::GeneratorExp {
+                        element: Box::new(first),
+                        generators,
+                    });
+                }
+                if !self.eat_op(Op::Comma) {
+                    self.expect_op(Op::RParen, "after the parenthesized expression")?;
+                    return Ok(first);
+                }
+                let mut items = alloc::vec![first];
+                loop {
+                    if self.check_op(Op::RParen) {
+                        break;
+                    }
+                    items.push(self.parse_expr()?);
+                    if !self.eat_op(Op::Comma) {
+                        break;
+                    }
+                }
+                self.expect_op(Op::RParen, "after the tuple elements")?;
+                Ok(Expr::Tuple(items))
             }
             Tok::Op(Op::LBracket) => {
                 self.advance();
@@ -1282,6 +1366,42 @@ impl Parser {
         }
     }
 
+    /// `yield` / `yield value` / `yield a, b`.
+    ///
+    /// The operand is a testlist, so `yield 1, 2` yields a tuple, and the
+    /// conditional-expression rule is inherited from `parse_expr`
+    /// (`yield 1 if flag else 2` yields the conditional's value). `yield from`
+    /// is not implemented and says so.
+    fn parse_yield(&mut self) -> Result<Expr, SyntaxError> {
+        self.expect_kw(Kw::Yield, "at the start of a yield expression")?;
+        if self.check_kw(Kw::From) {
+            return self.error(String::from(
+                "'yield from' is not supported; use a for loop with yield",
+            ));
+        }
+        if self.comprehension_depth > 0 {
+            return self.error(String::from("'yield' inside a comprehension is not supported"));
+        }
+        match self.function_yields.last_mut() {
+            Some(seen) => *seen = true,
+            None => {
+                return self.error(String::from(
+                    "'yield' outside a function: only a def body can be a generator",
+                ))
+            }
+        }
+        if self.at_yield_end() {
+            return Ok(Expr::Yield(None));
+        }
+        let value = self.parse_testlist()?;
+        Ok(Expr::Yield(Some(Box::new(value))))
+    }
+
+    /// True when the token after `yield` cannot start its operand.
+    fn at_yield_end(&self) -> bool {
+        matches!(self.peek(), Tok::Op(Op::Comma)) || self.at_testlist_end()
+    }
+
     fn parse_list_comprehension(&mut self, element: Expr) -> Result<Expr, SyntaxError> {
         let generators = self.parse_comp_generators()?;
         self.expect_op(Op::RBracket, "after the comprehension")?;
@@ -1292,6 +1412,13 @@ impl Parser {
     }
 
     fn parse_comp_generators(&mut self) -> Result<Vec<CompGen>, SyntaxError> {
+        self.comprehension_depth += 1;
+        let result = self.parse_comp_generators_inner();
+        self.comprehension_depth -= 1;
+        result
+    }
+
+    fn parse_comp_generators_inner(&mut self) -> Result<Vec<CompGen>, SyntaxError> {
         let mut generators = Vec::new();
         while self.eat_kw(Kw::For) {
             let target = self.parse_target()?;
@@ -1390,7 +1517,13 @@ impl Parser {
             }
         }
         self.expect_op(Op::Colon, "after the lambda parameters")?;
+        self.function_yields.push(false);
         let body = self.parse_expr()?;
+        if self.function_yields.pop().unwrap_or(false) {
+            return self.error(String::from(
+                "'yield' inside a lambda is not supported; use a def",
+            ));
+        }
         Ok(Expr::Lambda {
             params,
             body: Rc::new(body),
@@ -1516,7 +1649,12 @@ fn parse_expression_fragment(text: &str, line: u32, column: u32) -> Result<Expr,
             column,
         )
     })?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        function_yields: Vec::new(),
+        comprehension_depth: 0,
+    };
     let expression = parser.parse_testlist().map_err(|error| {
         SyntaxError::new(
             format!("in f-string expression: {}", error.message),
@@ -1584,6 +1722,7 @@ fn op_text(op: Op) -> &'static str {
         Op::Colon => ":",
         Op::Dot => ".",
         Op::Semi => ";",
+        Op::At => "@",
     }
 }
 

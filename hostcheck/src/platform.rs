@@ -42,6 +42,37 @@ pub fn args() -> Vec<String> {
     std::env::args().collect()
 }
 
+// ── clock and sleeping (time module) ───────────────────────────────────────
+//
+// The host mirror of the ABI's two clocks: realtime is the wall clock,
+// monotonic is an `Instant` (the same choice the kernel ABI makes). The
+// process start time is the monotonic epoch.
+
+/// The realtime clock in seconds since the Unix epoch.
+pub fn realtime_seconds() -> Result<f64, String> {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => Ok(duration.as_secs_f64()),
+        Err(error) => Err(format!("system clock before the epoch: {}", error)),
+    }
+}
+
+static MONOTONIC_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// A monotonic clock in seconds. Only differences are meaningful.
+pub fn monotonic_seconds() -> Result<f64, String> {
+    let start = MONOTONIC_START.get_or_init(std::time::Instant::now);
+    Ok(start.elapsed().as_secs_f64())
+}
+
+/// Sleep for a non-negative number of seconds.
+pub fn sleep_seconds(seconds: f64) -> Result<(), String> {
+    if !(seconds >= 0.0) {
+        return Err(String::from("sleep length must be non-negative"));
+    }
+    std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+    Ok(())
+}
+
 pub fn current_dir() -> String {
     std::env::current_dir()
         .map(|path| path.to_string_lossy().into_owned())

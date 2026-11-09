@@ -32,3 +32,11 @@ run /mnt/pythonc /mnt/json_demo.py
 run /mnt/pythonc /mnt/os_proc.py
 run /mnt/pythonc /mnt/star_args.py
 run /mnt/pythonc /mnt/str_format.py
+run /mnt/pythonc /mnt/generators.py
+run /mnt/pythonc /mnt/genexpr.py
+run /mnt/pythonc /mnt/decorators.py
+run /mnt/pythonc /mnt/percent_format.py
+run /mnt/pythonc /mnt/stdlib_modules.py
+run /mnt/pythonc /mnt/generator_syntax.py
+run /mnt/pythonc /mnt/decorator_syntax.py
+run /mnt/pythonc /mnt/stack_depth.py

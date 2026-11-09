@@ -11,6 +11,7 @@
 //! order with no hash function, no collision handling and no extra allocation,
 //! and scripts on this ABI are small.
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -18,7 +19,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::fmt::Write;
 
-use crate::ast::{Expr, Stmt};
+use crate::ast::{CompGen, Expr, Stmt};
 
 /// A lexical environment. Function calls get one of these; the module scope
 /// and class bodies get their own.
@@ -110,6 +111,13 @@ pub fn env_find_nonlocal(env: &EnvRef, name: &str) -> Option<EnvRef> {
 pub enum FunctionBody {
     Block(Rc<Vec<Stmt>>),
     Expression(Rc<Expr>),
+    /// A generator expression's body: walk the comprehension clauses, yield
+    /// each `element`. Creating this body is what `(x for x in y)` does; it
+    /// has no parameters and its closure is the surrounding scope.
+    GeneratorExpr {
+        element: Rc<Expr>,
+        generators: Rc<Vec<CompGen>>,
+    },
 }
 
 pub struct Function {
@@ -122,6 +130,9 @@ pub struct Function {
     pub kwargs: Option<Rc<str>>,
     pub body: FunctionBody,
     pub closure: EnvRef,
+    /// The body contains `yield`: calling this function builds a generator
+    /// (binding the parameters) instead of executing anything.
+    pub is_generator: bool,
     /// The module the function was defined in, for traceback lines.
     pub filename: Rc<str>,
     pub def_line: u32,
@@ -151,6 +162,7 @@ pub enum BuiltinType {
     File,
     Range,
     Iterator,
+    Generator,
 }
 
 impl BuiltinType {
@@ -173,6 +185,7 @@ impl BuiltinType {
             BuiltinType::File => "file",
             BuiltinType::Range => "range",
             BuiltinType::Iterator => "iterator",
+            BuiltinType::Generator => "generator",
         }
     }
 }
@@ -403,6 +416,36 @@ impl FileValue {
     }
 }
 
+/// A suspended generator: the function it runs, the frame its parameters were
+/// bound into, and the fiber holding its interpreter state.
+///
+/// The interpreter resumes it through the fiber and never holds a `RefCell`
+/// borrow across the switch — the fields below are written by the resumer
+/// before the switch and by the running fiber at `yield`, never concurrently.
+pub struct Generator {
+    /// The generator function, or the synthetic `<genexpr>` function of a
+    /// generator expression.
+    pub function: Rc<Function>,
+    /// The frame the body runs in, with the parameters already bound.
+    pub env: EnvRef,
+    /// Display name: the function name, or `<genexpr>`.
+    pub name: Rc<str>,
+    /// The stack the body runs on, allocated by the first `next()`: a
+    /// generator that is created and never iterated costs no fiber slot.
+    pub fiber: Option<Box<crate::fiber::Fiber>>,
+    /// True between `next()` and the matching `yield`.
+    pub running: bool,
+    /// True once the body returned or raised; the fiber is never resumed.
+    pub finished: bool,
+    /// The exception that ended the body, re-raised to the caller once.
+    pub failed: Option<crate::error::PyError>,
+    /// The value of the last `yield`, or the body's `return` value.
+    pub yielded: Option<Value>,
+    /// The value a `yield` expression evaluates to when the generator is
+    /// resumed (always `None` today: `send()` is not implemented).
+    pub sent: Value,
+}
+
 pub struct RangeValue {
     pub start: i64,
     pub stop: i64,
@@ -566,6 +609,11 @@ pub enum BuiltinId {
     StrEncode,
     // map
     Map,
+    /// `staticmethod(f)`: wraps a function so instance attribute lookup does
+    /// not bind it as a method (the wrapper carries the function as receiver).
+    StaticMethod,
+    /// Calling such a wrapper: forwards to the wrapped function unchanged.
+    StaticMethodCall,
     // os module
     OsGetpid,
     OsGetppid,
@@ -585,6 +633,24 @@ pub enum BuiltinId {
     // json module
     JsonDumps,
     JsonLoads,
+    // os.path module
+    PathJoin,
+    PathBasename,
+    PathDirname,
+    PathExists,
+    PathIsfile,
+    PathIsdir,
+    // time module
+    TimeTime,
+    TimeMonotonic,
+    TimeSleep,
+    // random module
+    RandomRandom,
+    RandomSeed,
+    RandomRandint,
+    RandomChoice,
+    RandomShuffle,
+    RandomUniform,
     // file methods
     FileRead,
     FileReadline,
@@ -639,6 +705,7 @@ pub fn builtin_name(id: BuiltinId) -> &'static str {
         BuiltinId::Round => "round",
         BuiltinId::Hex => "hex",
         BuiltinId::Id => "id",
+        BuiltinId::StaticMethod | BuiltinId::StaticMethodCall => "staticmethod",
         BuiltinId::MathSqrt => "sqrt",
         BuiltinId::MathFloor => "floor",
         BuiltinId::MathCeil => "ceil",
@@ -728,6 +795,21 @@ pub fn builtin_name(id: BuiltinId) -> &'static str {
         BuiltinId::OsSystem => "system",
         BuiltinId::JsonDumps => "dumps",
         BuiltinId::JsonLoads => "loads",
+        BuiltinId::PathJoin => "join",
+        BuiltinId::PathBasename => "basename",
+        BuiltinId::PathDirname => "dirname",
+        BuiltinId::PathExists => "exists",
+        BuiltinId::PathIsfile => "isfile",
+        BuiltinId::PathIsdir => "isdir",
+        BuiltinId::TimeTime => "time",
+        BuiltinId::TimeMonotonic => "monotonic",
+        BuiltinId::TimeSleep => "sleep",
+        BuiltinId::RandomRandom => "random",
+        BuiltinId::RandomSeed => "seed",
+        BuiltinId::RandomRandint => "randint",
+        BuiltinId::RandomChoice => "choice",
+        BuiltinId::RandomShuffle => "shuffle",
+        BuiltinId::RandomUniform => "uniform",
         BuiltinId::FileEnter => "__enter__",
         BuiltinId::FileExit => "__exit__",
     }
@@ -756,6 +838,7 @@ pub enum Value {
     File(Rc<RefCell<FileValue>>),
     Range(Rc<RangeValue>),
     Iterator(Rc<RefCell<IterState>>),
+    Generator(Rc<RefCell<Generator>>),
 }
 
 impl Value {
@@ -837,6 +920,7 @@ impl Value {
             Value::File(_) => "file",
             Value::Range(_) => "range",
             Value::Iterator(_) => "iterator",
+            Value::Generator(_) => "generator",
         }
     }
 
@@ -860,6 +944,7 @@ impl Value {
             Value::File(_) => BuiltinType::File,
             Value::Range(_) => BuiltinType::Range,
             Value::Iterator(_) => BuiltinType::Iterator,
+            Value::Generator(_) => BuiltinType::Generator,
         }
     }
 
@@ -1017,6 +1102,9 @@ fn write_repr(out: &mut String, value: &Value, depth: usize) {
             }
         }
         Value::Iterator(_) => out.push_str("<iterator>"),
+        Value::Generator(generator) => {
+            let _ = write!(out, "<generator object {}>", generator.borrow().name);
+        }
     }
 }
 
@@ -1181,6 +1269,7 @@ fn equal_depth(left: &Value, right: &Value, depth: usize) -> bool {
             a.start == b.start && a.stop == b.stop && a.step == b.step
         }
         (Value::Iterator(a), Value::Iterator(b)) => Rc::ptr_eq(a, b),
+        (Value::Generator(a), Value::Generator(b)) => Rc::ptr_eq(a, b),
         _ => false,
     }
 }
@@ -1208,6 +1297,7 @@ pub fn is_same(left: &Value, right: &Value) -> bool {
         (Value::File(a), Value::File(b)) => Rc::ptr_eq(a, b),
         (Value::Range(a), Value::Range(b)) => Rc::ptr_eq(a, b),
         (Value::Iterator(a), Value::Iterator(b)) => Rc::ptr_eq(a, b),
+        (Value::Generator(a), Value::Generator(b)) => Rc::ptr_eq(a, b),
         _ => false,
     }
 }

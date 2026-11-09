@@ -1,0 +1,11 @@
+# Live suite for pythonc 0.5.0 on the pagh 0.19.0 kernel: the new features
+# only. One boot, commands in order; each script prints its own OK marker and
+# the kernel prints "run: /mnt/pythonc exited with code N" after every run.
+run /mnt/pythonc /mnt/generators.py
+run /mnt/pythonc /mnt/genexpr.py
+run /mnt/pythonc /mnt/decorators.py
+run /mnt/pythonc /mnt/percent_format.py
+run /mnt/pythonc /mnt/stdlib_modules.py
+run /mnt/pythonc /mnt/stack_depth.py
+run /mnt/pythonc /mnt/generator_syntax.py
+run /mnt/pythonc /mnt/decorator_syntax.py
