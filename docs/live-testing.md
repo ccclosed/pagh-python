@@ -463,3 +463,75 @@ generator failure: generator stack exhausted (5408 bytes left of 64 KiB)
 - Не проверялись живьём: `os.path` на путях со спецсимволами, `time.sleep`
   под нагрузкой планировщика, генераторы с исключением в `finally`,
   одновременные 8 генераторов (проверено только «6 из 8» и лимит).
+
+---
+
+# Живой прогон pythonc 0.6.0 на ядре 0.21.0
+
+Дата: 2026-11-12. Ядро: `pagh-riscv` 0.21.0, debug ELF,
+`sha256 abaeee3f76fe…`; QEMU `qemu-system-riscv64` 10.2.2, машина `virt`,
+256 MiB, serial на Unix-сокете. Диск: 64 MiB ext2, собран на хосте
+
+```sh
+truncate -s 64M /tmp/py-live-0.6.0.img
+mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py-live-0.6.0.img
+```
+
+**Одна загрузка**, все команды подряд; драйвер — собственный
+[`../tests/live/qemu_driver.py`](../tests/live/qemu_driver.py), обёртка —
+[`../tests/live/live06.sh`](../tests/live/live06.sh), список команд —
+[`../tests/live/live06.cmds`](../tests/live/live06.cmds). Сырой транскрипт:
+[`live-pythonc-060.txt`](live-pythonc-060.txt).
+
+## Итог 0.6.0
+
+**40 запусков pythonc: 34 с кодом 0, 6 намеренных диагностик** (usage — 2;
+`syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
+`decorator_syntax.py`, `yield_from_syntax.py` — 1), плюс три `cat`, которые
+показывают staged-скрипт и два файла, записанных `fileio.py` и
+`print(file=...)`. Все языковые проверки — assert-скрипты, поэтому код 0
+означает совпадение значений, а не только напечатанные строки.
+
+Новое в 0.6.0:
+
+| Скрипт | Что проверяет | Результат |
+|---|---|---|
+| `yield_from.py` | `yield from` генератору, `range`, списку, generator expression и объекту с `__iter__`; ленивость, вложенность, `finally`, `TypeError` на не-iterable, однократное потребление, рецикл 200 стеков | `YIELD FROM OK`, exit 0 |
+
+Закрытая находка 0.5.0:
+
+- `os_proc.py` (`os.fork`/`os.execv`/`os.waitpid`) на ядре **0.19.0** не
+  доходил до вывода ни одним бинарником (0.4.0 и 0.5.0) и был записан как
+  расхождение ядра и ABI. На ядре **0.21.0** он проходит:
+  `child: True status: 0`, `proc ok`, exit 0 — расхождение было в ядре, а не
+  в интерпретаторе.
+
+## Ключевые строки 0.6.0
+
+```text
+outer: ['before', 0, 1, 2, 'after']        # yield_from.py
+range: [0, 1, 2] [7, 8] [0, 1, 4] ['a', 'b']
+value: [1, 2, None]
+lazy: [0, 1, 2, 3, 4]
+finally: ['start', 1, 2, 'end'] ['cleanup']
+non-iterable: TypeError True
+recycled: 600
+YIELD FROM OK
+
+child: True status: 0                       # os_proc.py на 0.21.0
+proc ok
+
+max depth inside a generator: 10            # stack_depth.py
+generator failure: generator stack exhausted (3872 bytes left of 64 KiB)
+```
+
+## Честные пробелы 0.6.0
+
+- **`send`/`throw`/`close` у генераторов нет**, поэтому делегация проверена
+  только по итерационному протоколу: `yield from` не передаёт значения
+  обратно в подгенератор и не даёт его `return`-значение (выражение — `None`).
+- **Глубина цепочки делегирования** больше 8 не проверялась: каждый уровень
+  держит приостановленный файбер, лимит 0.5.0 (`не больше 8`) не менялся.
+- Не проверялись живьём: `yield from` внутри `try/finally` самого внешнего
+  генератора, делегирование объекту, чей `__iter__` возвращает не итератор
+  (ошибка `TypeError` покрыта hostcheck).

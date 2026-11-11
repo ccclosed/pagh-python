@@ -11,44 +11,33 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
 
 ## Статус
 
-**Рабочая версия 0.5.0.** Язык и встроенные функции реализованы настолько,
+**Рабочая версия 0.6.0.** Язык и встроенные функции реализованы настолько,
 насколько это нужно для небольших скриптов на 1 MiB bump-heap ядра pagh.
 
-Новое в 0.5.0:
+Новое в 0.6.0:
 
-- **Генераторы.** `yield` (в том числе как выражение), генераторные функции,
-  `next()`, `StopIteration`, `for` по генератору, `finally` при исчерпании и
-  настоящая ленивость (бесконечный генератор завершается только по `break`).
-  Генератор — это файбер: тело исполняется на собственном стеке и
-  приостанавливается на `yield` без разворачивания интерпретатора
-  (`src/fiber.rs` — единственный ассемблер в проекте: сохранение
-  callee-saved регистров и `sp`).
-- **Generator expressions** — `(x for x in ...)` и голый вид
-  `f(x for x in ...)`.
-- **Декораторы** — `@dec` на `def` и `class`, применяются в момент
-  определения, снизу вверх; `@staticmethod` (passthrough-обёртка, не
-  привязывающая `self`).
-- **`%`-форматирование строк** — `%s %r %a %d %i %u %f %F %e %E %g %G %x %X
-  %o %b %c %%` с флагами, шириной и точностью.
-- **Модули:** `os.path` (`join`/`basename`/`dirname`/`exists`/`isfile`/
-  `isdir`/`sep`), `time` (`time`/`monotonic`/`sleep` через `clock_gettime` и
-  `nanosleep` ABI), `random` (детерминированный xorshift64*: `random`/`seed`/
-  `randint`/`choice`/`shuffle`/`uniform`).
-- `import os.path` / `from os.path import ...` — импорт по точечному имени.
+- **`yield from`.** Делегирование итерации: `yield from <iterable>` выдаёт
+  все значения операнда, а не только генератора — работают генераторы,
+  `range`, списки, generator expressions и объекты с `__iter__`.
+  Делегирование ленивое, вкладывается на любую глубину (внешний файбер
+  резюмирует внутренний, как `for`), а по завершении выражение даёт `None`:
+  значения `return` у генераторов по-прежнему нет, `send`/`throw`/`close` не
+  реализованы, поэтому это итерационный протокол, а не полная делегация
+  CPython. Стек завершённого делегированного генератора возвращается в пул,
+  лимит в 8 одновременно приостановленных генераторов — прежний.
 
-Живая проверка 0.5.0 — на ядре **0.19.0** (`pagh-riscv`, QEMU `virt`, ext2
-64 MiB, драйвер `tools/run.py` самого ядра): пять скриптов
-(`tests/live/generators.py`, `genexpr.py`, `decorators.py`,
-`percent_format.py`, `stdlib_modules.py`) завершились с кодом 0 и напечатали
-`GENERATORS OK` / `GENEXPR OK` / `DECORATORS OK` / `PERCENT OK` /
-`STDLIB OK`, два фронтенд-отказа (`generator_syntax.py`,
-`decorator_syntax.py`) — с кодом 1 и внятным `SyntaxError`. Сырой транскрипт:
-[`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt). Старый suite
-(30 команд 0.1.2–0.4.0) прогнан на этом же бинарнике: 26 команд с кодом 0 и
-три намеренных диагностики с кодами 2/1/1, как и раньше; одна команда,
-`os_proc.py` (`os.fork`/`execv`/`waitpid`), на ядре 0.19.0 не доходит до
-вывода — это воспроизводится и бинарником 0.4.0, то есть расхождение
-ядро/ABI, а не 0.5.0. PASS-лист и детали —
+Живая проверка 0.6.0 — на ядре **0.21.0** (`pagh-riscv`, QEMU `virt`, ext2
+64 MiB, драйвер `tests/live/qemu_driver.py`, одна загрузка): полный suite
+[`tests/live/live06.cmds`](tests/live/live06.cmds) — 40 запусков, 34 с кодом
+0, шесть намеренных диагностик (usage — код 2; `syntax_error.py`,
+`uncaught.py`, `generator_syntax.py`, `decorator_syntax.py`,
+`yield_from_syntax.py` — код 1), и новый
+[`tests/live/yield_from.py`](tests/live/yield_from.py) печатает
+`YIELD FROM OK`. `os_proc.py` (`os.fork`/`os.execv`/`os.waitpid`), который
+на ядре 0.19.0 не доходил до вывода, на 0.21.0 печатает
+`child: True status: 0` и `proc ok` — расхождение ядро/ABI из отчёта 0.5.0
+закрыто. Сырой транскрипт:
+[`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt), PASS-лист и детали —
 [`docs/live-testing.md`](docs/live-testing.md).
 
 Размер release-ELF — 541 096 байт (528 КиБ; лимит ядра — 1 МиБ): профиль
@@ -60,8 +49,21 @@ f64-инструкции в U-mode, поэтому ядро обязано ос�
 
 ## Сборка
 
+Интерпретатор зависит от `libpagh` — соседнего чекаута
+[`pagh-api`](https://github.com/ccclosed/pagh-api), как и `pagh-rust`:
+зависимость и linker script заданы путём `../pagh-api`, поэтому репозитории
+должны лежать рядом:
+
+```text
+<parent>/pagh-api
+<parent>/pagh-python
+```
+
+Тулчейн пинован в `rust-toolchain.toml` (nightly-2026-07-12 с целью
+`riscv64gc-unknown-none-elf`), а `.cargo/config.toml` уже выбирает эту цель:
+
 ```sh
-cargo build --release --target riscv64gc-unknown-none-elf
+cargo build --release
 ```
 
 `target/riscv64gc-unknown-none-elf/release/pythonc` — готовый ELF. Ядро
@@ -71,6 +73,14 @@ cargo build --release --target riscv64gc-unknown-none-elf
 
 ## Запуск в QEMU
 
+Один прогон suite 0.6.0 (сборка, образ, QEMU, транскрипт) — одной командой:
+
+```sh
+sh tests/live/live06.sh
+```
+
+Вручную:
+
 ```sh
 rm -rf /tmp/py-rootfs && mkdir /tmp/py-rootfs
 cp target/riscv64gc-unknown-none-elf/release/pythonc tests/live/*.py /tmp/py-rootfs/
@@ -78,7 +88,7 @@ mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py-live.img 64M
 
 python3 tests/live/qemu_driver.py \
   --disk /tmp/py-live.img \
-  --commands tests/live/live.cmds \
+  --commands tests/live/live06.cmds \
   --transcript /tmp/live.txt
 ```
 
@@ -165,9 +175,10 @@ comprehension отвергается парсером). Вызов генера�
 значения, `yield a, b` (кортеж), `x = yield value`, `next(gen)`,
 `next(gen, default)`, `StopIteration`, `for`/`in`/`list()`/`sum()` по
 генератору, `finally` при исчерпании, распространение исключения из тела в
-вызывающий `next()`, вложенные генераторы (внешний резюмирует внутренний) и
-`iter(gen) is gen`. Значение `return` из генератора теряется (как в Python),
-повторный `next()` после исключения даёт `StopIteration`.
+вызывающий `next()`, вложенные генераторы (внешний резюмирует внутренний),
+`iter(gen) is gen` и `yield from` для любого iterable (делегация, см. 0.6.0).
+Значение `return` из генератора теряется, повторный `next()` после исключения
+даёт `StopIteration`.
 
 **Generator expressions:** `(element for target in iterable if cond ...)` —
 ленивый генератор, а не список: поддерживаются несколько `for`/`if`, захват
@@ -351,7 +362,7 @@ dict (`{k: v for k in ...}`), с несколькими `for` и `if`.
 - **`map` энергичный.** Он сразу возвращает список, а не ленивый итератор;
   значения и вызовы функции совпадают с Python, момент вычисления — нет.
 - **Нет `input()`** (консольный ввод ядра не выдаёт EOF) и нет `sys.stdin`.
-- **Парсер не поддерживает** `yield from`, `yield` внутри `lambda` и
+- **Парсер не поддерживает** `yield` внутри `lambda` и
   comprehension, относительные импорты, keyword-only параметры после `*args`
   и голый `*`, `match`, walrus `:=`, `async`/`await`, аннотации типов,
   вложенные кавычки в f-string выражениях, вложенные replacement fields в
@@ -386,8 +397,9 @@ dict (`{k: v for k in ...}`), с несколькими `for` и `if`.
   достижимым из собственной области видимости (например `g = counter(10)` на
   уровне модуля), держит свой слот до конца процесса — `del g` или
   исчерпание (`list(g)`) его освобождают; `finally` такого брошенного
-  генератора не исполняется. Нет `send()`, `close()`, `throw()` и
-  `yield from`; значение `return` теряется; генератор нельзя скопировать или
+  генератора не исполняется. Нет `send()`, `close()` и `throw()`; `yield from`
+  выполняет только итерационный протокол (см. 0.6.0) и даёт `None`; значение
+  `return` теряется; генератор нельзя скопировать или
   сериализовать.
 - **Рекурсия упирается в стек, а не в константу.** `RECURSION_LIMIT = 56`
   кадров недостижим в этой сборке: Rust-кадры интерпретатора стоят несколько
@@ -420,25 +432,38 @@ dict (`{k: v for k in ...}`), с несколькими `for` и `if`.
 
 ```sh
 cd hostcheck
-cargo test                 # 30 unit-тестов интерпретатора
-cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (30 PASS)
+cargo test                 # 31 unit-тест интерпретатора
+cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (31 PASS)
 cargo run -- ../tests/live/hello.py
 ```
 
-Проверки 0.5.0: `fibers` (сам примитив переключения стека), `generators`,
-`generator expressions`, `decorators`, `percent format`, `os.path`, `time`,
-`random` — плюс прежние 22.
+Проверки 0.6.0: `yield from` (делегирование генератору, `range`, generator
+expression и объекту с `__iter__`, ленивость, вложенность, `TypeError` на
+не-iterable, два фронтенд-отказа) — плюс 30 проверок 0.5.0 (`fibers`,
+`generators`, `generator expressions`, `decorators`, `percent format`,
+`os.path`, `time`, `random` и прежние 22).
 
 `hostcheck --parse file.py` и `--tokens file.py` проверяют только фронтенд.
 `hostcheck` не умеет `os.fork`/`execv`/`waitpid` (у него нет libpagh); эти
 вызовы живьём проверены в QEMU (`tests/live/os_proc.py`).
 
 Живой QEMU-прогон suite 0.1.2 (30 PASS), отдельные прогоны `*args`/`**kwargs`
-и `str.format` (0.4.0), прогон 0.5.0 на ядре 0.19.0 (шесть скриптов с
-OK-маркерами и два фронтенд-отказа), PASS-листы и сырые логи:
-[`docs/live-testing.md`](docs/live-testing.md), транскрипт 0.5.0 —
-[`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt), скрипты —
+и `str.format` (0.4.0), прогон 0.5.0 на ядре 0.19.0, полный прогон 0.6.0 на
+ядре 0.21.0 (40 запусков, 34 PASS, 6 намеренных диагностик; `YIELD FROM OK`)
+— PASS-листы и сырые логи:
+[`docs/live-testing.md`](docs/live-testing.md), транскрипты 0.5.0 и 0.6.0 —
+[`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt) и
+[`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt), скрипты —
 [`tests/live/`](tests/live/).
+
+## CI
+
+`.github/workflows/ci.yml` чекаутит соседний `pagh-api` (main), ставит
+тулчейн из `rust-toolchain.toml` и гоняет два гейта: `cargo test` в
+`hostcheck` (31 проверка) и `cargo build --release` для
+`riscv64gc-unknown-none-elf` с проверкой, что `pythonc` не превышает лимит
+ядра в 1 МиБ. Живой QEMU-прогон в CI намеренно не входит: для него нужны
+ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live06.sh`.
 
 ## Устройство
 
