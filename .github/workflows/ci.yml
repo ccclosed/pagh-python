@@ -1,0 +1,76 @@
+name: ci
+
+# Two gates, one job:
+#   * the host harness (`hostcheck`) compiles the interpreter sources with a
+#     std `platform` and runs its 31-check grid on x86_64;
+#   * the freestanding interpreter builds for riscv64gc-unknown-none-elf with
+#     the pinned toolchain and the pagh linker script, and the resulting ELF
+#     fits the kernel's 1 MiB image limit.
+#
+# `pythonc` depends on `libpagh` from the sibling `pagh-api` checkout, exactly
+# like `pagh-rust`: both the path dependency and the linker script live there,
+# so CI checks that repository out next to this one. The riscv build
+# deliberately does not pass `--locked`: `Cargo.lock` records the sibling's
+# `libpagh` version, and making that a hard gate would couple this repository's
+# build to `pagh-api`'s release cadence (a patch bump of the library would turn
+# every older commit red). The host harness has its own lockfile and no path
+# dependencies, so `--locked` there is meaningful.
+#
+# The live QEMU check is intentionally not in CI: it needs the kernel checkout
+# and QEMU, and the captured transcript is the acceptance artifact
+# (`tests/live/live06.sh` is the command to run locally).
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: host tests, build, image size
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pagh-python
+        uses: actions/checkout@v4
+        with:
+          path: pagh-python
+
+      - name: Checkout pagh-api (sibling dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/pagh-api
+          ref: main
+          path: pagh-api
+
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        working-directory: pagh-python
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "rust-toolchain.toml pins: $channel"
+          rustup toolchain install "$channel" --profile minimal \
+            --target riscv64gc-unknown-none-elf
+          rustup run "$channel" rustc --version
+
+      - name: Host interpreter checks
+        working-directory: pagh-python/hostcheck
+        run: cargo test --locked
+
+      - name: Build the riscv64 ELF
+        working-directory: pagh-python
+        run: cargo build --release
+
+      - name: Check the kernel 1 MiB image limit
+        working-directory: pagh-python
+        run: |
+          set -euo pipefail
+          elf=target/riscv64gc-unknown-none-elf/release/pythonc
+          size=$(wc -c <"$elf")
+          echo "$elf: $size bytes"
+          test "$size" -le 1048576
