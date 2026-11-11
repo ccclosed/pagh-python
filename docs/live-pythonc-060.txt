@@ -1,10 +1,10 @@
 Serial transcript of the pythonc 0.6.0 live run.
 
-Kernel: /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh (pagh-riscv 0.21.0), sha256 abaeee3f76febe18768b02e5dea81c6ed8946b0dd2cd0b709ddbd46706bb1d18.
+Kernel: /home/oleg/pagh-riscv/target/riscv64gc-unknown-none-elf/debug/pagh (pagh-riscv 0.21.0), sha256 b1ea1fb572e2dc7f76281af0b4dee4561d5b3253a0b2ab6fad9994129d04ec2d.
 QEMU `qemu-system-riscv64` 10.2.2, machine `virt`, 256 MiB, serial on a Unix
 socket, no display, virtio-blk. Disk: 64 MiB ext2 image built on the host with
 `truncate -s 64M` + `mke2fs -q -t ext2 -F -b 4096 -d <rootfs>`; the rootfs
-contains `pythonc` (release, 541096 bytes, sha256 6c4c6f2e6cbae54f8db7db2ca2a473ca85ed48a4cf34944731827215230bc82e) and every
+contains `pythonc` (release, 545192 bytes, sha256 f6ee22262ba06b27f26b34a5bf2c2b3164b3d7b3e1c69051a648e20c80de7f80) and every
 `tests/live/*.py`.
 
 One boot, driven by the repository's own driver, commands in the order of
