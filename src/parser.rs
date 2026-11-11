@@ -1366,19 +1366,16 @@ impl Parser {
         }
     }
 
-    /// `yield` / `yield value` / `yield a, b`.
+    /// `yield` / `yield value` / `yield a, b` / `yield from iterable`.
     ///
-    /// The operand is a testlist, so `yield 1, 2` yields a tuple, and the
-    /// conditional-expression rule is inherited from `parse_expr`
-    /// (`yield 1 if flag else 2` yields the conditional's value). `yield from`
-    /// is not implemented and says so.
+    /// The operand of a plain `yield` is a testlist, so `yield 1, 2` yields a
+    /// tuple, and the conditional-expression rule is inherited from
+    /// `parse_expr` (`yield 1 if flag else 2` yields the conditional's value).
+    /// `yield from` takes a single expression, matching Python's grammar:
+    /// `yield from a, b` is a syntax error, not a delegation of a tuple.
     fn parse_yield(&mut self) -> Result<Expr, SyntaxError> {
         self.expect_kw(Kw::Yield, "at the start of a yield expression")?;
-        if self.check_kw(Kw::From) {
-            return self.error(String::from(
-                "'yield from' is not supported; use a for loop with yield",
-            ));
-        }
+        let delegating = self.eat_kw(Kw::From);
         if self.comprehension_depth > 0 {
             return self.error(String::from("'yield' inside a comprehension is not supported"));
         }
@@ -1389,6 +1386,10 @@ impl Parser {
                     "'yield' outside a function: only a def body can be a generator",
                 ))
             }
+        }
+        if delegating {
+            let value = self.parse_expr()?;
+            return Ok(Expr::YieldFrom(Box::new(value)));
         }
         if self.at_yield_end() {
             return Ok(Expr::Yield(None));

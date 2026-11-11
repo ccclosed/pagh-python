@@ -59,6 +59,25 @@ fn expect_repr_in(
     }
 }
 
+fn expect_syntax_error(source: &str, needle: &str) -> Result<(), String> {
+    match parser::parse(source) {
+        Ok(_) => Err(format!(
+            "expected a syntax error containing {:?}, but the source parsed",
+            needle
+        )),
+        Err(error) => {
+            if error.message.contains(needle) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected {:?} in the syntax error, got {:?}",
+                    needle, error.message
+                ))
+            }
+        }
+    }
+}
+
 fn arithmetic() -> Result<(), String> {
     expect_repr("x = 2 + 3 * 4", "x", "14")?;
     expect_repr("x = 7 // 2", "x", "3")?;
@@ -719,6 +738,64 @@ fn generator_expressions() -> Result<(), String> {
     Ok(())
 }
 
+fn yield_from() -> Result<(), String> {
+    // Delegation to another generator function: the delegated values come out
+    // of the outer generator in order, between the outer `yield`s.
+    expect_repr(
+        "def inner():\n    yield 1\n    yield 2\ndef outer():\n    yield 0\n    yield from inner()\n    yield 3\nx = list(outer())",
+        "x",
+        "[0, 1, 2, 3]",
+    )?;
+    // The operand is any iterable, not only a generator: a range, a generator
+    // expression, and an instance whose `__iter__` returns an iterator.
+    expect_repr(
+        "def rng():\n    yield from range(3)\nx = list(rng())",
+        "x",
+        "[0, 1, 2]",
+    )?;
+    expect_repr(
+        "def genexp():\n    yield from (v * 2 for v in range(3))\nx = list(genexp())",
+        "x",
+        "[0, 2, 4]",
+    )?;
+    expect_repr(
+        "class Box:\n    def __iter__(self):\n        return iter([7, 8])\ndef take():\n    yield from Box()\nx = list(take())",
+        "x",
+        "[7, 8]",
+    )?;
+    // The delegated expression evaluates to None (there is no generator
+    // `return` value), so `got = yield from ...` binds None after the loop.
+    expect_repr(
+        "def f():\n    got = yield from [1]\n    yield got\nx = list(f())",
+        "x",
+        "[1, None]",
+    )?;
+    // Two levels of delegation, and laziness: nothing past the first value is
+    // produced until the resumer asks for it.
+    expect_repr(
+        "def inner():\n    yield 1\n    yield 2\ndef middle():\n    yield from inner()\ndef outer():\n    yield from middle()\ng = outer()\nx = (next(g), next(g), next(g, 'done'))\ndel g",
+        "x",
+        "(1, 2, 'done')",
+    )?;
+    // A non-iterable operand is a TypeError from the iterator protocol, and it
+    // surfaces from the first `next()` rather than at definition time.
+    expect_repr(
+        "def f():\n    yield from 5\ntry:\n    list(f())\n    x = 'no error'\nexcept TypeError as error:\n    x = (type(error).__name__, 'not iterable' in str(error))",
+        "x",
+        "('TypeError', True)",
+    )?;
+    // Syntax: delegation needs a `def` body and an operand.
+    expect_syntax_error(
+        "yield from [1]",
+        "'yield' outside a function",
+    )?;
+    expect_syntax_error(
+        "def f():\n    yield from",
+        "expected an expression",
+    )?;
+    Ok(())
+}
+
 fn decorators() -> Result<(), String> {
     expect_repr(
         "def double(f):\n    def wrapper(*args, **kwargs):\n        return f(*args, **kwargs) * 2\n    return wrapper\n@double\ndef five():\n    return 5\nx = five()",
@@ -1146,6 +1223,7 @@ fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
     alloc::vec![
         ("arithmetic", arithmetic as fn() -> Result<(), String>),
         ("generators", generators),
+        ("yield from", yield_from),
         ("generator expressions", generator_expressions),
         ("decorators", decorators),
         ("percent format", percent_formatting),
@@ -1318,6 +1396,11 @@ fn generators_work() {
 #[test]
 fn generator_expressions_work() {
     generator_expressions().unwrap();
+}
+
+#[test]
+fn yield_from_works() {
+    yield_from().unwrap();
 }
 
 #[test]

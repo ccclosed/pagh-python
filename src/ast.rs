@@ -189,6 +189,13 @@ pub enum Expr {
     /// `yield` / `yield value`: an expression, so `x = yield` works. Only
     /// valid inside a generator function; the parser enforces that.
     Yield(Option<Box<Expr>>),
+    /// `yield from iterable`: yield every value the operand produces.
+    ///
+    /// The operand is any iterable and is evaluated once; delegation is the
+    /// iteration protocol only, because this interpreter has no `send`,
+    /// `throw` or `close`, and a generator's `return` value is lost (both are
+    /// inherited 0.5.0 limits). The expression therefore evaluates to `None`.
+    YieldFrom(Box<Expr>),
     /// `(element for target in iterable ...)`. Lazy: the interpreter turns it
     /// into a generator, not a list.
     GeneratorExp {
