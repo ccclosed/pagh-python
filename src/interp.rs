@@ -4091,7 +4091,10 @@ impl Interp {
                 if let Some(method) = class_lookup(&instance.class, "__iter__") {
                     let bound = bind_method(method, value.clone())?;
                     let produced = self.call_value(bound, ArgList::new(), Vec::new())?;
-                    if matches!(produced, Value::Iterator(_)) {
+                    // A generator *is* an iterator (`iter(g) is g` above), and
+                    // a generator function is the natural way to write
+                    // `__iter__`, so both values are accepted here.
+                    if matches!(produced, Value::Iterator(_) | Value::Generator(_)) {
                         return Ok(produced);
                     }
                     return Err(self.err(

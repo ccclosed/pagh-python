@@ -735,6 +735,21 @@ fn generator_expressions() -> Result<(), String> {
         "x",
         "([0, 1, 2], [])",
     )?;
+    // `yield` in a comprehension is a compile-time error, as in CPython. The
+    // element is parsed before the `for` is known, so this is the finished-tree
+    // check rather than the clause guard.
+    expect_syntax_error(
+        "def f():\n    return [yield 1 for _ in range(2)]",
+        "'yield' inside a comprehension",
+    )?;
+    expect_syntax_error(
+        "def f():\n    return {i: (yield i) for i in range(2)}",
+        "'yield' inside a comprehension",
+    )?;
+    expect_syntax_error(
+        "def f():\n    return (yield from [1] for _ in range(2))",
+        "'yield' inside a comprehension",
+    )?;
     Ok(())
 }
 
@@ -762,6 +777,13 @@ fn yield_from() -> Result<(), String> {
         "class Box:\n    def __iter__(self):\n        return iter([7, 8])\ndef take():\n    yield from Box()\nx = list(take())",
         "x",
         "[7, 8]",
+    )?;
+    // `__iter__` may also be a generator function: a generator is an iterator
+    // (`iter(g) is g`), so both values are legal iterator protocol results.
+    expect_repr(
+        "class Box:\n    def __iter__(self):\n        yield 'a'\n        yield 'b'\ndef take():\n    yield from Box()\nx = list(take())",
+        "x",
+        "['a', 'b']",
     )?;
     // The delegated expression evaluates to None (there is no generator
     // `return` value), so `got = yield from ...` binds None after the loop.
