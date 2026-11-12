@@ -32,6 +32,7 @@ use crate::error::{ErrorName, PyError, PyResult, TraceFrame};
 use crate::parser;
 use crate::platform;
 use crate::value;
+use crate::value::view_elements;
 use crate::value::{
     attr_get, attr_set, class_is_subclass, class_lookup, dict_get, dict_set, env_find_nonlocal,
     env_lookup, is_same, set_find, set_insert, values_equal, BuiltinId, BuiltinType, BuiltinValue,
@@ -239,6 +240,9 @@ impl Interp {
             BuiltinType::Range,
             BuiltinType::Iterator,
             BuiltinType::Generator,
+            BuiltinType::DictKeys,
+            BuiltinType::DictValues,
+            BuiltinType::DictItems,
         ] {
             let base = if tag == BuiltinType::Bool {
                 // `bool` is a subclass of `int`, exactly as in Python.
@@ -1113,6 +1117,60 @@ impl Interp {
 
     // ── assignment ─────────────────────────────────────────────────────────
 
+    /// The value an augmented assignment stores: for two sets `|=`, `&=`,
+    /// `^=` and `-=` mutate the left set in place, exactly like CPython's
+    /// `__ior__` family, so an alias of the set sees the update. Every other
+    /// type keeps the old rebind behaviour (`x += 1` is `x = x + 1`).
+    fn aug_assign_value(&mut self, op: BinOp, current: Value, right: Value) -> PyResult<Value> {
+        let in_place = matches!(
+            op,
+            BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor | BinOp::Sub
+        ) && matches!((&current, &right), (Value::Set(_), Value::Set(_)));
+        if in_place {
+            let (Value::Set(items), Value::Set(other)) = (&current, &right) else {
+                unreachable!("checked above")
+            };
+            let items = items.clone();
+            let other = other.clone();
+            let other = other.borrow();
+            let mut items = items.borrow_mut();
+            match op {
+                BinOp::BitOr => {
+                    for item in other.iter() {
+                        set_insert(&mut items, item.clone());
+                    }
+                }
+                BinOp::BitAnd => {
+                    items.retain(|item| set_find(&other, item).is_some());
+                }
+                BinOp::Sub => {
+                    items.retain(|item| set_find(&other, item).is_none());
+                }
+                _ => {
+                    let mut removed = Vec::new();
+                    items.retain(|item| {
+                        if set_find(&other, item).is_some() {
+                            removed.push(item.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    for item in other.iter() {
+                        if !removed
+                            .iter()
+                            .any(|candidate| values_equal(candidate, item))
+                        {
+                            set_insert(&mut items, item.clone());
+                        }
+                    }
+                }
+            }
+            return Ok(current);
+        }
+        self.binary_op(op, current, right)
+    }
+
     fn exec_aug_assign(
         &mut self,
         target: &Expr,
@@ -1124,7 +1182,7 @@ impl Interp {
             Expr::Name(name) => {
                 let current = self.lookup_name(env, name)?;
                 let right = self.eval_expr(value_expression, env)?;
-                let result = self.binary_op(op, current, right)?;
+                let result = self.aug_assign_value(op, current, right)?;
                 self.set_name(env, name.clone(), result)
             }
             Expr::Index { target, index } => {
@@ -1132,14 +1190,14 @@ impl Interp {
                 let index = self.eval_expr(index, env)?;
                 let current = self.index_value(&object, &index)?;
                 let right = self.eval_expr(value_expression, env)?;
-                let result = self.binary_op(op, current, right)?;
+                let result = self.aug_assign_value(op, current, right)?;
                 self.set_index(object, index, result)
             }
             Expr::Attribute { target, name } => {
                 let object = self.eval_expr(target, env)?;
                 let current = self.get_attribute(&object, name)?;
                 let right = self.eval_expr(value_expression, env)?;
-                let result = self.binary_op(op, current, right)?;
+                let result = self.aug_assign_value(op, current, right)?;
                 self.set_attribute(&object, name.clone(), result)
             }
             _ => Err(self.err(
@@ -1456,6 +1514,13 @@ impl Interp {
                                 format!("bad operand type for unary +: '{}'", other.type_name()),
                             )),
                         },
+                    },
+                    UnOp::Invert => match value.as_int() {
+                        Some(number) => Ok(Value::Int(!number)),
+                        None => Err(self.err(
+                            "TypeError",
+                            format!("bad operand type for unary ~: '{}'", value.type_name()),
+                        )),
                     },
                 }
             }
@@ -3178,7 +3243,10 @@ impl Interp {
     pub fn binary_op(&mut self, op: BinOp, left: Value, right: Value) -> PyResult<Value> {
         match op {
             BinOp::Add => self.add_values(left, right),
-            BinOp::Sub => self.numeric_op(op, left, right),
+            BinOp::Sub => self.subtract_values(left, right),
+            BinOp::BitOr | BinOp::BitXor | BinOp::BitAnd | BinOp::Shl | BinOp::Shr => {
+                self.bitwise_op(op, left, right)
+            }
             BinOp::Mul => self.multiply_values(left, right),
             BinOp::Div => self.divide_values(left, right),
             BinOp::FloorDiv => self.floor_divide_values(left, right),
@@ -3274,6 +3342,133 @@ impl Interp {
                 right.type_name()
             ),
         ))
+    }
+
+    /// `-` is subtraction for numbers and set difference for two sets.
+    fn subtract_values(&self, left: Value, right: Value) -> PyResult<Value> {
+        if let (Value::Set(a), Value::Set(b)) = (&left, &right) {
+            let a = a.borrow();
+            let b = b.borrow();
+            let mut items = Vec::new();
+            for item in a.iter() {
+                if set_find(&b, item).is_none() {
+                    set_insert(&mut items, item.clone());
+                }
+            }
+            return Ok(Value::Set(Rc::new(RefCell::new(items))));
+        }
+        self.numeric_op(BinOp::Sub, left, right)
+    }
+
+    /// `|`, `&`, `^` on ints are bitwise; on two sets they are union,
+    /// intersection and symmetric difference. `<<`/`>>` are int-only.
+    fn bitwise_op(&self, op: BinOp, left: Value, right: Value) -> PyResult<Value> {
+        // CPython keeps `bool` for bool|bool, bool&bool and bool^bool (it
+        // added the bool operators in 3.13); every other pair follows the
+        // int path below.
+        if let (Value::Bool(a), Value::Bool(b)) = (&left, &right) {
+            if matches!(op, BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor) {
+                return Ok(Value::Bool(match op {
+                    BinOp::BitOr => *a || *b,
+                    BinOp::BitAnd => *a && *b,
+                    _ => *a != *b,
+                }));
+            }
+        }
+        if let (Value::Set(a), Value::Set(b)) = (&left, &right) {
+            if matches!(op, BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor) {
+                let a = a.borrow();
+                let b = b.borrow();
+                let mut items = Vec::new();
+                match op {
+                    BinOp::BitOr => {
+                        for item in a.iter() {
+                            set_insert(&mut items, item.clone());
+                        }
+                        for item in b.iter() {
+                            set_insert(&mut items, item.clone());
+                        }
+                    }
+                    BinOp::BitAnd => {
+                        for item in a.iter() {
+                            if set_find(&b, item).is_some() {
+                                set_insert(&mut items, item.clone());
+                            }
+                        }
+                    }
+                    _ => {
+                        for item in a.iter() {
+                            if set_find(&b, item).is_none() {
+                                set_insert(&mut items, item.clone());
+                            }
+                        }
+                        for item in b.iter() {
+                            if set_find(&a, item).is_none() {
+                                set_insert(&mut items, item.clone());
+                            }
+                        }
+                    }
+                }
+                return Ok(Value::Set(Rc::new(RefCell::new(items))));
+            }
+        }
+        let (Some(a), Some(b)) = (left.as_int(), right.as_int()) else {
+            return Err(self.err(
+                "TypeError",
+                format!(
+                    "unsupported operand type(s) for {}: '{}' and '{}'",
+                    op_text(op),
+                    left.type_name(),
+                    right.type_name()
+                ),
+            ));
+        };
+        match op {
+            BinOp::BitOr => Ok(Value::Int(a | b)),
+            BinOp::BitXor => Ok(Value::Int(a ^ b)),
+            BinOp::BitAnd => Ok(Value::Int(a & b)),
+            BinOp::Shl | BinOp::Shr => {
+                if b < 0 {
+                    return Err(self.err("ValueError", String::from("negative shift count")));
+                }
+                if op == BinOp::Shr {
+                    // CPython's `>>` is an arithmetic shift and never
+                    // overflows: shifting everything out of an i64 leaves the
+                    // sign, so large counts saturate instead of wrapping.
+                    return Ok(Value::Int(if b >= 64 {
+                        if a < 0 {
+                            -1
+                        } else {
+                            0
+                        }
+                    } else {
+                        a >> b
+                    }));
+                }
+                if a == 0 {
+                    return Ok(Value::Int(0));
+                }
+                match if b >= 64 {
+                    None
+                } else {
+                    a.checked_shl(b as u32)
+                } {
+                    Some(result) => Ok(Value::Int(result)),
+                    None => {
+                        Err(self.err("OverflowError", String::from("integer left shift overflow")))
+                    }
+                }
+            }
+            _ => Err(self.err(
+                "TypeError",
+                format!(
+                    "unsupported operand type(s) for {}: '{}' and '{}'",
+                    op_text(op),
+                    left.type_name(),
+                    right.type_name()
+                ),
+            )),
+        }
     }
 
     fn multiply_values(&self, left: Value, right: Value) -> PyResult<Value> {
@@ -3911,6 +4106,23 @@ impl Interp {
                 }
                 Ok(set_find(&items.borrow(), item).is_some())
             }
+            Value::DictView(view) if view.kind == value::DictViewKind::Keys => {
+                if !item.is_hashable() {
+                    return Err(self.err(
+                        "TypeError",
+                        format!("unhashable type: '{}'", item.type_name()),
+                    ));
+                }
+                Ok(dict_get(&view.entries.borrow(), item).is_some())
+            }
+            Value::DictView(view) if view.kind == value::DictViewKind::Values => Ok(view
+                .entries
+                .borrow()
+                .iter()
+                .any(|(_, value)| values_equal(value, item))),
+            Value::DictView(view) => Ok(view_elements(view)
+                .iter()
+                .any(|candidate| values_equal(candidate, item))),
             Value::Bytes(data) => match item {
                 Value::Int(number) => {
                     if !(0..=255).contains(number) {
@@ -4543,6 +4755,15 @@ impl Interp {
                     index: 0,
                 },
             )))),
+            Value::DictView(view) => {
+                let entries = view.entries.clone();
+                let state = match view.kind {
+                    value::DictViewKind::Keys => IterState::DictKeys { entries, index: 0 },
+                    value::DictViewKind::Values => IterState::DictValues { entries, index: 0 },
+                    value::DictViewKind::Items => IterState::DictItems { entries, index: 0 },
+                };
+                Ok(Value::Iterator(Rc::new(RefCell::new(state))))
+            }
             Value::Set(items) => Ok(Value::Iterator(Rc::new(RefCell::new(
                 IterState::SetElems {
                     items: items.clone(),
@@ -5194,6 +5415,11 @@ fn op_text(op: BinOp) -> &'static str {
         BinOp::FloorDiv => "//",
         BinOp::Mod => "%",
         BinOp::Pow => "**",
+        BinOp::BitOr => "|",
+        BinOp::BitXor => "^",
+        BinOp::BitAnd => "&",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
     }
 }
 
@@ -5206,6 +5432,13 @@ fn set_method(name: &str) -> Option<BuiltinId> {
         "intersection" => BuiltinId::SetIntersection,
         "difference" => BuiltinId::SetDifference,
         "issubset" => BuiltinId::SetIssubset,
+        "pop" => BuiltinId::SetPop,
+        "update" => BuiltinId::SetUpdate,
+        "difference_update" => BuiltinId::SetDifferenceUpdate,
+        "intersection_update" => BuiltinId::SetIntersectionUpdate,
+        "symmetric_difference" => BuiltinId::SetSymmetricDifference,
+        "symmetric_difference_update" => BuiltinId::SetSymmetricDifferenceUpdate,
+        "isdisjoint" => BuiltinId::SetIsDisjoint,
         "issuperset" => BuiltinId::SetSuperset,
         "copy" => BuiltinId::SetCopy,
         "clear" => BuiltinId::SetClear,

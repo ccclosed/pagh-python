@@ -860,6 +860,11 @@ impl Parser {
                     | Op::SlashSlashEq
                     | Op::PercentEq
                     | Op::StarStarEq
+                    | Op::AmpEq
+                    | Op::PipeEq
+                    | Op::CaretEq
+                    | Op::ShlEq
+                    | Op::ShrEq
             ),
             Tok::Kw(kw) => matches!(kw, Kw::In | Kw::As),
             _ => false,
@@ -922,7 +927,7 @@ impl Parser {
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, SyntaxError> {
-        let left = self.parse_additive()?;
+        let left = self.parse_bit_or()?;
         let mut ops = Vec::new();
         let mut comparators = Vec::new();
         loop {
@@ -958,7 +963,7 @@ impl Parser {
             };
             let Some(op) = op else { break };
             ops.push(op);
-            comparators.push(self.parse_additive()?);
+            comparators.push(self.parse_bit_or()?);
         }
         if ops.is_empty() {
             Ok(left)
@@ -969,6 +974,68 @@ impl Parser {
                 comparators,
             })
         }
+    }
+
+    /// `|` is the loosest bitwise/set operator, below `^`, `&` and shifts,
+    /// exactly as in Python: `a | b ^ c & d << e` groups from the right.
+    fn parse_bit_or(&mut self) -> Result<Expr, SyntaxError> {
+        let mut left = self.parse_bit_xor()?;
+        while self.eat_op(Op::Pipe) {
+            let right = self.parse_bit_xor()?;
+            left = Expr::Binary {
+                op: BinOp::BitOr,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_bit_xor(&mut self) -> Result<Expr, SyntaxError> {
+        let mut left = self.parse_bit_and()?;
+        while self.eat_op(Op::Caret) {
+            let right = self.parse_bit_and()?;
+            left = Expr::Binary {
+                op: BinOp::BitXor,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_bit_and(&mut self) -> Result<Expr, SyntaxError> {
+        let mut left = self.parse_shift()?;
+        while self.eat_op(Op::Amp) {
+            let right = self.parse_shift()?;
+            left = Expr::Binary {
+                op: BinOp::BitAnd,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, SyntaxError> {
+        let mut left = self.parse_additive()?;
+        loop {
+            let op = if self.eat_op(Op::Shl) {
+                Some(BinOp::Shl)
+            } else if self.eat_op(Op::Shr) {
+                Some(BinOp::Shr)
+            } else {
+                None
+            };
+            let Some(op) = op else { break };
+            let right = self.parse_additive()?;
+            left = Expr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
     }
 
     fn parse_additive(&mut self) -> Result<Expr, SyntaxError> {
@@ -1023,6 +1090,12 @@ impl Parser {
     }
 
     fn parse_factor(&mut self) -> Result<Expr, SyntaxError> {
+        if self.eat_op(Op::Tilde) {
+            return Ok(Expr::Unary {
+                op: UnOp::Invert,
+                value: Box::new(self.parse_factor()?),
+            });
+        }
         if self.eat_op(Op::Minus) {
             return Ok(Expr::Unary {
                 op: UnOp::Minus,
@@ -1796,6 +1869,11 @@ fn compound_assignment_op(tok: &Tok) -> Option<BinOp> {
         Tok::Op(Op::SlashSlashEq) => Some(BinOp::FloorDiv),
         Tok::Op(Op::PercentEq) => Some(BinOp::Mod),
         Tok::Op(Op::StarStarEq) => Some(BinOp::Pow),
+        Tok::Op(Op::AmpEq) => Some(BinOp::BitAnd),
+        Tok::Op(Op::PipeEq) => Some(BinOp::BitOr),
+        Tok::Op(Op::CaretEq) => Some(BinOp::BitXor),
+        Tok::Op(Op::ShlEq) => Some(BinOp::Shl),
+        Tok::Op(Op::ShrEq) => Some(BinOp::Shr),
         _ => None,
     }
 }
@@ -1809,6 +1887,17 @@ fn op_text(op: Op) -> &'static str {
         Op::SlashSlash => "//",
         Op::Percent => "%",
         Op::StarStar => "**",
+        Op::Amp => "&",
+        Op::Pipe => "|",
+        Op::Caret => "^",
+        Op::Tilde => "~",
+        Op::Shl => "<<",
+        Op::Shr => ">>",
+        Op::AmpEq => "&=",
+        Op::PipeEq => "|=",
+        Op::CaretEq => "^=",
+        Op::ShlEq => "<<=",
+        Op::ShrEq => ">>=",
         Op::EqEq => "==",
         Op::NotEq => "!=",
         Op::Lt => "<",

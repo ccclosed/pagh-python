@@ -163,6 +163,9 @@ pub enum BuiltinType {
     Range,
     Iterator,
     Generator,
+    DictKeys,
+    DictValues,
+    DictItems,
 }
 
 impl BuiltinType {
@@ -185,6 +188,9 @@ impl BuiltinType {
             BuiltinType::File => "file",
             BuiltinType::Range => "range",
             BuiltinType::Iterator => "iterator",
+            BuiltinType::DictKeys => "dict_keys",
+            BuiltinType::DictValues => "dict_values",
+            BuiltinType::DictItems => "dict_items",
             BuiltinType::Generator => "generator",
         }
     }
@@ -473,6 +479,36 @@ pub enum GeneratorPending {
     Close,
 }
 
+/// Which dict method produced a view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DictViewKind {
+    Keys,
+    Values,
+    Items,
+}
+
+impl DictViewKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            DictViewKind::Keys => "dict_keys",
+            DictViewKind::Values => "dict_values",
+            DictViewKind::Items => "dict_items",
+        }
+    }
+}
+
+/// A live view over a dict, as returned by `d.keys()`, `d.values()` and
+/// `d.items()`.
+///
+/// It is not a snapshot: `len`, iteration and membership read the dict when
+/// they are used, so a view obtained before a mutation sees it — exactly like
+/// CPython's view objects. Being a separate `Rc` also gives the view object
+/// identity, which is what `d.values() == d.values()` is false about.
+pub struct DictView {
+    pub entries: Rc<RefCell<Vec<(Value, Value)>>>,
+    pub kind: DictViewKind,
+}
+
 pub struct RangeValue {
     pub start: i64,
     pub stop: i64,
@@ -500,6 +536,14 @@ pub enum IterState {
         index: usize,
     },
     DictKeys {
+        entries: Rc<RefCell<Vec<(Value, Value)>>>,
+        index: usize,
+    },
+    DictValues {
+        entries: Rc<RefCell<Vec<(Value, Value)>>>,
+        index: usize,
+    },
+    DictItems {
         entries: Rc<RefCell<Vec<(Value, Value)>>>,
         index: usize,
     },
@@ -630,6 +674,13 @@ pub enum BuiltinId {
     SetSuperset,
     SetCopy,
     SetClear,
+    SetPop,
+    SetUpdate,
+    SetDifferenceUpdate,
+    SetIntersectionUpdate,
+    SetSymmetricDifference,
+    SetSymmetricDifferenceUpdate,
+    SetIsDisjoint,
     // bytes methods
     BytesDecode,
     BytesHex,
@@ -808,6 +859,13 @@ pub fn builtin_name(id: BuiltinId) -> &'static str {
         BuiltinId::SetSuperset => "issuperset",
         BuiltinId::SetCopy => "copy",
         BuiltinId::SetClear => "clear",
+        BuiltinId::SetPop => "pop",
+        BuiltinId::SetUpdate => "update",
+        BuiltinId::SetDifferenceUpdate => "difference_update",
+        BuiltinId::SetIntersectionUpdate => "intersection_update",
+        BuiltinId::SetSymmetricDifference => "symmetric_difference",
+        BuiltinId::SetSymmetricDifferenceUpdate => "symmetric_difference_update",
+        BuiltinId::SetIsDisjoint => "isdisjoint",
         BuiltinId::BytesDecode => "decode",
         BuiltinId::BytesHex => "hex",
         BuiltinId::StrEncode => "encode",
@@ -861,6 +919,7 @@ pub enum Value {
     List(Rc<RefCell<Vec<Value>>>),
     Tuple(Rc<Vec<Value>>),
     Dict(Rc<RefCell<Vec<(Value, Value)>>>),
+    DictView(Rc<DictView>),
     Set(Rc<RefCell<Vec<Value>>>),
     Bytes(Rc<Vec<u8>>),
     Function(Rc<Function>),
@@ -926,6 +985,7 @@ impl Value {
             Value::List(items) => !items.borrow().is_empty(),
             Value::Tuple(items) => !items.is_empty(),
             Value::Dict(entries) => !entries.borrow().is_empty(),
+            Value::DictView(view) => !view.entries.borrow().is_empty(),
             Value::Set(items) => !items.borrow().is_empty(),
             Value::Bytes(data) => !data.is_empty(),
             Value::Range(range) => range.len > 0,
@@ -944,6 +1004,7 @@ impl Value {
             Value::List(_) => "list",
             Value::Tuple(_) => "tuple",
             Value::Dict(_) => "dict",
+            Value::DictView(view) => view.kind.name(),
             Value::Set(_) => "set",
             Value::Bytes(_) => "bytes",
             Value::Function(_) | Value::BoundMethod(_) => "function",
@@ -968,6 +1029,11 @@ impl Value {
             Value::List(_) => BuiltinType::List,
             Value::Tuple(_) => BuiltinType::Tuple,
             Value::Dict(_) => BuiltinType::Dict,
+            Value::DictView(view) => match view.kind {
+                DictViewKind::Keys => BuiltinType::DictKeys,
+                DictViewKind::Values => BuiltinType::DictValues,
+                DictViewKind::Items => BuiltinType::DictItems,
+            },
             Value::Set(_) => BuiltinType::Set,
             Value::Bytes(_) => BuiltinType::Bytes,
             Value::Function(_) | Value::BoundMethod(_) => BuiltinType::Function,
@@ -1008,6 +1074,7 @@ impl Value {
             Value::Tuple(items) => items.iter().all(Value::is_hashable),
             Value::Bytes(_) => true,
             Value::Class(_) | Value::Instance(_) => true,
+            Value::DictView(_) => false,
             _ => false,
         }
     }
@@ -1062,6 +1129,48 @@ fn write_repr(out: &mut String, value: &Value, depth: usize) {
             }
             if items.len() == 1 {
                 out.push(',');
+            }
+            out.push(')');
+        }
+        Value::DictView(view) => {
+            let entries = view.entries.borrow();
+            out.push_str(view.kind.name());
+            out.push('(');
+            match view.kind {
+                DictViewKind::Keys => {
+                    out.push('[');
+                    for (index, (key, _)) in entries.iter().enumerate() {
+                        if index > 0 {
+                            out.push_str(", ");
+                        }
+                        write_repr(out, key, depth + 1);
+                    }
+                    out.push(']');
+                }
+                DictViewKind::Values => {
+                    out.push('[');
+                    for (index, (_, value)) in entries.iter().enumerate() {
+                        if index > 0 {
+                            out.push_str(", ");
+                        }
+                        write_repr(out, value, depth + 1);
+                    }
+                    out.push(']');
+                }
+                DictViewKind::Items => {
+                    out.push('[');
+                    for (index, (key, value)) in entries.iter().enumerate() {
+                        if index > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push('(');
+                        write_repr(out, key, depth + 1);
+                        out.push_str(", ");
+                        write_repr(out, value, depth + 1);
+                        out.push(')');
+                    }
+                    out.push(']');
+                }
             }
             out.push(')');
         }
@@ -1200,6 +1309,19 @@ fn write_bytes_repr(out: &mut String, data: &[u8]) {
 
 // ── equality and ordering ─────────────────────────────────────────────────
 
+/// The elements a keys/items view compares and tests membership against.
+pub fn view_elements(view: &DictView) -> Vec<Value> {
+    let entries = view.entries.borrow();
+    match view.kind {
+        DictViewKind::Keys => entries.iter().map(|(key, _)| key.clone()).collect(),
+        DictViewKind::Values => entries.iter().map(|(_, value)| value.clone()).collect(),
+        DictViewKind::Items => entries
+            .iter()
+            .map(|(key, value)| Value::tuple(alloc::vec![key.clone(), value.clone()]))
+            .collect(),
+    }
+}
+
 pub fn values_equal(left: &Value, right: &Value) -> bool {
     equal_depth(left, right, 0)
 }
@@ -1248,6 +1370,22 @@ fn equal_depth(left: &Value, right: &Value, depth: usize) -> bool {
                 && a.iter()
                     .zip(b.iter())
                     .all(|(x, y)| equal_depth(x, y, depth + 1))
+        }
+        (Value::DictView(a), Value::DictView(b)) => {
+            if a.kind != b.kind {
+                return false;
+            }
+            match a.kind {
+                // `dict_values` has no meaningful equality in CPython either:
+                // only the very same view object is equal to itself.
+                DictViewKind::Values => Rc::ptr_eq(a, b),
+                _ => {
+                    let left = view_elements(a);
+                    let right = view_elements(b);
+                    left.len() == right.len()
+                        && left.iter().all(|item| set_find(&right, item).is_some())
+                }
+            }
         }
         (Value::Dict(a), Value::Dict(b)) => {
             if Rc::ptr_eq(a, b) {
@@ -1321,6 +1459,7 @@ pub fn is_same(left: &Value, right: &Value) -> bool {
         (Value::Tuple(a), Value::Tuple(b)) => Rc::ptr_eq(a, b),
         (Value::Dict(a), Value::Dict(b)) => Rc::ptr_eq(a, b),
         (Value::Set(a), Value::Set(b)) => Rc::ptr_eq(a, b),
+        (Value::DictView(a), Value::DictView(b)) => Rc::ptr_eq(a, b),
         (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
         (Value::Builtin(a), Value::Builtin(b)) => Rc::ptr_eq(a, b),
@@ -1511,6 +1650,24 @@ impl IterState {
                     *index += 1;
                 }
                 entry
+            }
+            IterState::DictValues { entries, index } => {
+                let borrowed = entries.borrow();
+                let value = borrowed.get(*index).map(|(_, value)| value.clone());
+                if value.is_some() {
+                    *index += 1;
+                }
+                value
+            }
+            IterState::DictItems { entries, index } => {
+                let borrowed = entries.borrow();
+                let value = borrowed
+                    .get(*index)
+                    .map(|(key, item)| Value::tuple(alloc::vec![key.clone(), item.clone()]));
+                if value.is_some() {
+                    *index += 1;
+                }
+                value
             }
             IterState::SetElems { items, index } => {
                 let borrowed = items.borrow();

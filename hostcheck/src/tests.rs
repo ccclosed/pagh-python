@@ -1101,6 +1101,179 @@ fn generator_delegation() -> Result<(), String> {
     Ok(())
 }
 
+fn dict_views() -> Result<(), String> {
+    // `keys()`/`values()`/`items()` are view objects, not lists: they have
+    // their own type name and repr, support len/iter/membership, and read the
+    // dict live (a view sees a mutation made after it was obtained).
+    expect_repr(
+        "d = {'a': 1, 'b': 2}\nk = d.keys()\nv = d.values()\ni = d.items()\nx = (len(k), len(v), len(i), list(k), list(v), list(i), 'a' in k, 1 in v, ('a', 1) in i)",
+        "x",
+        "(2, 2, 2, ['a', 'b'], [1, 2], [('a', 1), ('b', 2)], True, True, True)",
+    )?;
+    expect_repr(
+        "d = {'a': 1}\nx = (d.keys(), d.values(), d.items())",
+        "x",
+        "(dict_keys(['a']), dict_values([1]), dict_items([('a', 1)]))",
+    )?;
+    expect_repr(
+        "d = {'a': 1, 'b': 2}\nx = (type(d.keys()).__name__, type(d.values()).__name__, type(d.items()).__name__)",
+        "x",
+        "('dict_keys', 'dict_values', 'dict_items')",
+    )?;
+    // Views are live: mutation after the view was created is visible.
+    expect_repr(
+        "d = {'a': 1}\nk = d.keys()\nd['b'] = 2\nx = (list(k), len(k))",
+        "x",
+        "(['a', 'b'], 2)",
+    )?;
+    expect_repr(
+        "d = {'a': 1}\nk = d.keys()\ndel d['a']\nx = list(k)",
+        "x",
+        "[]",
+    )?;
+    // Views compare as sets for keys/items; `dict_values` has no meaningful
+    // equality, so two values views of the same dict are unequal.
+    expect_repr(
+        "d = {'a': 1, 'b': 2}\nx = (d.keys() == d.keys(), d.values() == d.values())",
+        "x",
+        "(True, False)",
+    )?;
+    // `dict(d.items())` round-trips, and values views iterate like any iterable.
+    expect_repr(
+        "d = {'a': 1, 'b': 2}\nrebuilt = dict(d.items())\ntotal = 0\nfor value in d.values():\n    total += value\nx = (rebuilt, total)",
+        "x",
+        "({'a': 1, 'b': 2}, 3)",
+    )?;
+    // A view is unhashable and is not JSON-serializable; both fail loudly
+    // instead of silently snapshotting.
+    expect_repr(
+        "import json\nd = {'a': 1}\ntry:\n    x = {d.keys(): 1}\nexcept TypeError as error:\n    x = str(error)",
+        "x",
+        "'unhashable type: \\'dict_keys\\''",
+    )?;
+    Ok(())
+}
+
+fn bitwise_operators() -> Result<(), String> {
+    expect_repr(
+        "x = (6 & 3, 6 | 3, 6 ^ 3, ~6, 1 << 4, 32 >> 2)",
+        "x",
+        "(2, 7, 5, -7, 16, 8)",
+    )?;
+    // Python precedence: | < ^ < & < shifts < additive.
+    expect_repr(
+        "x = (1 | 2 & 3, 1 ^ 2 | 4, 1 << 2 + 1, ~-1)",
+        "x",
+        "(3, 7, 8, 0)",
+    )?;
+    // Augmented forms rebind like the rest of the arithmetic operators.
+    expect_repr("a = 5\na |= 2\na <<= 1\nx = a", "x", "14")?;
+    // bool/bool keeps bool (CPython 3.13+); mixed bool/int is an int.
+    expect_repr(
+        "x = (True | False, type(True | False).__name__, True | 1, type(True | 1).__name__, ~True)",
+        "x",
+        "(True, 'bool', 1, 'int', -2)",
+    )?;
+    // Right shift is arithmetic and saturates; left shift never wraps.
+    expect_repr(
+        "x = (-8 >> 1, 1 >> 100, -1 >> 100, 0 << 70, 1 << 10)",
+        "x",
+        "(-4, 0, -1, 0, 1024)",
+    )?;
+    expect_repr(
+        "try:\n    x = 1 << 64\nexcept OverflowError as error:\n    x = str(error)",
+        "x",
+        "'integer left shift overflow'",
+    )?;
+    expect_repr(
+        "try:\n    x = 1 << -1\nexcept ValueError as error:\n    x = str(error)",
+        "x",
+        "'negative shift count'",
+    )?;
+    expect_repr(
+        "try:\n    x = 'a' & 1\nexcept TypeError as error:\n    x = str(error)",
+        "x",
+        "'unsupported operand type(s) for &: \\'str\\' and \\'int\\''",
+    )?;
+    expect_repr(
+        "try:\n    x = ~'a'\nexcept TypeError as error:\n    x = str(error)",
+        "x",
+        "'bad operand type for unary ~: \\'str\\''",
+    )?;
+    Ok(())
+}
+
+fn set_operations() -> Result<(), String> {
+    // The operators Python spells with the bitwise tokens on sets.
+    expect_repr(
+        "a = {1, 2, 3}\nb = {3, 4}\nx = (a | b, a & b, a - b, a ^ b)",
+        "x",
+        "({1, 2, 3, 4}, {3}, {1, 2}, {1, 2, 4})",
+    )?;
+    // `|=`, `&=`, `-=`, `^=` mutate the set in place, so aliases see it.
+    expect_repr(
+        "a = {1, 2}\nalias = a\na |= {3}\nx = (a, alias)",
+        "x",
+        "({1, 2, 3}, {1, 2, 3})",
+    )?;
+    expect_repr(
+        "a = {1, 2, 3}\nalias = a\na &= {2, 3, 4}\nx = (a, alias)",
+        "x",
+        "({2, 3}, {2, 3})",
+    )?;
+    expect_repr(
+        "a = {1, 2, 3}\nalias = a\na -= {2}\nx = (a, alias)",
+        "x",
+        "({1, 3}, {1, 3})",
+    )?;
+    expect_repr(
+        "a = {1, 2, 3}\nalias = a\na ^= {3, 4}\nx = (a, alias)",
+        "x",
+        "({1, 2, 4}, {1, 2, 4})",
+    )?;
+    // The mutating methods return None and accept any iterables.
+    expect_repr("a = {1, 2}\nx = (a.update([3]), a)", "x", "(None, {1, 2, 3})")?;
+    expect_repr(
+        "a = {1, 2}\na.update({3}, [4])\nx = a",
+        "x",
+        "{1, 2, 3, 4}",
+    )?;
+    expect_repr(
+        "a = {1, 2, 3}\nx = (a.difference_update([1, 2]), a)",
+        "x",
+        "(None, {3})",
+    )?;
+    expect_repr(
+        "a = {1, 2, 3}\nx = (a.intersection_update([2, 3, 4]), a)",
+        "x",
+        "(None, {2, 3})",
+    )?;
+    expect_repr(
+        "a = {1, 2, 3}\nx = (a.symmetric_difference_update([3, 4]), a)",
+        "x",
+        "(None, {1, 2, 4})",
+    )?;
+    expect_repr(
+        "x = ({1, 2, 3}.symmetric_difference([3, 4]), {1, 2}.isdisjoint([3, 4]), {1, 2}.isdisjoint([2, 3]))",
+        "x",
+        "({1, 2, 4}, True, False)",
+    )?;
+    // `pop()` removes from the front (this implementation keeps insertion
+    // order), an empty set is a KeyError, and a non-set operand is a TypeError.
+    expect_repr("a = {1, 2, 3}\nx = (a.pop(), a)", "x", "(1, {2, 3})")?;
+    expect_repr(
+        "try:\n    set().pop()\nexcept KeyError as error:\n    x = str(error)",
+        "x",
+        "'pop from an empty set'",
+    )?;
+    expect_repr(
+        "try:\n    x = {1} | [2]\nexcept TypeError as error:\n    x = str(error)",
+        "x",
+        "'unsupported operand type(s) for |: \\'set\\' and \\'list\\''",
+    )?;
+    Ok(())
+}
+
 fn decorators() -> Result<(), String> {
     expect_repr(
         "def double(f):\n    def wrapper(*args, **kwargs):\n        return f(*args, **kwargs) * 2\n    return wrapper\n@double\ndef five():\n    return 5\nx = five()",
@@ -1544,6 +1717,9 @@ fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
         ("strings", strings),
         ("lists", lists),
         ("dicts", dicts),
+        ("dict views", dict_views),
+        ("bitwise operators", bitwise_operators),
+        ("set operations", set_operations),
         ("slicing", slicing),
         ("functions", functions),
         ("classes", classes),
@@ -1730,6 +1906,21 @@ fn generator_close_works() {
 #[test]
 fn generator_delegation_works() {
     generator_delegation().unwrap();
+}
+
+#[test]
+fn dict_views_work() {
+    dict_views().unwrap();
+}
+
+#[test]
+fn bitwise_operators_work() {
+    bitwise_operators().unwrap();
+}
+
+#[test]
+fn set_operations_work() {
+    set_operations().unwrap();
 }
 
 #[test]
