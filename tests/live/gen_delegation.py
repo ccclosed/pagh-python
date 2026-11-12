@@ -115,45 +115,70 @@ assert g.throw(ValueError("plain")) == "caught plain"
 g.close()
 print("delegate plain throw: caught plain")
 
-# ── fibers: the 8-suspended limit and stack recycling still hold ──────────
+# `throw(GeneratorExit)` through `yield from` is special-cased (CPython's
+# gen_throw): the delegate must die. A delegate that swallows GeneratorExit
+# and yields makes the outer throw a RuntimeError, one that returns is
+# reported as GeneratorExit at the `yield from`.
+log = []
 
-def counter():
-    total = 0
-    while True:
-        value = yield total
-        total += value
+def sub_exit_yield():
+    try:
+        yield 1
+    except GeneratorExit:
+        log.append("sub")
+        yield "caught"
 
-def one():
-    yield 1
+def outer_exit_yield():
+    try:
+        yield from sub_exit_yield()
+    finally:
+        log.append("outer")
 
-# 200 generators come and go through send/close, so no fiber slot leaks.
-for _ in range(200):
-    g = counter()
-    next(g)
-    g.send(1)
-    g.close()
-print("recycled: 200 generators")
-
-# The documented limit stays true: 8 suspended generators, the ninth gets a
-# Python MemoryError instead of an allocator abort.
-suspended = []
-for _ in range(8):
-    g = one()
-    next(g)
-    suspended.append(g)
-limit = ""
+g = outer_exit_yield()
+next(g)
+message = ""
 try:
-    ninth = one()
-    next(ninth)
-    raise AssertionError("the ninth suspended generator must fail")
-except MemoryError as error:
-    limit = str(error)
-assert "8 are already suspended" in limit
-for g in suspended:
-    g.close()
-probe = one()
-assert next(probe) == 1
-probe.close()
-print("limit:", limit)
+    g.throw(GeneratorExit())
+    raise AssertionError("a delegate that ignores GeneratorExit must be refused")
+except RuntimeError as error:
+    message = str(error)
+assert message == "generator ignored GeneratorExit"
+assert log == ["sub", "outer"]
+print("delegate throw GeneratorExit:", message)
+
+def sub_exit_return():
+    try:
+        yield 1
+    except GeneratorExit:
+        return "done"
+
+def outer_exit_return():
+    yield from sub_exit_return()
+
+g = outer_exit_return()
+next(g)
+exiting = False
+try:
+    g.throw(GeneratorExit())
+except GeneratorExit:
+    exiting = True
+assert exiting
+print("delegate throw GeneratorExit return: GeneratorExit")
+
+# The delegated `return` value is taken once: a second delegation to the same
+# exhausted generator sees None.
+def inner_return():
+    yield 1
+    return "answer"
+
+done = inner_return()
+list(done)
+
+def delegate_again():
+    got = yield from done
+    yield got
+
+assert list(delegate_again()) == [None]
+print("delegate return once: None")
 
 print("GEN DELEGATION OK")

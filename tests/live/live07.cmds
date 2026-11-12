@@ -1,6 +1,7 @@
 # Live suite for pythonc 0.7.0 on the pagh 0.21.2 kernel: the 0.1.2-0.6.0
-# regression commands plus the two new generator-protocol scripts (`send`/
-# `throw`/`close` and their `yield from` delegation), one boot, in order.
+# regression commands plus the three new generator-protocol scripts (`send`/
+# `throw`/`close`, their `yield from` delegation, and the fiber limits), one
+# boot, in order.
 # Each script checks itself with asserts; the kernel prints
 # "run: /mnt/pythonc exited with code N" after every run.
 cat /mnt/hello.py
@@ -45,6 +46,7 @@ run /mnt/pythonc /mnt/stack_depth.py
 run /mnt/pythonc /mnt/yield_from.py
 run /mnt/pythonc /mnt/gen_methods.py
 run /mnt/pythonc /mnt/gen_delegation.py
+run /mnt/pythonc /mnt/gen_fibers.py
 run /mnt/pythonc /mnt/generator_syntax.py
 run /mnt/pythonc /mnt/decorator_syntax.py
 run /mnt/pythonc /mnt/yield_from_syntax.py

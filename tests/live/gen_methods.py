@@ -147,6 +147,22 @@ assert next(g, "done") == "done"
 print("throw unstarted: body not run")
 del g
 
+# PEP 479: a StopIteration escaping the body is an error, not a quiet end of
+# the iteration (it would make a `for` loop stop silently).
+def plain():
+    yield 1
+
+g = plain()
+next(g)
+pep479 = ""
+try:
+    g.throw(StopIteration("stop"))
+    raise AssertionError("throw(StopIteration) must become a RuntimeError")
+except RuntimeError as error:
+    pep479 = str(error)
+assert pep479 == "generator raised StopIteration"
+print("pep479:", pep479)
+
 # ── close ──────────────────────────────────────────────────────────────────
 
 log = []

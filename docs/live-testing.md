@@ -574,19 +574,20 @@ cd /tmp/pagh-kernel-a0933ee && cargo build --locked
 
 ## Итог 0.7.0
 
-**42 запуска pythonc: 36 с кодом 0, 6 намеренных диагностик** (usage — 2;
+**43 запуска pythonc: 37 с кодом 0, 6 намеренных диагностик** (usage — 2;
 `syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
 `decorator_syntax.py`, `yield_from_syntax.py` — 1), плюс три `cat`, которые
 показывают staged-скрипт и два файла, записанных `fileio.py` и
 `print(file=...)`. Все языковые проверки — assert-скрипты, поэтому код 0
 означает совпадение значений, а не только напечатанные строки.
 
-Новое в 0.7.0 (два скрипта, по одному на загрузку — см. «Честные пробелы»):
+Новое в 0.7.0 (три скрипта, см. «Честные пробелы» про 1 МиБ):
 
 | Скрипт | Что проверяет | Результат |
 |---|---|---|
-| `gen_methods.py` | `send(value)`/`send(None)`/`send` в незапущенный и исчерпанный генератор, `throw` экземпляром/классом/класс+аргументы (включая пользовательский класс), необработанный `throw`, `throw` в незапущенный, `close()` с `finally`, `close()` незапущенного, `RuntimeError` на теле, игнорирующем `GeneratorExit`, иерархия `GeneratorExit` | `GEN METHODS OK`, exit 0 |
-| `gen_delegation.py` | `send`/`throw`/`close` через `yield from`, значение `return` делегированного генератора, вложенность, сужение для обычного итератора, рецикл 200 стеков, лимит 8 приостановленных генераторов и его снятие через `close()` | `GEN DELEGATION OK`, exit 0 |
+| `gen_methods.py` | `send(value)`/`send(None)`/`send` в незапущенный и исчерпанный генератор, `throw` экземпляром/классом/класс+аргументы (включая пользовательский класс), необработанный `throw`, `throw` в незапущенный, `close()` с `finally`, `close()` незапущенного, `RuntimeError` на теле, игнорирующем `GeneratorExit`, иерархия `GeneratorExit`, `PEP 479` (`throw(StopIteration)` → `RuntimeError`) | `GEN METHODS OK`, exit 0 |
+| `gen_delegation.py` | `send`/`throw`/`close` через `yield from`, значение `return` делегированного генератора (однократное), особый случай `throw(GeneratorExit)` через `yield from`, вложенность, сужение для обычного итератора | `GEN DELEGATION OK`, exit 0 |
+| `gen_fibers.py` | рецикл 200 стеков, лимит 8 приостановленных генераторов и его снятие через `close()` | `GEN FIBERS OK`, exit 0 |
 
 Регрессия: все прежние проверки 0.6.0 (включая `YIELD FROM OK`,
 `GENERATORS OK`, `os_proc.py` с `child: True status: 0`/`proc ok`) проходят
@@ -608,6 +609,7 @@ close finally: ['cleanup']
 close unstarted: nothing ran
 close ignored: generator ignored GeneratorExit
 close: GeneratorExit is BaseException
+pep479: generator raised StopIteration
 GEN METHODS OK
 
 delegate send: sub return                                # gen_delegation.py
@@ -630,9 +632,6 @@ proc ok
 - **Трёхаргументная форма `throw(type, value, traceback)` не поддерживается**
   и отвергается `TypeError` (у исключений этого интерпретатора нет
   traceback-объектов); CPython сам объявил её deprecated.
-- **`PEP 479` не реализован:** необработанный `StopIteration`
-  (например, из `throw(StopIteration)`) завершает генератор и выходит как
-  `StopIteration`, а не превращается в `RuntimeError`.
 - **Делегация через `yield from` полная только для pagh-генератора.** Для
   обычного итератора (`range`, список) `send` не-`None` даёт `AttributeError`
   (hostcheck/live), а `throw`/`close` поднимаются в точке `yield from`.
@@ -640,14 +639,16 @@ proc ok
   `StopIteration.value` оно не выставляется (у исключений нет атрибута
   `value`), и у генератора нет `gi_frame`/`gi_code`/`gi_yieldfrom` и метода
   `__next__`.
-- **Один большой скрипт с сотнями закрытых генераторов упирается в 1 МиБ.**
-  Первая версия проверки была одним файлом на ~330 строк со всеми секциями:
-  `send`/`throw`/`close` и делегация проходили, а цикл на 200 генераторов в
-  том же процессе получал `pythonc: out of memory (brk failed); requested
-  104 bytes` (код 102). Байтовый heap ядра не освобождается, AST большого
-  скрипта — тоже память, поэтому suite разделён на два скрипта (у каждого
-  свой процесс). Для сравнения: тот же цикл на 200 генераторов отдельным
-  маленьким скриптом проходит (в `gen_delegation.py`).
+- **Проверки разделены по процессам из-за 1 МиБ.**
+  Проверка лимита 8 требует 8 × 64 КиБ стеков (512 КиБ) — больше половины
+  bump-heap ядра, а AST скрипта и уже созданные строки тоже занимают память.
+  Первая версия была одним файлом на ~330 строк: `send`/`throw`/`close`
+  проходили, а цикл на 200 генераторов в том же процессе получал
+  `pythonc: out of memory (brk failed); requested 104 bytes` (код 102).
+  Затем лимит переехал в общий скрипт с делегацией, и тот стал падать на
+  девятом стеке (`requested 65536 bytes`). Поэтому suite разделён на три
+  маленьких скрипта, у каждого свой процесс; `gen_fibers.py` — самый
+  короткий, чтобы 512 КиБ стеков гарантированно помещались.
 - Не проверялись живьём: `send`/`throw`/`close` на generator expression
   (hostcheck: `send` отбрасывается, `throw`/`close` поднимаются в `yield`),
   цепочка делегации длиннее двух уровней (hostcheck — два уровня),

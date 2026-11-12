@@ -45,8 +45,8 @@ EOF
 
 One boot, driven by the repository's own driver, commands in the order of
 `tests/live/live07.cmds` (the 0.1.2-0.6.0 regression suite plus the new
-`gen_methods.py`/`gen_delegation.py` for the generator protocol); the kernel
-prints
+`gen_methods.py`/`gen_delegation.py`/`gen_fibers.py` for the generator protocol);
+the kernel prints
 `run: /mnt/pythonc exited with code N` after every program. This script runs
 exactly these steps, including the image build:
 
@@ -59,17 +59,18 @@ exactly these steps, including the image build:
 The OpenSBI/kernel boot banner is dropped; the transcript starts at the first
 shell prompt.
 
-Totals: 42 program runs, 36 exited 0; six exited non-zero on purpose
+Totals: 43 program runs, 37 exited 0; six exited non-zero on purpose
 (`run /mnt/pythonc` without arguments -> 2, and `syntax_error.py`,
 `uncaught.py`, `generator_syntax.py`, `decorator_syntax.py`,
 `yield_from_syntax.py` -> 1). Three `cat` commands show the staged script and
 the two files written by `fileio.py`/`print(file=...)`.
 
 The new markers of this run are `GEN METHODS OK` (`send`, `throw`, `close`,
-`GeneratorExit` handling) and `GEN DELEGATION OK` (the same three methods
-delegated through `yield from`, the delegated `return` value, the 8-suspended
-generator limit and stack recycling); the 0.6.0 marker `YIELD FROM OK` and
-`child: True status: 0` / `proc ok` from `os_proc.py` are still there.
+`GeneratorExit` handling, PEP 479), `GEN DELEGATION OK` (the same three
+methods delegated through `yield from` and the delegated `return` value) and
+`GEN FIBERS OK` (the 8-suspended-generator limit and stack recycling); the
+0.6.0 marker `YIELD FROM OK` and `child: True status: 0` / `proc ok` from
+`os_proc.py` are still there.
 
 ==============================================================================
 ## One boot: the 0.1.2-0.6.0 regression commands and the 0.7.0 generator protocol
