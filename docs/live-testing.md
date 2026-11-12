@@ -731,3 +731,68 @@ DICT SET OK
   огромные сдвиги на границе i64, view после `clear()`/`update()` словаря в
   тех же выражениях (hostcheck покрывает мутацию/удаление после создания
   view).
+
+---
+
+# Живой прогон pythonc 0.9.0 на ядре 0.21.2
+
+Дата: 2026-11-13. Ядро: `pagh-riscv` 0.21.2, коммит
+`a0933ee`, debug ELF,
+`sha256 2e8ae74637fae1d83445b843d887bfcc5ccc371ccd6174e16ff64afee88cc0b1`
+(сборка из git-архива коммита, чекаут ядра не изменялся — как и для 0.7.0/
+0.8.0). QEMU `qemu-system-riscv64` 10.2.2, машина `virt`, 256 MiB, serial
+на Unix-сокете, 64 MiB ext2.
+
+**Одна загрузка**, все команды подряд; драйвер — собственный
+[`../tests/live/qemu_driver.py`](../tests/live/qemu_driver.py), обёртка —
+[`../tests/live/live09.sh`](../tests/live/live09.sh), список команд —
+[`../tests/live/live09.cmds`](../tests/live/live09.cmds). Сырой транскрипт:
+[`live-pythonc-090.txt`](live-pythonc-090.txt).
+
+## Итог 0.9.0
+
+**45 запусков pythonc: 39 с кодом 0, 6 намеренных диагностик** (usage — 2;
+`syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
+`decorator_syntax.py`, `yield_from_syntax.py` — 1), плюс три `cat`.
+
+| Скрипт | Что проверяет | Результат |
+|---|---|---|
+| `keyword_only.py` | `def f(a, *, b)`/`def f(*args, x=1, **kw)`: keyword-only заполняются только по имени, `missing ... keyword-only argument`, голый `*`, чередование default'ов, методы/лямбды/генераторы, `**mapping` на вызове | `KEYWORD ONLY OK`, exit 0 |
+
+Регрессия: все прежние проверки (включая `DICT SET OK`, `GEN METHODS OK`,
+`GEN DELEGATION OK`, `GEN FIBERS OK`, `YIELD FROM OK`, `GENERATORS OK`,
+`os_proc.py` с `child: True status: 0`/`proc ok`) проходят на 0.21.2.
+
+## Ключевые строки 0.9.0
+
+```text
+def: (1, 2, 3) (1, 2, 9)
+positional refused: f() takes 1 positional arguments but 2 were given
+missing: f() missing 1 required keyword-only argument: 'b'
+bare star: 7 -1
+args/kwonly/kwargs: ((1, 2), 5, 1, {'z': 9})
+defaults: (1, 5, 2) (9, 5, 2) (1, 2)
+method: 6 12
+lambda: 7 4
+generator: [0, 1, 2]
+call unpacking: 3
+KEYWORD ONLY OK
+```
+
+## Честные пробелы 0.9.0
+
+- **Только keyword-only часть сигнатур.** Нет позиционных-only параметров
+  (`/` в CPython), нет аннотаций и `__annotations__`, нет перегрузки имён по
+  позиции/ключу за пределами описанной модели; дубликаты имён отвергаются,
+  как в CPython.
+- **Замыкания и defaults** остались прежними: default вычисляется один раз
+  при `def` (Python-семантика), поздних binding'ов нет.
+- **`**mapping` в вызове** по-прежнему требует именно `dict` (не
+  произвольный mapping с `keys()`), а смешанные `f(*a, x=1)`/`f(x=1, *a)`
+  вычисляются в порядке «позиционные, затем именованные», а не строго в
+  исходном порядке — это ограничение вызова, не сигнатуры, оно записано в
+  README и не менялось.
+- Не проверялись живьём: keyword-only параметры в генераторных выражениях
+  (у них нет сигнатуры), очень длинные сигнатуры с `*args`+`**kwargs`+
+  keyword-only в одном `def` (hostcheck покрывает), `staticmethod` с
+  keyword-only (hostcheck: методы и `staticmethod` используют один binder).
