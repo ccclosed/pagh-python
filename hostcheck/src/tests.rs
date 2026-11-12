@@ -1274,6 +1274,88 @@ fn set_operations() -> Result<(), String> {
     Ok(())
 }
 
+fn keyword_only_parameters() -> Result<(), String> {
+    // `*` / `*args` switch the rest of the signature to keyword-only: those
+    // parameters can never be filled positionally, and defaults may be
+    // interleaved freely on the keyword-only side.
+    expect_repr(
+        "def f(a, *, b, c=3):\n    return (a, b, c)\nx = (f(1, b=2), f(1, b=2, c=9))",
+        "x",
+        "((1, 2, 3), (1, 2, 9))",
+    )?;
+    expect_repr(
+        "def f(a, *, b):\n    return (a, b)\ntry:\n    f(1, 2)\nexcept TypeError as error:\n    x = str(error)",
+        "x",
+        "'f() takes 1 positional arguments but 2 were given'",
+    )?;
+    // A missing keyword-only argument is its own error, not a positional one.
+    expect_repr(
+        "def f(a, *, b, c):\n    return (a, b, c)\ntry:\n    f(1)\nexcept TypeError as error:\n    x = str(error)",
+        "x",
+        "'f() missing 2 required keyword-only arguments: \\'b\\' and \\'c\\''",
+    )?;
+    // `*args`, keyword-only parameters and `**kwargs` in one signature;
+    // `**kwargs` collects only the names nothing else claimed.
+    expect_repr(
+        "def h(*args, x, y=1, **kw):\n    return (args, x, y, kw)\nx = (h(1, 2, x=5, z=9), h(x=0), h(1, x=3, y=4))",
+        "x",
+        "(((1, 2), 5, 1, {'z': 9}), ((), 0, 1, {}), ((1,), 3, 4, {}))",
+    )?;
+    // Defaults may be interleaved on the keyword-only side, and a positional
+    // default before the star does not force keyword-only defaults.
+    expect_repr(
+        "def mixed(a=1, *, b, c=2):\n    return (a, b, c)\ndef kworder(*, a=1, b):\n    return (a, b)\nx = (mixed(b=5), mixed(9, b=5), kworder(b=2))",
+        "x",
+        "((1, 5, 2), (9, 5, 2), (1, 2))",
+    )?;
+    // Methods, lambdas and generator functions all get the same binding.
+    expect_repr(
+        "class Box:\n    def __init__(self, *, size=1):\n        self.size = size\n    def scale(self, factor, *, twice=False):\n        if twice:\n            return self.size * factor * 2\n        return self.size * factor\nbox = Box(size=3)\nx = (box.scale(2), box.scale(2, twice=True), (lambda *, q: q)(q=7))",
+        "x",
+        "(6, 12, 7)",
+    )?;
+    expect_repr(
+        "def gen(*, n):\n    i = 0\n    while i < n:\n        yield i\n        i += 1\nx = list(gen(n=3))",
+        "x",
+        "[0, 1, 2]",
+    )?;
+    // A mapping unpacked at the call site fills keyword-only parameters too.
+    expect_repr(
+        "def total(*, a, b):\n    return a + b\nvalues = {'a': 1, 'b': 2}\nx = (total(**values), total(*[], **values))",
+        "x",
+        "(3, 3)",
+    )?;
+    Ok(())
+}
+
+fn keyword_only_errors() -> Result<(), String> {
+    // The parser rejects a bare `*` that names no keyword-only parameter, a
+    // parameter after `**kwargs`, a second `*`/`**`, and duplicate names.
+    expect_syntax_error("def f(*): pass", "named arguments must follow bare *")?;
+    expect_syntax_error("def f(*, **kw): pass", "named arguments must follow bare *")?;
+    expect_syntax_error(
+        "def f(**kw, x): pass",
+        "parameter follows the '**kwargs' parameter",
+    )?;
+    expect_syntax_error(
+        "def f(*a, *b): pass",
+        "'*args' must appear at most once and before '**kwargs'",
+    )?;
+    expect_syntax_error(
+        "def f(a, a): pass",
+        "duplicate argument 'a' in function definition",
+    )?;
+    expect_syntax_error(
+        "def f(*, x, x): pass",
+        "duplicate argument 'x' in function definition",
+    )?;
+    expect_syntax_error(
+        "(lambda a, a: a)",
+        "duplicate argument 'a' in function definition",
+    )?;
+    Ok(())
+}
+
 fn decorators() -> Result<(), String> {
     expect_repr(
         "def double(f):\n    def wrapper(*args, **kwargs):\n        return f(*args, **kwargs) * 2\n    return wrapper\n@double\ndef five():\n    return 5\nx = five()",
@@ -1719,6 +1801,8 @@ fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
         ("dicts", dicts),
         ("dict views", dict_views),
         ("bitwise operators", bitwise_operators),
+        ("keyword-only parameters", keyword_only_parameters),
+        ("keyword-only errors", keyword_only_errors),
         ("set operations", set_operations),
         ("slicing", slicing),
         ("functions", functions),
@@ -1911,6 +1995,16 @@ fn generator_delegation_works() {
 #[test]
 fn dict_views_work() {
     dict_views().unwrap();
+}
+
+#[test]
+fn keyword_only_parameters_work() {
+    keyword_only_parameters().unwrap();
+}
+
+#[test]
+fn keyword_only_errors_work() {
+    keyword_only_errors().unwrap();
 }
 
 #[test]

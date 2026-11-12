@@ -122,8 +122,11 @@ pub enum FunctionBody {
 
 pub struct Function {
     pub name: Rc<str>,
-    /// Parameters with defaults already evaluated at `def` time.
+    /// Positional parameters with defaults already evaluated at `def` time.
     pub params: Vec<(Rc<str>, Option<Value>)>,
+    /// Keyword-only parameters (`def f(*, x)`, `def f(*args, x=1)`), in
+    /// declaration order; they are never filled positionally.
+    pub kwonly: Vec<(Rc<str>, Option<Value>)>,
     /// The `*args` parameter, if the signature has one.
     pub varargs: Option<Rc<str>>,
     /// The `**kwargs` parameter, if the signature has one.
