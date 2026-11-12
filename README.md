@@ -11,49 +11,45 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
 
 ## Статус
 
-**Рабочая версия 0.8.0.** Язык и встроенные функции реализованы настолько,
+**Рабочая версия 0.9.0.** Язык и встроенные функции реализованы настолько,
 насколько это нужно для небольших скриптов на 1 MiB bump-heap ядра pagh.
 
-Новое в 0.8.0 — представления словаря и алгебра множеств (плюс побитовые
-операторы, которыми эта алгебра и записывается):
+Новое в 0.9.0 — keyword-only параметры: сигнатуры функций и лямбд стали
+полными по Python 3.
 
-- **`dict.keys()`, `dict.values()`, `dict.items()` — view-объекты, а не
-  копии-списки.** У них свои типы (`dict_keys`, `dict_values`,
-  `dict_items`), `repr` как в CPython, `len`, итерация, `in` (для keys —
-  хеш-поиск, для values — сравнение значений, для items — пар) и
-  равенство: keys/items сравниваются как множества, values — только по
-  идентичности объекта. View живой: созданный до мутации словаря view видит
-  её. `dict(d.items())` собирает словарь обратно.
-- **Побитовые операторы `& | ^ ~ << >>`** (и `&= |= ^= <<= >>=`): int-семантика
-  в 64 битах, приоритеты как в Python (`|` < `^` < `&` < сдвиги < `+ -`),
-  `~x = -x-1`, `bool`-операнды для `& | ^` дают `bool` (как CPython 3.13+),
-  `>>` арифметический и насыщается, `<<` с переполнением i64 — `OverflowError`,
-  отрицательный счётчик сдвига — `ValueError` (сдвиги за пределы 64 бит —
-  задокументированное сужение: CPython вернул бы произвольное целое).
-- **Алгебра множеств операторами и методами:** `|` объединение, `&`
-  пересечение, `-` разность, `^` симметрическая разность (для двух `set`),
-  in-place `|=`, `&=`, `-=`, `^=` **мутируют сам set**, поэтому алиас видит
-  изменение (как `__ior__` в CPython). Методы пополнены `update`,
-  `difference_update`, `intersection_update`, `symmetric_difference`,
-  `symmetric_difference_update`, `isdisjoint`, `pop`; прежние
-  `union`/`intersection`/`difference`/`issubset`/`issuperset`/`add`/`remove`/
-  `discard`/`copy`/`clear` на месте.
+- **`def f(a, *, b)` и `def f(a, *args, b=2, **kwargs)`.** Всё после `*`
+  или `*args` заполняется только по имени: позиционный аргумент туда не
+  попадает, а пропущенный обязательный параметр даёт
+  `TypeError: f() missing N required keyword-only argument(s): 'b' and 'c'`.
+  Значения по умолчанию на keyword-only стороне можно чередовать с
+  обязательными (`def f(*, a=1, b)`), тогда как для позиционных прежнее
+  правило «параметр без default не может идти после параметра с default»
+  сохранено.
+- **Та же механика работает для лямбд, методов, генераторных функций и
+  `staticmethod`**: параметры связываются одним binder'ом, `self`/`cls` —
+  обычный позиционный параметр, `**kwargs` собирает только те имена,
+  которые не заняла сигнатура.
+- **Парсер отвергает некорректные сигнатуры** как CPython: голый `*` без
+  единого имени после него (`named arguments must follow bare *`), повторный
+  `*`/`**`, параметр после `**kwargs` и повторяющиеся имена
+  (`duplicate argument 'a' in function definition`).
 
-Живая проверка 0.8.0 — на ядре **0.21.2** (`pagh-riscv`, коммит `a0933ee`,
+Живая проверка 0.9.0 — на ядре **0.21.2** (`pagh-riscv`, коммит `a0933ee`,
 QEMU `virt`, ext2 64 MiB, драйвер `tests/live/qemu_driver.py`, одна
-загрузка): полный suite [`tests/live/live08.cmds`](tests/live/live08.cmds) —
-44 запуска, 38 с кодом 0, шесть намеренных диагностик (usage — код 2;
+загрузка): полный suite [`tests/live/live09.cmds`](tests/live/live09.cmds) —
+45 запусков, 39 с кодом 0, шесть намеренных диагностик (usage — код 2;
 `syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
 `decorator_syntax.py`, `yield_from_syntax.py` — код 1), и новая проверка
-[`tests/live/dict_set.py`](tests/live/dict_set.py) печатает `DICT SET OK`
-(живые dict views, побитовые операторы, set-алгебра операторами и методами,
-in-place `|=`/`&=`/`-=`/`^=`). Прежние маркеры `GEN METHODS OK`,
-`GEN DELEGATION OK`, `GEN FIBERS OK`, `YIELD FROM OK`, `GENERATORS OK` и
-`child: True status: 0`/`proc ok` на месте. Сырой транскрипт:
-[`docs/live-pythonc-080.txt`](docs/live-pythonc-080.txt), PASS-лист и детали —
+[`tests/live/keyword_only.py`](tests/live/keyword_only.py) печатает
+`KEYWORD ONLY OK` (def/lambda/методы/генераторы, `*args` + keyword-only +
+`**kwargs`, значения по умолчанию и `missing ... keyword-only argument`).
+Прежние маркеры `DICT SET OK`, `GEN METHODS OK`, `GEN DELEGATION OK`,
+`GEN FIBERS OK`, `YIELD FROM OK` и `child: True status: 0`/`proc ok` на
+месте. Сырой транскрипт:
+[`docs/live-pythonc-090.txt`](docs/live-pythonc-090.txt), PASS-лист и детали —
 [`docs/live-testing.md`](docs/live-testing.md).
 
-Размер release-ELF — 577 960 байт (564 КиБ; лимит ядра — 1 МиБ): профиль
+Размер release-ELF — 582 056 байт (569 КиБ; лимит ядра — 1 МиБ): профиль
 `release` теперь использует `strip = "symbols"`, потому что одна таблица
 символов занимала ~540 КиБ из 1085 КиБ файла 0.4.0. Потоков, сигналов, сети и
 динамического загрузчика в языке нет. Интерпретатор исполняет настоящие
@@ -86,10 +82,10 @@ cargo build --release
 
 ## Запуск в QEMU
 
-Один прогон suite 0.8.0 (сборка, образ, QEMU, транскрипт) — одной командой:
+Один прогон suite 0.9.0 (сборка, образ, QEMU, транскрипт) — одной командой:
 
 ```sh
-sh tests/live/live08.sh
+sh tests/live/live09.sh
 ```
 
 Вручную:
@@ -101,7 +97,7 @@ mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py-live.img 64M
 
 python3 tests/live/qemu_driver.py \
   --disk /tmp/py-live.img \
-  --commands tests/live/live08.cmds \
+  --commands tests/live/live09.cmds \
   --transcript /tmp/live.txt
 ```
 
@@ -169,14 +165,17 @@ not`), цепочки сравнений,
 не поддерживаются (лексер сообщает `SyntaxError`). Встроенного `format()`
 нет, но `str.format` поддерживается (см. ниже).
 
-**`*args` / `**kwargs`:** `def f(a, b=2, *args, **kwargs)` и
+**`*args` / `**kwargs` / keyword-only:** `def f(a, b=2, *args, **kwargs)` и
 `lambda *args, **kwargs: ...`; `*args` собирает лишние позиционные аргументы
 в tuple, `**kwargs` — неиспользованные именованные в dict (порядок
 вставки сохраняется). На месте вызова поддерживаются `f(*iterable)` и
 `f(**mapping)` в любом сочетании, включая несколько распаковок, а также
 проброс `def g(*args, **kwargs): return f(*args, **kwargs)`. Параметры
-keyword-only после `*args` (`def f(*args, x)`) и голый `*` не
-поддерживаются; `*args`/`**kwargs` не могут иметь значений по умолчанию.
+после `*` или `*args` — keyword-only: `def f(a, *, b)` и
+`def f(a, *args, b=2, **kwargs)`; заполняются только по имени, позиционно
+никогда, значения по умолчанию на keyword-only стороне можно чередовать с
+обязательными (`def f(*, a=1, b)`). То же для `lambda *, x: ...`. `*args`/
+`**kwargs` не могут иметь значений по умолчанию.
 
 **lambda:** `lambda args: expr` с параметрами по умолчанию, `*args`/
 `**kwargs`, замыканиями и использованием как значения функции
@@ -413,15 +412,16 @@ CPython).
   значения и вызовы функции совпадают с Python, момент вычисления — нет.
 - **Нет `input()`** (консольный ввод ядра не выдаёт EOF) и нет `sys.stdin`.
 - **Парсер не поддерживает** `yield` внутри `lambda` и
-  comprehension, относительные импорты, keyword-only параметры после `*args`
-  и голый `*`, `match`, walrus `:=`, `async`/`await`, аннотации типов,
+  comprehension, относительные импорты, `match`, walrus `:=`,
+  `async`/`await`, аннотации типов,
   вложенные кавычки в f-string выражениях, вложенные replacement fields в
   `str.format`, встроенный `format()`. `yield` вне функции и `@decorator`
   перед не-определением — `SyntaxError` с отдельным сообщением.
-- **`*args`/`**kwargs`:** нет keyword-only параметров; `**mapping` принимает
-  только `dict` (не произвольный mapping с `keys()`), а `f(*a, x=1)` и
-  `f(x=1, *a)` допустимы, но аргументы вычисляются в порядке «сначала
-  позиционные, затем именованные», а не строго в исходном порядке.
+- **`*args`/`**kwargs`:** keyword-only параметры есть (0.9.0), но `**mapping`
+  принимает только `dict` (не произвольный mapping с `keys()`); `f(*a, x=1)`
+  и `f(x=1, *a)` допустимы, но аргументы вычисляются в порядке «сначала
+  позиционные, затем именованные», а не строго в исходном порядке; дубликаты
+  имён и голый `*` без имён отвергаются парсером.
 - **`del` и присваивание срезу работают**: `del name`, `del list[i]`,
   `del dict[key]`, `del obj.attr`, `del list[a:b]`, а также
   `list[a:b] = iterable` (шаг 1; extended-slice deletion/assignment
@@ -501,19 +501,24 @@ CPython).
 
 ```sh
 cd hostcheck
-cargo test                 # 38 unit-тестов интерпретатора
-cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (38 PASS)
+cargo test                 # 40 unit-тестов интерпретатора
+cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (40 PASS)
 cargo run -- ../tests/live/hello.py
 ```
 
-Проверки 0.8.0: `dict views` (`len`/итерация/`in`/`repr`/имена типов,
+Проверки 0.9.0: `keyword-only parameters` (def/lambda/методы/генераторы,
+`*args`+keyword-only+`**kwargs`, чередование default'ов, сообщения
+`missing ... keyword-only argument`, `**`-распаковка на вызове) и
+`keyword-only errors` (голый `*` без имён, параметр после `**kwargs`,
+повторный `*`/`**`, дубликаты имён) — плюс 38 проверок 0.8.0
+(`dict views` (`len`/итерация/`in`/`repr`/имена типов,
 живость view, равенство keys/items как множеств и values по идентичности,
 `dict(d.items())`, unhashable view), `bitwise operators` (int-семантика,
 приоритеты, `~`, сдвиги с насыщением и ошибками, `bool`-правило,
 augmented-формы, TypeError), `set operations` (`| & - ^`, in-place
 `|= &= -= ^=` с алиасами, `update`-семейство, `symmetric_difference`,
-`isdisjoint`, `pop`, ошибки на пустом set и на не-set операнде) — плюс 35
-проверок 0.7.0 (`generator send` (значение в точке `yield`, `send(None)`,
+`isdisjoint`, `pop`, ошибки на пустом set и на не-set операнде), `bitwise
+operators`) и 35 проверок 0.7.0 (`generator send` (значение в точке `yield`, `send(None)`,
 `TypeError` в незапущенный генератор, `StopIteration` в исчерпанный,
 повторный вход, generator expression), `generator throw` (экземпляр, класс,
 класс + аргументы, необработанное исключение, незапущенный и исчерпанный
@@ -535,22 +540,24 @@ expressions`, `decorators`, `percent format`, `os.path`, `time`, `random` и
 прогон 0.7.0 на ядре 0.21.2 (43 запуска, 37 PASS, 6 намеренных
 диагностик; `GEN METHODS OK`, `GEN DELEGATION OK`, `GEN FIBERS OK`) и
 прогон 0.8.0 на том же ядре (44 запуска, 38 PASS, 6 намеренных
-диагностик; `DICT SET OK`) — PASS-листы и сырые логи:
-[`docs/live-testing.md`](docs/live-testing.md), транскрипты 0.5.0–0.8.0 —
-[`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
+диагностик; `DICT SET OK`) и прогон 0.9.0 на том же ядре (45 запусков,
+39 PASS, 6 намеренных диагностик; `KEYWORD ONLY OK`) — PASS-листы и сырые
+логи: [`docs/live-testing.md`](docs/live-testing.md), транскрипты 0.5.0–0.9.0
+— [`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
 [`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt),
-[`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt) и
-[`docs/live-pythonc-080.txt`](docs/live-pythonc-080.txt), скрипты —
+[`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt),
+[`docs/live-pythonc-080.txt`](docs/live-pythonc-080.txt) и
+[`docs/live-pythonc-090.txt`](docs/live-pythonc-090.txt), скрипты —
 [`tests/live/`](tests/live/).
 
 ## CI
 
 `.github/workflows/ci.yml` чекаутит соседний `pagh-api` (main), ставит
 тулчейн из `rust-toolchain.toml` и гоняет два гейта: `cargo test` в
-`hostcheck` (38 проверок) и `cargo build --release` для
+`hostcheck` (40 проверок) и `cargo build --release` для
 `riscv64gc-unknown-none-elf` с проверкой, что `pythonc` не превышает лимит
 ядра в 1 МиБ. Живой QEMU-прогон в CI намеренно не входит: для него нужны
-ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live08.sh`.
+ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live09.sh`.
 
 ## Устройство
 
