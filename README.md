@@ -27,6 +27,8 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
   которое после этого снова выдало значение, получает
   `RuntimeError: generator ignored GeneratorExit`. `GeneratorExit` наследует
   `BaseException`, как в CPython, поэтому `except Exception` его не ловит.
+  `PEP 479` работает: `StopIteration`, вылетевший из тела, — это
+  `RuntimeError`, а не тихое завершение итератора.
 - **`yield from` делегирует `send`/`throw`/`close`** и вкладывается цепочкой:
   `send` уходит в подгенератор, `throw` поднимается в нём, `close` сначала
   закрывает подгенератор, а затем поднимает `GeneratorExit` во внешнем.
@@ -42,14 +44,15 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
 Живая проверка 0.7.0 — на ядре **0.21.2** (`pagh-riscv`, коммит `a0933ee`,
 QEMU `virt`, ext2 64 MiB, драйвер `tests/live/qemu_driver.py`, одна
 загрузка): полный suite [`tests/live/live07.cmds`](tests/live/live07.cmds) —
-42 запуска, 36 с кодом 0, шесть намеренных диагностик (usage — код 2;
+43 запуска, 37 с кодом 0, шесть намеренных диагностик (usage — код 2;
 `syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
-`decorator_syntax.py`, `yield_from_syntax.py` — код 1), и две новые проверки:
+`decorator_syntax.py`, `yield_from_syntax.py` — код 1), и три новые проверки:
 [`tests/live/gen_methods.py`](tests/live/gen_methods.py) печатает
-`GEN METHODS OK` (`send`/`throw`/`close`, иерархия `GeneratorExit`),
-[`tests/live/gen_delegation.py`](tests/live/gen_delegation.py) — 
-`GEN DELEGATION OK` (делегация трёх методов, значение `return`, лимит 8
-приостановленных генераторов и рецикл стеков). Прежние маркеры
+`GEN METHODS OK` (`send`/`throw`/`close`, иерархия `GeneratorExit`, PEP 479),
+[`tests/live/gen_delegation.py`](tests/live/gen_delegation.py) —
+`GEN DELEGATION OK` (делегация трёх методов и значение `return`),
+[`tests/live/gen_fibers.py`](tests/live/gen_fibers.py) — `GEN FIBERS OK`
+(лимит 8 приостановленных генераторов и рецикл стеков). Прежние маркеры
 `YIELD FROM OK`, `GENERATORS OK` и `child: True status: 0`/`proc ok` на месте.
 Сырой транскрипт:
 [`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt), PASS-лист и детали —
@@ -204,10 +207,18 @@ just-started generator`), в исчерпанный — `StopIteration`; `throw(
 `StopIteration`; `throw` в незапущенный генератор тело не исполняет, а в
 исчерпанный — поднимает переданное исключение в вызывающем (поведение
 CPython 3.13+); `close()` возвращает `None`, `GeneratorExit` можно поймать,
-но если тело после этого снова выдаст значение — `RuntimeError`. Значение
-`return` самого генератора доступно только как значение `yield from`, но не
-через `StopIteration.value` (у исключений этого интерпретатора нет атрибута
-`value`); повторный `next()` после исключения даёт `StopIteration`.
+но если тело после этого снова выдаст значение — `RuntimeError`. `PEP 479`
+реализован: `StopIteration`, вылетевший из тела генератора (в том числе из
+`throw(StopIteration)`), превращается в
+`RuntimeError: generator raised StopIteration`, а не завершает итерацию
+молча. `throw(GeneratorExit)` через `yield from` — особый случай CPython
+`gen_throw`: если подгенератор проглотил `GeneratorExit` и выдал значение —
+`RuntimeError: generator ignored GeneratorExit`, если подгенератор
+завершился — `GeneratorExit` поднимается в точке `yield from` (оба
+поведения проверены). Значение `return` самого генератора доступно только
+как значение `yield from`, но не через `StopIteration.value` (у исключений
+этого интерпретатора нет атрибута `value`); повторный `next()` после
+исключения даёт `StopIteration`.
 
 **Generator expressions:** `(element for target in iterable if cond ...)` —
 ленивый генератор, а не список: поддерживаются несколько `for`/`if`, захват
@@ -428,15 +439,13 @@ dict (`{k: v for k in ...}`), с несколькими `for` и `if`.
   исчерпание (`list(g)`) его освобождают; `finally` такого брошенного
   генератора не исполняется. `send`/`throw`/`close` есть (0.7.0), но с
   задокументированными сужениями: у `throw` нет трёхаргументной формы
-  `(type, value, traceback)`; `PEP 479` не реализован — необработанный
-  `StopIteration` (например, из `throw(StopIteration)`) завершает генератор и
-  выходит как `StopIteration`, а не превращается в `RuntimeError`; через
-  `yield from` делегируется только pagh-генератор — для обычного итератора
-  `send` не-`None` даёт `AttributeError`, а `throw`/`close` поднимаются в
-  точке `yield from`; значение `return` видно только как значение `yield
-  from`, но не как `StopIteration.value`; у генератора нет `gi_frame`/
-  `gi_code`/`gi_yieldfrom` и метода `__next__` (только `send`/`throw`/
-  `close`); генератор нельзя скопировать или сериализовать.
+  `(type, value, traceback)`; через `yield from` делегируется только
+  pagh-генератор — для обычного итератора `send` не-`None` даёт
+  `AttributeError`, а `throw`/`close` поднимаются в точке `yield from`;
+  значение `return` видно только как значение `yield from`, но не как
+  `StopIteration.value`; у генератора нет `gi_frame`/`gi_code`/
+  `gi_yieldfrom` и метода `__next__` (только `send`/`throw`/`close`);
+  генератор нельзя скопировать или сериализовать.
 - **Рекурсия упирается в стек, а не в константу.** `RECURSION_LIMIT = 56`
   кадров недостижим в этой сборке: Rust-кадры интерпретатора стоят несколько
   КиБ на Python-вызов, поэтому 64 КиБ стека процесса хватает примерно на
@@ -492,8 +501,9 @@ expressions`, `decorators`, `percent format`, `os.path`, `time`, `random` и
 Живой QEMU-прогон suite 0.1.2 (30 PASS), отдельные прогоны `*args`/`**kwargs`
 и `str.format` (0.4.0), прогон 0.5.0 на ядре 0.19.0, полный прогон 0.6.0 на
 ядре 0.21.0 (40 запусков, 34 PASS, 6 намеренных диагностик; `YIELD FROM OK`)
-и прогон 0.7.0 на ядре 0.21.2 (42 запуска, 36 PASS, 6 намеренных
-диагностик; `GEN METHODS OK`, `GEN DELEGATION OK`) — PASS-листы и сырые
+и прогон 0.7.0 на ядре 0.21.2 (43 запуска, 37 PASS, 6 намеренных
+диагностик; `GEN METHODS OK`, `GEN DELEGATION OK`, `GEN FIBERS OK`) —
+PASS-листы и сырые
 логи: [`docs/live-testing.md`](docs/live-testing.md), транскрипты 0.5.0,
 0.6.0 и 0.7.0 — [`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
 [`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt) и
