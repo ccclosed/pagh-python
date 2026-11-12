@@ -1,0 +1,418 @@
+Serial transcript of the pythonc 0.8.0 live run.
+
+Kernel: /tmp/pagh-kernel-a0933ee/target/riscv64gc-unknown-none-elf/debug/pagh (pagh-riscv 0.21.2), sha256 2e8ae74637fae1d83445b843d887bfcc5ccc371ccd6174e16ff64afee88cc0b1.
+QEMU `qemu-system-riscv64` 10.2.2, machine `virt`, 256 MiB, serial on a Unix
+socket, no display, virtio-blk. Disk: 64 MiB ext2 image built on the host with
+`truncate -s 64M` + `mke2fs -q -t ext2 -F -b 4096 -d <rootfs>`; the rootfs
+contains `pythonc` (release, 577960 bytes, sha256 6ceb205fd0cb87914ca668f7b79f3235258c8f07273ac834dea514d3a119ebd9) and every
+`tests/live/*.py`.
+
+One boot, driven by the repository's own driver, commands in the order of
+`tests/live/live08.cmds` (the 0.1.2-0.6.0 regression suite plus the new
+`gen_methods.py`/`gen_delegation.py`/`gen_fibers.py` for the generator protocol);
+the kernel prints
+`run: /mnt/pythonc exited with code N` after every program. This script runs
+exactly these steps, including the image build:
+
+    python3 tests/live/qemu_driver.py \
+        --kernel <kernel ELF> \
+        --disk /tmp/py-live-0.8.0.img \
+        --commands tests/live/live08.cmds \
+        --transcript <raw serial log>
+
+The OpenSBI/kernel boot banner is dropped; the transcript starts at the first
+shell prompt.
+
+Totals: 44 program runs, 38 exited 0; six exited non-zero on purpose
+(`run /mnt/pythonc` without arguments -> 2, and `syntax_error.py`,
+`uncaught.py`, `generator_syntax.py`, `decorator_syntax.py`,
+`yield_from_syntax.py` -> 1). Three `cat` commands show the staged script and
+the two files written by `fileio.py`/`print(file=...)`.
+
+The new marker of this run is `DICT SET OK` (live `dict_keys`/`dict_values`/
+`dict_items` views, the bitwise operators `& | ^ ~ << >>` and set algebra
+including in-place `|=`/`&=`/`-=`/`^=`); the 0.7.0 markers `GEN METHODS OK`,
+`GEN DELEGATION OK`, `GEN FIBERS OK`, the 0.6.0 marker `YIELD FROM OK` and
+`child: True status: 0` / `proc ok` from `os_proc.py` are still there.
+
+==============================================================================
+## One boot: the 0.1.2-0.7.0 regression commands and the 0.8.0 dict/set features
+==============================================================================
+
+pagh:rv64> cat /mnt/hello.py
+print("hello from pagh-python")
+print("arithmetic:", 1 + 2 * 3, 7 // 2, 7 % 3, 2 ** 10)
+print("builtins:", len("hello"), abs(-7), max(3, 1, 2), min([9, 4, 6]))
+print("sep/end:", "a", "b", "c", sep="-", end=".\n")
+pagh:rv64> run /mnt/pythonc /mnt/hello.py
+hello from pagh-python
+arithmetic: 7 3 1 1024
+builtins: 5 7 3 4
+sep/end:-a-b-c.
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/functions.py
+fact(6) = 720
+fib(10) = 55
+nested calls: 16
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/collections_demo.py
+list: [2, 3, 4, 5, 6] pop: 1 slice: [3, 4, 5] reversed: [6, 5, 4, 3, 2]
+dict: {'apple': 2, 'pear': 1, 'plum': 3} keys: ['apple', 'pear', 'plum']
+get: 0 items: dict_items([('apple', 2), ('pear', 1), ('plum', 3)])
+str: hello, python world
+split: ['a', 'b', '', 'c'] join: x-y-z
+find: 2 count: 2
+replace: bonona title: Hello World
+starts/ends: True True
+slices: bcde ace Hello
+enumerate 0 a
+enumerate 1 b
+zip 1 3
+zip 2 4
+min/max/sum: 2 6 20
+sorted: [1, 2, 5, 9] ['b', 'a']
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/classes.py
+cat makes a sound
+Rex barks
+Animal(cat) isinstance: True False
+counter: 1 2 3
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/exceptions.py
+caught ValueError: bad value
+caught ZeroDivisionError
+propagated: from fail
+try body
+finally runs
+caught KeyError: 'key'
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/fileio.py
+file lines: ['first line', 'second line', 'third line']
+readline: first line
+rest: second line|third line|
+run: /mnt/pythonc exited with code 0
+pagh:rv64> cat /mnt/py.txt
+first line
+second line
+third line
+pagh:rv64> cat /mnt/print.txt
+print to file
+pagh:rv64> run /mnt/pythonc /mnt/import_main.py
+mymod.answer = 42
+mymod.double(4) = 8
+from-import double(21) = 42
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/argv.py one two
+script: /mnt/argv.py
+args: ['one', 'two']
+count: 3
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc -c print(6*7)
+42
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc
+usage: pythonc [-c code | script.py] [args...]
+
+Runs the Python subset implemented by this interpreter. There is no
+CPython standard library, no threads, no processes and no network.
+run: /mnt/pythonc exited with code 2
+pagh:rv64> run /mnt/pythonc /mnt/syntax_error.py
+/mnt/syntax_error.py:2:5: SyntaxError: expected a parameter name, found 'return'
+run: /mnt/pythonc exited with code 1
+pagh:rv64> run /mnt/pythonc /mnt/uncaught.py
+before
+Traceback (most recent call last):
+  File "/mnt/uncaught.py", line 8, in <module>
+  File "/mnt/uncaught.py", line 5, in middle
+  File "/mnt/uncaught.py", line 2, in divide
+ZeroDivisionError: integer division or modulo by zero
+run: /mnt/pythonc exited with code 1
+pagh:rv64> run /mnt/pythonc /mnt/float_arithmetic.py
+literals: 1.5 0.5 1000.0 0.015 1.0 10.5
+mixed: 3.5 5.0 3.75 -1.5 1.5
+float arithmetic ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/float_division.py
+true division: 0.5 3.5 -3.5
+floor/mod: 3.0 -4.0 1.5 0.5 -0.5
+caught integer division by zero
+caught float floor division by zero
+caught float modulo by zero
+float division ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/float_format.py
+str: 1.0 1.5 1e+20 1e-07 1.5e-07
+repr: 1.0 0.30000000000000004 -0.0
+float formatting ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/float_compare.py
+mixed compare: True True True
+nan compare: False False
+float comparison ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/float_math.py
+pi/e: 3.141592653589793 2.718281828459045
+sqrt/pow: 1.4142135623730951 1.4142135623730951
+trig: 0.8414709848078965 0.5403023058681397 1.5574077246549025
+log/exp: 1.0 3.0 2.7182818284590446
+rounding: -3 -2 -2 2.5
+float math ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/float_errors.py
+typed float errors: 6
+float errors ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc -c print(1/2)
+0.5
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/lambda_map.py
+lambda defaults: 15 16
+lambda map: [2, 4, 6]
+sorted key: ['os', 'pagh', 'interpreter']
+sort key: [('a', 1), ('b', 2), ('c', 3)]
+lambda ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/with_open.py
+with file: alpha|beta|
+enter first
+enter second
+body first second
+exit second (None, None)
+exit first (None, None)
+events: [(None, None)] [(None, None)]
+suppressed: ('ValueError', 'suppressed')
+file exit propagates: not suppressed
+with ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/sets_demo.py
+literal: {3, 1, 2} len: 3 in: True
+add/remove: [2, 3, 4]
+union: [1, 2, 3, 4]
+intersection: [3]
+difference: [1, 2]
+constructor: {1, 2, 3}
+set comp: [0, 4, 16]
+dict comp: {'0': 0, '1': 10, '2': 20}
+iter 1
+iter 3
+iter 5
+sets ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/bytes_demo.py
+literal: b'pagh' len: 4 index: 112 slice: b'ag'
+escaped: b'line\nA\xff'
+encode/decode: b'hello' hello
+bytes(): b'ABC' b'\x00\x00'
+hex: 414243
+bytes ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/bytes_file.py
+binary write: 7 bytes
+binary read: b'\x00\x01pagh\xff' len: 7
+binary file ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/fstrings_demo.py
+hello pagh
+pi=3.14 count=42
+repr='pagh' width=   42
+braces {ok}
+fstrings ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/os_demo.py
+listdir: ['file.txt', 'nested']
+stat: 8 file True False
+rename: ['nested', 'renamed.txt']
+cwd stat: dir True
+pid: True True
+cwd: /
+os ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/json_demo.py
+dumps: {"name": "pagh", "ok": true, "count": 3, "ratio": 1.5, "items": [1, 2, null, "x"]}
+loads: {'name': 'pagh', 'ok': True, 'count': 3, 'ratio': 1.5, 'items': [1, 2, None, 'x']}
+escaped: {"quote": "he said \"hi\"", "newline": "a\nb"}
+json ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/os_proc.py
+hello from pagh-python
+arithmetic: 7 3 1 1024
+builtins: 5 7 3 4
+sep/end:-a-b-c.
+child: True status: 0
+proc ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/star_args.py
+collect: ((1, 'two', True), {'name': 'pagh', 'n': 3})
+mixed-default: (1, 20, (), {})
+mixed-full: (1, 2, (3, 4), {'z': 5})
+star-list: 30
+star-dict: 70
+both: 3
+forward: (1, 2, (3, 4), {'z': 5})
+lambda: ((7,), {'k': 8})
+STARARGS OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/str_format.py
+auto: 2 + 3 = 5
+manual: b/a/b
+named: pagh-7
+escape: {literal} { }
+spec: 0007 3.142    ok
+index: one
+key: v
+attr: 2,9
+conversion: 'hi'
+FORMAT OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/generators.py
+list: [0, 1, 2, 3]
+next: 0 1 2
+stopiteration: True
+for/else: 110
+lazy: [0, 1, 2, 3, 4]
+yield expr: first None
+finally: ['a', 'b'] ['cleanup']
+raise: generator failed
+nested: [10, 20]
+identity: True generator
+reentrant: generator already executing
+arity: TypeError
+recycled: 1200
+GENERATORS OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/genexpr.py
+squares: [0, 1, 4, 9, 16]
+filtered sum: 20
+type: generator
+nested loops: [(0, 0), (0, 1), (1, 0), (1, 1)]
+lazy: [0, 2, 4, 6]
+bare in call: 18
+closure: [0, 1, 2]
+single pass: [0, 1, 2] []
+GENEXPR OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/decorators.py
+double: 10
+order: value ['top', 'bottom']
+replaced: 42
+signature: 3 6
+method: 6
+generator decorator: [0, 1, 2]
+staticmethod: 3 7 10
+class decorator: decorated
+DECORATORS OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/percent_format.py
+basic: pagh and 42
+widths:    42|42   |00042
+floats: 3.14|   3.142|+7
+radix: ff FF 10 101
+repr: 'quo\'te' 5
+percent: 50%
+char: Ab
+single: [1, 2] | (1, 2)
+scientific: 1.234568e+04 1.23e-05 2.2
+signs: +5  5
+nested: 3
+bad type: type
+missing arg: missing
+extra arg: extra
+bad conversion: character
+modulo: 1 1.5
+PERCENT OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/stdlib_modules.py
+join: a/b/c /root/x /abs/b
+split: test.py /mnt x 
+sep: /
+stat probes: /mnt/stdlib_modules.py True False
+sleep: 0.05000000000000071 True
+clocks: True True
+negative sleep: rejected
+deterministic: True [0.8202466665411988, 0.9282901565044228, 0.08934959275158794]
+unit interval: True
+randint: 1 6 200
+degenerate randint: [5, 5, 5, 5]
+choice: b
+shuffle: [5, 1, 3, 4, 2] [1, 2, 3, 4, 5]
+uniform: 1.2585765664404798
+empty choice: IndexError
+STDLIB OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/stack_depth.py
+shallow plain recursion: 1 4 8
+max depth inside a generator: 9
+generator failure: generator stack exhausted (6008 bytes left of 64 KiB)
+fiber stack KiB: 64
+recursion ok
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/yield_from.py
+outer: ['before', 0, 1, 2, 'after']
+range: [0, 1, 2] [7, 8] [0, 1, 4] ['a', 'b']
+value: [1, 2, None]
+nested: [1, 2]
+lazy: [0, 1, 2, 3, 4]
+finally: ['start', 1, 2, 'end'] ['cleanup']
+non-iterable: TypeError True
+consumed once: [1, 2] []
+recycled: 600
+YIELD FROM OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/gen_methods.py
+send: ready one True
+send fresh: can't send non-None value to a just-started generator
+send driven: 0 2 5
+send exhausted: StopIteration
+throw instance: value:boom
+throw class / class+args: key, value:msg
+throw user class: mine:custom mine:made
+throw escapes: escaping
+throw unstarted: body not run
+pep479: generator raised StopIteration
+close finally: ['cleanup']
+close unstarted: nothing ran
+close ignored: generator ignored GeneratorExit
+close: GeneratorExit is BaseException
+GEN METHODS OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/gen_delegation.py
+delegate send: sub return
+delegate throw: handled bad
+delegate close: ['inner', 'outer']
+delegate return value: answer
+delegate nested: deep level1 down
+delegate plain send: AttributeError
+delegate plain throw: caught plain
+delegate throw GeneratorExit: generator ignored GeneratorExit
+delegate throw GeneratorExit return: GeneratorExit
+delegate return once: None
+GEN DELEGATION OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/gen_fibers.py
+recycled: 200 generators
+limit: cannot start a generator: 8 are already suspended (64 KiB each)
+GEN FIBERS OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/dict_set.py
+views: dict_keys(['a', 'b']) dict_values([1, 2]) dict_items([('a', 1), ('b', 2)])
+views are live: dict_keys(['b', 'c'])
+views round-trip: dict(items) and for-over-values
+bitwise: 2 7 5 -7 16 8
+bitwise errors: integer left shift overflow | negative shift count | unsupported operand type(s) for &: 'str' and 'int'
+set operators: {1, 2, 3, 4} {3} {1, 2} {1, 2, 4}
+in-place set operators: aliases see the update
+set update methods: {2, 6}
+symmetric_difference/isdisjoint/subset/popping worked
+set errors: pop from an empty set | unsupported operand type(s) for |: 'set' and 'list'
+DICT SET OK
+run: /mnt/pythonc exited with code 0
+pagh:rv64> run /mnt/pythonc /mnt/generator_syntax.py
+/mnt/generator_syntax.py:3:7: SyntaxError: 'yield' outside a function: only a def body can be a generator
+run: /mnt/pythonc exited with code 1
+pagh:rv64> run /mnt/pythonc /mnt/decorator_syntax.py
+/mnt/decorator_syntax.py:4:1: SyntaxError: only a function or class definition can be decorated, found 'x'
+run: /mnt/pythonc exited with code 1
+pagh:rv64> run /mnt/pythonc /mnt/yield_from_syntax.py
+/mnt/yield_from_syntax.py:3:12: SyntaxError: 'yield' outside a function: only a def body can be a generator
+run: /mnt/pythonc exited with code 1
+pagh:rv64> 
