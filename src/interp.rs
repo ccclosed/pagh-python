@@ -1300,6 +1300,21 @@ impl Interp {
                 };
                 self.fiber_yield(produced)
             }
+            Expr::YieldFrom(iterable) => {
+                // `yield from` is the iteration protocol in this interpreter:
+                // the operand is evaluated once, then every value it produces
+                // is yielded on to the resumer. A delegated generator is
+                // resumed through the same nesting path as a `for` loop (the
+                // outer fiber resumes the inner one), so laziness and the
+                // 8-suspended-fiber limit are unchanged. The expression
+                // evaluates to `None`: there is no `return` value to capture.
+                let iterable = self.eval_expr(iterable, env)?;
+                let iterator = self.make_iterator(iterable)?;
+                while let Some(item) = self.next_from_iterator(&iterator)? {
+                    self.fiber_yield(item)?;
+                }
+                Ok(Value::None)
+            }
             Expr::GeneratorExp { element, generators } => {
                 self.make_generator_expression(element, generators, env)
             }
@@ -4076,7 +4091,10 @@ impl Interp {
                 if let Some(method) = class_lookup(&instance.class, "__iter__") {
                     let bound = bind_method(method, value.clone())?;
                     let produced = self.call_value(bound, ArgList::new(), Vec::new())?;
-                    if matches!(produced, Value::Iterator(_)) {
+                    // A generator *is* an iterator (`iter(g) is g` above), and
+                    // a generator function is the natural way to write
+                    // `__iter__`, so both values are accepted here.
+                    if matches!(produced, Value::Iterator(_) | Value::Generator(_)) {
                         return Ok(produced);
                     }
                     return Err(self.err(

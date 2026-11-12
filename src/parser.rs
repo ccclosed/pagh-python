@@ -1103,6 +1103,7 @@ impl Parser {
                 // expression is optional when it is the only argument.
                 if args.is_empty() && self.check_kw(Kw::For) {
                     let generators = self.parse_comp_generators()?;
+                    self.check_comprehension_element(&value)?;
                     self.expect_op(Op::RParen, "after the generator expression")?;
                     return Ok(Expr::Call {
                         function: Box::new(function),
@@ -1260,6 +1261,7 @@ impl Parser {
                 // before the comma, because `(x for x in y)` has neither.
                 if self.check_kw(Kw::For) {
                     let generators = self.parse_comp_generators()?;
+                    self.check_comprehension_element(&first)?;
                     self.expect_op(Op::RParen, "after the generator expression")?;
                     return Ok(Expr::GeneratorExp {
                         element: Box::new(first),
@@ -1311,6 +1313,7 @@ impl Parser {
                 let first = self.parse_expr()?;
                 if self.check_kw(Kw::For) {
                     let generators = self.parse_comp_generators()?;
+                    self.check_comprehension_element(&first)?;
                     self.expect_op(Op::RBrace, "after the set comprehension")?;
                     return Ok(Expr::SetComp {
                         element: Box::new(first),
@@ -1321,6 +1324,8 @@ impl Parser {
                     let value = self.parse_expr()?;
                     if self.check_kw(Kw::For) {
                         let generators = self.parse_comp_generators()?;
+                        self.check_comprehension_element(&first)?;
+                        self.check_comprehension_element(&value)?;
                         self.expect_op(Op::RBrace, "after the dict comprehension")?;
                         return Ok(Expr::DictComp {
                             key: Box::new(first),
@@ -1366,19 +1371,16 @@ impl Parser {
         }
     }
 
-    /// `yield` / `yield value` / `yield a, b`.
+    /// `yield` / `yield value` / `yield a, b` / `yield from iterable`.
     ///
-    /// The operand is a testlist, so `yield 1, 2` yields a tuple, and the
-    /// conditional-expression rule is inherited from `parse_expr`
-    /// (`yield 1 if flag else 2` yields the conditional's value). `yield from`
-    /// is not implemented and says so.
+    /// The operand of a plain `yield` is a testlist, so `yield 1, 2` yields a
+    /// tuple, and the conditional-expression rule is inherited from
+    /// `parse_expr` (`yield 1 if flag else 2` yields the conditional's value).
+    /// `yield from` takes a single expression, matching Python's grammar:
+    /// `yield from a, b` is a syntax error, not a delegation of a tuple.
     fn parse_yield(&mut self) -> Result<Expr, SyntaxError> {
         self.expect_kw(Kw::Yield, "at the start of a yield expression")?;
-        if self.check_kw(Kw::From) {
-            return self.error(String::from(
-                "'yield from' is not supported; use a for loop with yield",
-            ));
-        }
+        let delegating = self.eat_kw(Kw::From);
         if self.comprehension_depth > 0 {
             return self.error(String::from("'yield' inside a comprehension is not supported"));
         }
@@ -1389,6 +1391,10 @@ impl Parser {
                     "'yield' outside a function: only a def body can be a generator",
                 ))
             }
+        }
+        if delegating {
+            let value = self.parse_expr()?;
+            return Ok(Expr::YieldFrom(Box::new(value)));
         }
         if self.at_yield_end() {
             return Ok(Expr::Yield(None));
@@ -1404,11 +1410,28 @@ impl Parser {
 
     fn parse_list_comprehension(&mut self, element: Expr) -> Result<Expr, SyntaxError> {
         let generators = self.parse_comp_generators()?;
+        self.check_comprehension_element(&element)?;
         self.expect_op(Op::RBracket, "after the comprehension")?;
         Ok(Expr::ListComp {
             element: Box::new(element),
             generators,
         })
+    }
+
+    /// Reject a `yield` in the element (or the dict key/value) of a
+    /// comprehension.
+    ///
+    /// The element is parsed *before* the `for` that turns the expression into
+    /// a comprehension, so the `comprehension_depth` guard in [`Self::parse_yield`]
+    /// cannot see it; the finished tree is checked once the clause is known.
+    /// CPython refuses `yield` in a comprehension at compile time as well.
+    fn check_comprehension_element(&self, expression: &Expr) -> Result<(), SyntaxError> {
+        if contains_yield(expression) {
+            return self.error(String::from(
+                "'yield' inside a comprehension is not supported",
+            ));
+        }
+        Ok(())
     }
 
     fn parse_comp_generators(&mut self) -> Result<Vec<CompGen>, SyntaxError> {
@@ -1641,6 +1664,94 @@ impl Parser {
 /// Parse the source text of one f-string expression. Positions in errors are
 /// reported at the f-string's opening token: the fragment is a separate token
 /// stream, and its offsets would otherwise look like line 1.
+/// True when `expression` yields in the function scope the parser is in.
+///
+/// A nested `lambda` has its own scope: its `yield` is rejected by
+/// [`Parser::parse_lambda`] with a separate message, and is not counted here.
+/// Used to catch a `yield` in a comprehension's element, which is parsed
+/// before the `for` that makes the expression a comprehension.
+fn contains_yield(expression: &Expr) -> bool {
+    fn in_args(args: &[CallArg]) -> bool {
+        args.iter().any(|argument| match argument {
+            CallArg::Value(value) | CallArg::Unpack(value) => contains_yield(value),
+        })
+    }
+    fn in_keywords(keywords: &[CallKeyword]) -> bool {
+        keywords.iter().any(|keyword| match keyword {
+            CallKeyword::Named(_, value) | CallKeyword::Unpack(value) => contains_yield(value),
+        })
+    }
+    fn in_generators(generators: &[CompGen]) -> bool {
+        generators.iter().any(|generator| {
+            contains_yield(&generator.target)
+                || contains_yield(&generator.iterable)
+                || generator.conditions.iter().any(contains_yield)
+        })
+    }
+    match expression {
+        Expr::Yield(_) | Expr::YieldFrom(_) => true,
+        Expr::List(items) | Expr::Tuple(items) | Expr::Set(items) => {
+            items.iter().any(contains_yield)
+        }
+        Expr::Dict(entries) => entries
+            .iter()
+            .any(|(key, value)| contains_yield(key) || contains_yield(value)),
+        Expr::FString(parts) => parts.iter().any(|part| match part {
+            FStringPart::Text(_) => false,
+            FStringPart::Value { expression, .. } => contains_yield(expression),
+        }),
+        // A lambda introduces a new function scope (and is checked on its own).
+        Expr::Lambda { .. } => false,
+        Expr::GeneratorExp { element, generators }
+        | Expr::ListComp { element, generators }
+        | Expr::SetComp { element, generators } => {
+            contains_yield(element) || in_generators(generators)
+        }
+        Expr::DictComp {
+            key,
+            value,
+            generators,
+        } => contains_yield(key) || contains_yield(value) || in_generators(generators),
+        Expr::Unary { value, .. } => contains_yield(value),
+        Expr::Binary { left, right, .. } => contains_yield(left) || contains_yield(right),
+        Expr::BoolOp { values, .. } => values.iter().any(contains_yield),
+        Expr::Compare {
+            left, comparators, ..
+        } => contains_yield(left) || comparators.iter().any(contains_yield),
+        Expr::Call {
+            function,
+            args,
+            kwargs,
+        } => contains_yield(function) || in_args(args) || in_keywords(kwargs),
+        Expr::Index { target, index } => contains_yield(target) || contains_yield(index),
+        Expr::Slice {
+            target,
+            start,
+            stop,
+            step,
+        } => {
+            contains_yield(target)
+                || start.as_deref().is_some_and(contains_yield)
+                || stop.as_deref().is_some_and(contains_yield)
+                || step.as_deref().is_some_and(contains_yield)
+        }
+        Expr::Attribute { target, .. } => contains_yield(target),
+        Expr::IfExpr {
+            body,
+            condition,
+            otherwise,
+        } => contains_yield(body) || contains_yield(condition) || contains_yield(otherwise),
+        Expr::None
+        | Expr::True
+        | Expr::False
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Name(_)
+        | Expr::Bytes(_) => false,
+    }
+}
+
 fn parse_expression_fragment(text: &str, line: u32, column: u32) -> Result<Expr, SyntaxError> {
     let tokens = tokenize(text).map_err(|error| {
         SyntaxError::new(
