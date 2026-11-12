@@ -22,7 +22,8 @@ use crate::interp::{ArgList, Interp};
 use crate::platform;
 use crate::value::{
     self, dict_find, dict_get, dict_set, hex_text, is_same, range_length, set_find, set_insert,
-    values_equal, BuiltinId, BuiltinType, BuiltinValue, FileValue, IterState, RangeValue, Value,
+    values_equal, BuiltinId, BuiltinType, BuiltinValue, FileValue, Generator, IterState,
+    RangeValue, Value,
 };
 
 // ── dispatch ───────────────────────────────────────────────────────────────
@@ -1917,6 +1918,68 @@ fn file_receiver(
     }
 }
 
+fn generator_receiver(
+    interp: &Interp,
+    builtin: &BuiltinValue,
+    function: &str,
+) -> PyResult<Rc<RefCell<Generator>>> {
+    match receiver(interp, builtin, function)? {
+        Value::Generator(generator) => Ok(generator.clone()),
+        other => Err(interp.err(
+            "TypeError",
+            format!(
+                "{}() receiver must be a generator, not '{}'",
+                function,
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+// ── generator methods (send/throw/close) ──────────────────────────────────
+//
+// The machinery (resuming a fiber with a value or an injected exception) lives
+// in `interp.rs` next to `generator_resume`; these three only validate
+// arguments and build the exception `throw` was asked for.
+
+fn generator_send(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "send")?;
+    expect_args(interp, args, "send", 1, 1)?;
+    let generator = generator_receiver(interp, builtin, "send")?;
+    let value = argument(interp, args, 0, "send")?.clone();
+    interp.generator_send(&generator, value)
+}
+
+fn generator_throw(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "throw")?;
+    let generator = generator_receiver(interp, builtin, "throw")?;
+    let error = interp.exception_from_throw_args(args)?;
+    interp.generator_throw(&generator, error)
+}
+
+fn generator_close(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "close")?;
+    expect_args(interp, args, "close", 0, 0)?;
+    let generator = generator_receiver(interp, builtin, "close")?;
+    interp.generator_close(&generator)?;
+    Ok(Value::None)
+}
+
 fn file_error(interp: &Interp, message: String) -> crate::error::PyError {
     let name = if message.starts_with("I/O operation on closed file") {
         "ValueError"
@@ -1949,6 +2012,9 @@ fn call_method(
         BuiltinId::StrIsdigit => str_isdigit(interp, builtin, args, kwargs),
         BuiltinId::StrTitle => str_title(interp, builtin, args, kwargs),
         BuiltinId::StrSplitlines => str_splitlines(interp, builtin, args, kwargs),
+        BuiltinId::GenSend => generator_send(interp, builtin, args, kwargs),
+        BuiltinId::GenThrow => generator_throw(interp, builtin, args, kwargs),
+        BuiltinId::GenClose => generator_close(interp, builtin, args, kwargs),
         BuiltinId::StrFormat => str_format(interp, builtin, args, kwargs),
         BuiltinId::ListAppend => list_append(interp, builtin, args, kwargs),
         BuiltinId::ListExtend => list_extend(interp, builtin, args, kwargs),

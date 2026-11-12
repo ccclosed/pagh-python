@@ -435,15 +435,42 @@ pub struct Generator {
     pub fiber: Option<Box<crate::fiber::Fiber>>,
     /// True between `next()` and the matching `yield`.
     pub running: bool,
+    /// True once the body has actually started on its fiber. `send()` must
+    /// refuse a non-None value before that, and `throw()`/`close()` must not
+    /// run the body at all: CPython raises/returns in the caller instead.
+    pub started: bool,
     /// True once the body returned or raised; the fiber is never resumed.
     pub finished: bool,
     /// The exception that ended the body, re-raised to the caller once.
     pub failed: Option<crate::error::PyError>,
-    /// The value of the last `yield`, or the body's `return` value.
+    /// The value the body last yielded. The body's `return` value is kept
+    /// apart in `returned`.
     pub yielded: Option<Value>,
     /// The value a `yield` expression evaluates to when the generator is
-    /// resumed (always `None` today: `send()` is not implemented).
+    /// resumed: `None` for `next()`, the argument for `send(value)`.
     pub sent: Value,
+    /// What the resumer injected at the suspended `yield`: `throw()` and
+    /// `close()` write it before the switch, `fiber_yield` reads it after the
+    /// switch and raises it inside the body.
+    pub pending: Option<GeneratorPending>,
+    /// The body's `return` value. `yield from` exposes it as the value of the
+    /// delegated expression, the way CPython exposes it through
+    /// `StopIteration.value` (the interpreter itself has no exception
+    /// attributes, so it is kept here instead of on the StopIteration object).
+    pub returned: Option<Value>,
+}
+
+/// What the resumer asked the suspended generator to do when it resumes.
+///
+/// Kept apart from [`Generator::sent`] because `throw`/`close` do not deliver
+/// a value: they raise an exception at the `yield` point.
+pub enum GeneratorPending {
+    /// `throw(error)`: raise `error` at the suspended `yield`.
+    Throw(crate::error::PyError),
+    /// `close()`: raise `GeneratorExit` at the suspended `yield`, closing a
+    /// delegated generator first (CPython calls `delegate.close()` in
+    /// `gen_close`, which is not the same as `throw(GeneratorExit)`).
+    Close,
 }
 
 pub struct RangeValue {
@@ -614,6 +641,10 @@ pub enum BuiltinId {
     StaticMethod,
     /// Calling such a wrapper: forwards to the wrapped function unchanged.
     StaticMethodCall,
+    // generator methods
+    GenSend,
+    GenThrow,
+    GenClose,
     // os module
     OsGetpid,
     OsGetppid,
@@ -706,6 +737,9 @@ pub fn builtin_name(id: BuiltinId) -> &'static str {
         BuiltinId::Hex => "hex",
         BuiltinId::Id => "id",
         BuiltinId::StaticMethod | BuiltinId::StaticMethodCall => "staticmethod",
+        BuiltinId::GenSend => "send",
+        BuiltinId::GenThrow => "throw",
+        BuiltinId::GenClose => "close",
         BuiltinId::MathSqrt => "sqrt",
         BuiltinId::MathFloor => "floor",
         BuiltinId::MathCeil => "ceil",
