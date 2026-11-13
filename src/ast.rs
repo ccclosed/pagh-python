@@ -114,8 +114,14 @@ pub struct Param {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ParamKind {
     Normal,
+    /// `def f(*args, x)`: a parameter after `*args`/bare `*`. It can only be
+    /// filled by name, never positionally.
+    KeywordOnly,
     VarArgs,
     KwArgs,
+    /// The bare `*` marker itself: no binding, it only switches the rest of
+    /// the signature to keyword-only.
+    BareStar,
 }
 
 #[derive(Clone)]

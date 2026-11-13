@@ -712,6 +712,46 @@ impl Interp {
         }
     }
 
+    /// Evaluate a signature's parameters at `def`/`lambda` time (defaults are
+    /// computed once, here) and split them into the four groups the binder
+    /// needs: positional, keyword-only, `*args` and `**kwargs`. The bare `*`
+    /// marker binds nothing.
+    #[allow(clippy::type_complexity)]
+    fn collect_params(
+        &mut self,
+        params: &[Param],
+        env: &EnvRef,
+    ) -> PyResult<(
+        Vec<(Name, Option<Value>)>,
+        Vec<(Name, Option<Value>)>,
+        Option<Name>,
+        Option<Name>,
+    )> {
+        let mut positional = Vec::with_capacity(params.len());
+        let mut kwonly = Vec::new();
+        let mut varargs = None;
+        let mut kwargs = None;
+        for parameter in params {
+            match parameter.kind {
+                ParamKind::Normal | ParamKind::KeywordOnly => {
+                    let default = match &parameter.default {
+                        Some(expression) => Some(self.eval_expr(expression, env)?),
+                        None => None,
+                    };
+                    if parameter.kind == ParamKind::Normal {
+                        positional.push((parameter.name.clone(), default));
+                    } else {
+                        kwonly.push((parameter.name.clone(), default));
+                    }
+                }
+                ParamKind::VarArgs => varargs = Some(parameter.name.clone()),
+                ParamKind::KwArgs => kwargs = Some(parameter.name.clone()),
+                ParamKind::BareStar => {}
+            }
+        }
+        Ok((positional, kwonly, varargs, kwargs))
+    }
+
     fn make_function(
         &mut self,
         name: &Name,
@@ -721,22 +761,7 @@ impl Interp {
         def_line: u32,
         env: &EnvRef,
     ) -> PyResult<Function> {
-        let mut bound = Vec::with_capacity(params.len());
-        let mut varargs = None;
-        let mut kwargs = None;
-        for parameter in params {
-            match parameter.kind {
-                ParamKind::Normal => {
-                    let default = match &parameter.default {
-                        Some(expression) => Some(self.eval_expr(expression, env)?),
-                        None => None,
-                    };
-                    bound.push((parameter.name.clone(), default));
-                }
-                ParamKind::VarArgs => varargs = Some(parameter.name.clone()),
-                ParamKind::KwArgs => kwargs = Some(parameter.name.clone()),
-            }
-        }
+        let (bound, kwonly, varargs, kwargs) = self.collect_params(params, env)?;
         let in_class_body = match &self.class_env {
             Some(class_env) => Rc::ptr_eq(class_env, env),
             None => false,
@@ -752,6 +777,7 @@ impl Interp {
         Ok(Function {
             name: name.clone(),
             params: bound,
+            kwonly,
             varargs,
             kwargs,
             body: FunctionBody::Block(body.clone()),
@@ -829,22 +855,7 @@ impl Interp {
         body: &Rc<Expr>,
         env: &EnvRef,
     ) -> PyResult<Function> {
-        let mut bound = Vec::with_capacity(params.len());
-        let mut varargs = None;
-        let mut kwargs = None;
-        for parameter in params {
-            match parameter.kind {
-                ParamKind::Normal => {
-                    let default = match &parameter.default {
-                        Some(expression) => Some(self.eval_expr(expression, env)?),
-                        None => None,
-                    };
-                    bound.push((parameter.name.clone(), default));
-                }
-                ParamKind::VarArgs => varargs = Some(parameter.name.clone()),
-                ParamKind::KwArgs => kwargs = Some(parameter.name.clone()),
-            }
-        }
+        let (bound, kwonly, varargs, kwargs) = self.collect_params(params, env)?;
         let in_class_body = match &self.class_env {
             Some(class_env) => Rc::ptr_eq(class_env, env),
             None => false,
@@ -864,6 +875,7 @@ impl Interp {
         Ok(Function {
             name: Rc::from("<lambda>"),
             params: bound,
+            kwonly,
             varargs,
             kwargs,
             body: FunctionBody::Expression(body.clone()),
@@ -2062,6 +2074,7 @@ impl Interp {
         let function = Rc::new(Function {
             name: Rc::from("<genexpr>"),
             params: Vec::new(),
+            kwonly: Vec::new(),
             varargs: None,
             kwargs: None,
             body: FunctionBody::GeneratorExpr {
@@ -2702,10 +2715,49 @@ impl Interp {
                 ),
             ));
         }
+        // Keyword-only parameters: never filled positionally, only by keyword
+        // or by their default, and a missing one without a default is the
+        // CPython "missing N required keyword-only argument(s)" error.
+        let mut missing: Vec<Name> = Vec::new();
+        for (name, default) in &function.kwonly {
+            if let Some((_, value)) = kwargs.iter().find(|(key, _)| key == name) {
+                env.borrow_mut().set_local(name.clone(), value.clone());
+            } else if let Some(default) = default {
+                env.borrow_mut().set_local(name.clone(), default.clone());
+            } else {
+                missing.push(name.clone());
+            }
+        }
+        if !missing.is_empty() {
+            let names: Vec<String> = missing.iter().map(|name| format!("'{}'", name)).collect();
+            let joined = if names.len() == 1 {
+                names[0].clone()
+            } else {
+                format!(
+                    "{} and {}",
+                    names[..names.len() - 1].join(", "),
+                    names[names.len() - 1]
+                )
+            };
+            return Err(self.err(
+                "TypeError",
+                format!(
+                    "{}() missing {} required keyword-only argument{}: {}",
+                    function.name,
+                    missing.len(),
+                    if missing.len() == 1 { "" } else { "s" },
+                    joined
+                ),
+            ));
+        }
+        let known = |key: &str| {
+            function.params.iter().any(|(param, _)| &**param == key)
+                || function.kwonly.iter().any(|(param, _)| &**param == key)
+        };
         if let Some(name) = &function.kwargs {
             let mut entries = Vec::new();
             for (key, value) in kwargs {
-                if function.params.iter().any(|(param, _)| param == key) {
+                if known(key) {
                     continue;
                 }
                 entries.push((Value::Str(key.clone()), value.clone()));
@@ -2714,7 +2766,7 @@ impl Interp {
                 .set_local(name.clone(), Value::dict(entries));
         } else {
             for (key, _) in kwargs {
-                if !function.params.iter().any(|(name, _)| name == key) {
+                if !known(key) {
                     return Err(self.err(
                         "TypeError",
                         format!(

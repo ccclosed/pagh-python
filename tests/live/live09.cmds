@@ -1,0 +1,53 @@
+# Live suite for pythonc 0.9.0 on the pagh 0.21.2 kernel: the 0.1.2-0.8.0
+# regression commands plus the new keyword-only-parameters script, one boot,
+# in order.
+# Each script checks itself with asserts; the kernel prints
+# "run: /mnt/pythonc exited with code N" after every run.
+cat /mnt/hello.py
+run /mnt/pythonc /mnt/hello.py
+run /mnt/pythonc /mnt/functions.py
+run /mnt/pythonc /mnt/collections_demo.py
+run /mnt/pythonc /mnt/classes.py
+run /mnt/pythonc /mnt/exceptions.py
+run /mnt/pythonc /mnt/fileio.py
+cat /mnt/py.txt
+cat /mnt/print.txt
+run /mnt/pythonc /mnt/import_main.py
+run /mnt/pythonc /mnt/argv.py one two
+run /mnt/pythonc -c print(6*7)
+run /mnt/pythonc
+run /mnt/pythonc /mnt/syntax_error.py
+run /mnt/pythonc /mnt/uncaught.py
+run /mnt/pythonc /mnt/float_arithmetic.py
+run /mnt/pythonc /mnt/float_division.py
+run /mnt/pythonc /mnt/float_format.py
+run /mnt/pythonc /mnt/float_compare.py
+run /mnt/pythonc /mnt/float_math.py
+run /mnt/pythonc /mnt/float_errors.py
+run /mnt/pythonc -c print(1/2)
+run /mnt/pythonc /mnt/lambda_map.py
+run /mnt/pythonc /mnt/with_open.py
+run /mnt/pythonc /mnt/sets_demo.py
+run /mnt/pythonc /mnt/bytes_demo.py
+run /mnt/pythonc /mnt/bytes_file.py
+run /mnt/pythonc /mnt/fstrings_demo.py
+run /mnt/pythonc /mnt/os_demo.py
+run /mnt/pythonc /mnt/json_demo.py
+run /mnt/pythonc /mnt/os_proc.py
+run /mnt/pythonc /mnt/star_args.py
+run /mnt/pythonc /mnt/str_format.py
+run /mnt/pythonc /mnt/generators.py
+run /mnt/pythonc /mnt/genexpr.py
+run /mnt/pythonc /mnt/decorators.py
+run /mnt/pythonc /mnt/percent_format.py
+run /mnt/pythonc /mnt/stdlib_modules.py
+run /mnt/pythonc /mnt/stack_depth.py
+run /mnt/pythonc /mnt/yield_from.py
+run /mnt/pythonc /mnt/gen_methods.py
+run /mnt/pythonc /mnt/gen_delegation.py
+run /mnt/pythonc /mnt/gen_fibers.py
+run /mnt/pythonc /mnt/dict_set.py
+run /mnt/pythonc /mnt/keyword_only.py
+run /mnt/pythonc /mnt/generator_syntax.py
+run /mnt/pythonc /mnt/decorator_syntax.py
+run /mnt/pythonc /mnt/yield_from_syntax.py
