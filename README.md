@@ -85,6 +85,13 @@ exceeded`, 201 скобка — `too many nested parentheses`, а PoC аудит
 f64-инструкции в U-mode, поэтому ядро обязано оставлять `sstatus.FS`
 включённым при `sret`.
 
+## Branching and releases
+
+`main` is the stable branch; `dev` is the experimental integration branch. Feature
+and fix PRs target `dev`; stable releases are tagged from `main`, release
+candidates/pre-releases from `dev` (`vX.Y.Z-rc.N`). The release workflow refuses a
+tag cut from the wrong branch. See [BRANCHING.md](BRANCHING.md).
+
 ## Сборка
 
 Интерпретатор зависит от `libpagh` — соседнего чекаута
