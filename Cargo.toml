@@ -1,6 +1,6 @@
 [package]
 name = "pythonc"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 publish = false
 description = "A native Python interpreter for the pagh-riscv native ABI (generators, yield from, decorators, % formatting, variadics, str.format, lambda, with, set, bytes, f-strings, os, json, time, random, os.path)"

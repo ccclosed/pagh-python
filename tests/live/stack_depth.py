@@ -3,9 +3,10 @@
 #
 # A generator body runs on a 64 KiB fiber stack that this interpreter owns, and
 # that stack *is* checked: too deep a recursion inside it raises RecursionError
-# instead of writing past the end. The process stack is 64 KiB too (the ABI
-# fixes it) and is not checked — see the README limitation: roughly twelve
-# nested plain calls fill it, so this script stays well inside that.
+# instead of writing past the end. The process stack is the kernel's 1 MiB user
+# window (USER_STACK_FLOOR..USER_TOP); plain calls are bounded by
+# RECURSION_LIMIT = 56 and deep expression trees by EXPR_RECURSION_LIMIT
+# (0.9.2), so this script stays well inside both.
 
 def reck(n):
     if n == 0:

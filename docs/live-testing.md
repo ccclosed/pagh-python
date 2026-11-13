@@ -882,3 +882,110 @@ BLOCKS200 OK
   записаны в `src/platform.rs`/`src/parser.rs` по контракту pagh-riscv 0.24.1
   (`pagh-riscv/src/user/elf.rs`: `USER_STACK_FLOOR`, 1 МиБ); при изменении
   контракта ядра их нужно пересмотреть.
+
+---
+
+# Живой прогон pythonc 0.9.2 на ядре 0.24.1
+
+Дата: 2026-11-14. Ядро: `pagh-riscv` 0.24.1, чистое дерево `origin/main` на
+`a3f3a70`, debug ELF, `sha256 2e0dfca19185933603992c321c9a5d2221183ac3236e7bde7ea56a70f54db740`.
+QEMU `qemu-system-riscv64` 10.2.2, машина `virt`, 256 MiB, serial на
+Unix-сокете, 64 MiB ext2. `pythonc` — release, 582 056 байт,
+`sha256 5cd9c9d4eac4e1f53e283cba5d83045f41598ed7ae80035dbcae0a86ddab8a21`.
+
+**Одна загрузка**, все команды подряд; драйвер — собственный
+[`../tests/live/qemu_driver.py`](../tests/live/qemu_driver.py), обёртка —
+[`../tests/live/live092.sh`](../tests/live/live092.sh), список команд —
+[`../tests/live/live092.cmds`](../tests/live/live092.cmds). Сырой транскрипт:
+[`live-pythonc-092.txt`](live-pythonc-092.txt).
+
+## Итог 0.9.2
+
+**69 запусков pythonc: 51 с кодом 0, 18 намеренных диагностик** (usage — 2;
+семнадцать диагностик — 1: прежние пять, пять 0.9.1 nesting-сценариев и семь
+новых evaluator-сценариев), плюс пять `cat`. После последнего запуска
+транскрипт показывает `SUITE ALIVE`: машина жива после всех «бомб».
+
+Новое в 0.9.2 — аудит `F-r2-py-1/2`: фикс 0.9.1 ограничивал только
+рекурсивный спуск парсера, а лево-ассоциативная цепочка `1+1+…` строится
+парсером в цикле и затем рекурсивно обходится `eval_expr`. 740 термов
+убивали интерпретатор на `USER_STACK_FLOOR` (`store page fault`,
+`stval=0x3feffd68`), а то же выражение в генераторе переполняло 64-КиБ
+heap-фибер без guard-страницы (wild-pointer падения `stval=0x1/0x0/0x44800000008/0x1fffffe8`).
+Теперь глубина вычисления ограничена 256 уровнями AST, а перед каждым узлом
+проверяется остаток стека (процесс — 1 МиБ с запасом 64 КиБ, файбер — 64 КиБ
+с запасом 8 КиБ). Все PoC-цепочки — чистые `RecursionError` и код 1.
+
+| Скрипт | Что проверяет | Результат |
+|---|---|---|
+| `eval_chain_200.py` | 200 термов `1+1+…` — цепочка, которую парсер свернул циклом | `EVAL CHAIN 200 OK 200`, exit 0 |
+| `eval_chain_256.py` | ровно `EXPR_RECURSION_LIMIT` = 256 уровней вычисления | `EVAL CHAIN 256 OK 256`, exit 0 |
+| `eval_chain_257.py` | 257-й уровень | `RecursionError: maximum recursion depth exceeded (256 expression levels)`, exit 1 |
+| `eval_chain_720.py` | порог аудита: 720 термов ещё «работали» на 0.9.1 случайно | тот же `RecursionError`, exit 1 |
+| `eval_chain_740.py` | 740 термов — на 0.9.1 stack guard kill (`stval=0x3feffd68`) | тот же `RecursionError`, exit 1 |
+| `eval_chain_800.py` | PoC `F-r2-py-1` verbatim: 800 термов, 1626 байт | тот же `RecursionError`, exit 1 |
+| `eval_chain_func_uncalled.py` | 3000-термная цепочка в невызываемой функции: парсер её по-прежнему разбирает | `PARSE OK`, exit 0 |
+| `eval_chain_caught.py` | `RecursionError` ловится, интерпретатор продолжает работу | `CAUGHT: …`, `EVAL RECOVERED OK`, exit 0 |
+| `eval_chain_interleave.py` | генератор, приостановленный на `yield` внутри выражения, не отнимает глубину у вызывающего | `INTERLEAVE OK 1 200 43`, exit 0 |
+| `eval_chain_attr.py` | attribute-цепочка `c.self.self…` (300 звеньев) — та же лево-глубая форма | `RecursionError`, exit 1 |
+| `eval_chain_sub.py` | subscript-цепочка `l[0][0]…` (300 звеньев) | `RecursionError`, exit 1 |
+| `gen_chain_20.py` | короткая цепочка в генераторе работает | `GEN CHAIN 20 OK 20`, exit 0 |
+| `gen_chain_100.py` | PoC `F-r2-py-2`: 100 термов в генераторе (было wild-pointer падение) | `GEN GUARD OK: generator stack exhausted (7688 bytes left of 64 KiB)`, `ALIVE AFTER GEN BOMB`, exit 0 |
+| `gen_chain_300.py` | необработанный вариант: 300 термов в генераторе | `RecursionError: generator stack exhausted`, exit 1 |
+| `recursion_limit.py` | регрессия рекурсии вызовов: 55 кадров работают, 56-й — `RecursionError` | `RECURSION LIMIT OK`, exit 0 |
+
+Регрессия: весь suite 0.1.2–0.9.1 проходит на 0.24.1 без изменений —
+`KEYWORD ONLY OK`, `DICT SET OK`, `GEN METHODS OK`, `GEN DELEGATION OK`,
+`GEN FIBERS OK`, `YIELD FROM OK`, `GENERATORS OK`, `NESTING OK`,
+`PARENS150 OK`, `NOT200 OK`, `BLOCKS200 OK`,
+`child: True status: 0`/`proc ok` на месте. Отдельно прогнаны сами PoC из
+`attack/r2/runtime/pocs/python` на финальной сборке: `eval-bomb.py` (800
+термов; control 700 термов теперь тоже ошибка, потому что предел —
+256, а не порог стека), все четыре `fiber-bomb-*`, `gen_add_100/200/500` —
+чистые `RecursionError` и код 1, `func_add_3000.py` — `PARSE OK` и код 0,
+после чего `echo ALIVE AFTER ATTACK POCS` печатается.
+
+## Ключевые строки 0.9.2
+
+```text
+EVAL CHAIN 200 OK 200
+EVAL CHAIN 256 OK 256
+RecursionError: maximum recursion depth exceeded (256 expression levels)   [eval_chain_257/720/740/800, attr, sub]
+PARSE OK
+CAUGHT: maximum recursion depth exceeded (256 expression levels)
+EVAL RECOVERED OK
+INTERLEAVE OK 1 200 43
+GEN CHAIN 20 OK 20
+GEN GUARD OK: generator stack exhausted (7688 bytes left of 64 KiB)
+ALIVE AFTER GEN BOMB
+RecursionError: generator stack exhausted (7688 bytes left of 64 KiB)      [gen_chain_300]
+CALL LIMIT CAUGHT: maximum recursion depth exceeded (56 Python frames)
+RECURSION LIMIT OK
+NOT200 OK True
+SUITE ALIVE
+```
+
+## Честные пробелы 0.9.2
+
+- **256 уровней — меньше CPython'овских 1000.** Один уровень — это один узел
+  AST (бинарная операция, имя, литерал), а не один Rust-кадр парсера:
+  `1+1+…` из 257 термов — уже `RecursionError`, хотя CPython такое выражение
+  компилирует. Для длинных однотипных цепочек в скрипте лучше цикл/`sum()`;
+  предел документирован и одинаков на хосте и на цели.
+- **Под 64-КиБ файбером по-прежнему нет guard-страницы.** Защита —
+  программная (`Fiber::headroom` + `STACK_MARGIN` 8 КиБ на каждом узле
+  `eval_expr` и на каждом `exec_stmt`), а не аппаратная. Промах в оценке
+  размера кадра теоретически всё ещё может дописать за конец `Vec<u8>`;
+  отдельной mmap-guard-страницы в ABI нет.
+- **Проверка process stack — только на цели.** На хосте
+  `platform::process_stack_bounds()` возвращает `None` (у потока теста нет
+  документированного окна), поэтому hostcheck проверяет точную границу по
+  счётчику, а фактический остаток стека — только на pagh-riscv.
+- **Глубина `exec_stmt` не считается отдельно.** Вложенные блоки
+  ограничивает парсер (200 уровней), а на файбере — headroom-проверка; на
+  process stack глубокие блоки не превышают парсерного предела и в 1 МиБ
+  укладываются.
+- **Константы ядра.** Окно `0x3ff0_0000..0x4000_0000` и запас 64 КиБ
+  записаны в `src/platform.rs`/`src/interp.rs` по контракту pagh-riscv 0.24.1
+  (`pagh-riscv/src/user/elf.rs`: `USER_STACK_FLOOR`, `USER_STACK_MAX_SIZE`);
+  при изменении контракта их нужно пересмотреть.

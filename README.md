@@ -11,10 +11,41 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
 
 ## Статус
 
-**Рабочая версия 0.9.1.** Язык и встроенные функции реализованы настолько,
+**Рабочая версия 0.9.2.** Язык и встроенные функции реализованы настолько,
 насколько это нужно для небольших скриптов на 1 MiB bump-heap ядра pagh.
 
-Новое в 0.9.1 — пределы вложенности парсера (аудит F-rt-4): 506-байтный
+Новое в 0.9.2 — пределы глубины *вычисления* (аудит F-r2-py-1/2):
+лево-ассоциативная цепочка `x = 1+1+…` строится парсером в цикле, поэтому
+фикс вложенности 0.9.1 её не видел, а `eval_expr` рекурсивно обходил дерево
+без счётчика. Цепочка из 740 термов выводила стек процесса на guard page
+(`store page fault`, `stval=0x3feffd68`), а та же цепочка внутри генератора
+переполняла 64-КиБ heap-фибер без guard-страницы — wild-pointer падения
+(`stval=0x1/0x0/0x44800000008/0x1fffffe8`) и порча кучи интерпретатора.
+
+- **Глубина вычисления — 256 уровней (`EXPR_RECURSION_LIMIT`).** Каждый узел
+  AST, включая левый операнд бинарного оператора (то есть всю
+  лево-ассоциативную цепочку), берёт один уровень; переполнение —
+  `RecursionError: maximum recursion depth exceeded (256 expression levels)`,
+  ловимое исключение с кодом 1, а не падение. 256 выше пределов парсера
+  (200 вложенных `not` — это 201 уровень AST), поэтому вычислитель не
+  отвергает принятое парсером: 256 термов вычисляются, 257-й — ошибка.
+- **Перед каждым узлом проверяется остаток стека.** На pagh-riscv `sp`
+  сверяется с 1 МиБ user-стека (`USER_STACK_FLOOR`) и запасом 64 КиБ; на
+  файбере генератора — с его 64-КиБ буфером (запас 8 КиБ). Поэтому
+  генераторная «бомба» — это `RecursionError: generator stack exhausted
+  (… bytes left of 64 KiB)`, а не wild-pointer фолт; та же проверка стоит в
+  начале `exec_stmt`, так что вложенные блоки на файбере тоже не могут уйти
+  за конец буфера.
+- **Счётчик глубины привязан к текущему стеку:** генератор,
+  приостановленный внутри выражения, хранит свои уровни в
+  `Generator::eval_depth`, и переключение файберов сохраняет/восстанавливает
+  счётчик — `yield` в глубоком выражении не отнимает бюджет вызывающего.
+- **Покрыты вызовы функций и генераторы:** 256/257 термов,
+  attribute/subscript-цепочки, ловля `RecursionError` с продолжением работы,
+  generator expressions и 3000-термная цепочка в невызываемой функции (её
+  по-прежнему разбирает парсер).
+
+В 0.9.1 исправлены пределы вложенности *парсера* (аудит F-rt-4): 506-байтный
 скрипт вида `x = (((…1…)))` больше не убивает интерпретатор.
 
 - **Скобки: 200 уровней, как у CPython.** Предел проверяется лексером
@@ -59,23 +90,34 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
   `*`/`**`, параметр после `**kwargs` и повторяющиеся имена
   (`duplicate argument 'a' in function definition`).
 
-Живая проверка 0.9.1 — на ядре **0.24.1** (`pagh-riscv`, коммит `aa8f1a9`,
-QEMU `virt`, ext2 64 MiB, драйвер `tests/live/qemu_driver.py`, одна
-загрузка): полный suite [`tests/live/live091.cmds`](tests/live/live091.cmds) —
-54 запуска, 43 с кодом 0, одиннадцать намеренных диагностик (usage — код 2;
-прежние `syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
-`decorator_syntax.py`, `yield_from_syntax.py` и новые
-`nesting_operators_201.py`, `nesting_blocks_201.py`, `nesting_parens_200.py`,
-`nesting_parens_201.py`, `nesting_unbalanced_300.py` — код 1). Допустимая
-глубина печатает `NESTING OK`, `PARENS150 OK`, `NOT200 OK` и `BLOCKS200 OK`;
-201 вложенный `not`/`if` даёт `SyntaxError: maximum recursion depth
-exceeded`, 201 скобка — `too many nested parentheses`, а PoC аудита
-(`nesting_parens_200.py`, 506 байт, 200 скобок) — тот же `SyntaxError` и код
-1 вместо убийства процесса. Прежние маркеры `KEYWORD ONLY OK` (0.9.0),
-`DICT SET OK`, `GEN METHODS OK`, `GEN DELEGATION OK`, `GEN FIBERS OK`,
-`YIELD FROM OK` и `child: True status: 0`/`proc ok` на месте. Сырой
-транскрипт: [`docs/live-pythonc-091.txt`](docs/live-pythonc-091.txt); прогон
-0.9.0 — [`docs/live-pythonc-090.txt`](docs/live-pythonc-090.txt), PASS-листы и
+Живая проверка 0.9.2 — на ядре **0.24.1** (`pagh-riscv`, чистое дерево
+`origin/main` на `a3f3a70`, QEMU `virt`, ext2 64 MiB, драйвер
+`tests/live/qemu_driver.py`, одна загрузка): полный suite
+[`tests/live/live092.cmds`](tests/live/live092.cmds) — 69 запусков, 51 с
+кодом 0, восемнадцать намеренных диагностик (usage — код 2; семнадцать
+диагностик — код 1: прежние `syntax_error.py`, `uncaught.py`,
+`generator_syntax.py`, `decorator_syntax.py`, `yield_from_syntax.py`,
+пять 0.9.1 nesting-сценариев и семь новых evaluator-сценариев
+`eval_chain_257.py`, `eval_chain_720.py`, `eval_chain_740.py`,
+`eval_chain_800.py`, `eval_chain_attr.py`, `eval_chain_sub.py`,
+`gen_chain_300.py`). Новые маркеры: `EVAL CHAIN 200 OK`, `EVAL CHAIN 256 OK`,
+`EVAL RECOVERED OK` (исключение ловится и интерпретатор продолжает работу),
+`PARSE OK` (3000-термная цепочка в невызываемой функции), `INTERLEAVE OK`
+(счётчик глубины у приостановленного генератора свой), `GEN CHAIN 20 OK`,
+`GEN GUARD OK: RecursionError: generator stack exhausted (…)`,
+`ALIVE AFTER GEN BOMB` и `RECURSION LIMIT OK` (рекурсия вызовов по-прежнему
+упирается в `RECURSION_LIMIT = 56`). Те же PoC из
+`attack/r2/runtime/pocs/python` (`eval-bomb` — 800 термов,
+`fiber-bomb-100/150/200/300`) прогнаны отдельной загрузкой на этой же
+сборке: чистые `RecursionError` и код 1, затем
+`echo ALIVE AFTER ATTACK POCS`; 720 термов, которые на 0.9.1 ещё «работали»
+случайно, и 740, которые её убивали, — та же чистая ошибка в suite. Прежние маркеры
+`KEYWORD ONLY OK` (0.9.0), `DICT SET OK`, `GEN METHODS OK`,
+`GEN DELEGATION OK`, `GEN FIBERS OK`, `YIELD FROM OK`, `NESTING OK`,
+`PARENS150 OK`, `NOT200 OK`, `BLOCKS200 OK` и
+`child: True status: 0`/`proc ok` на месте. Сырой транскрипт:
+[`docs/live-pythonc-092.txt`](docs/live-pythonc-092.txt); прогон 0.9.1 —
+[`docs/live-pythonc-091.txt`](docs/live-pythonc-091.txt), PASS-листы и
 детали — [`docs/live-testing.md`](docs/live-testing.md).
 
 Размер release-ELF — 582 056 байт (569 КиБ; лимит ядра — 1 МиБ): профиль
@@ -118,10 +160,10 @@ cargo build --release
 
 ## Запуск в QEMU
 
-Один прогон suite 0.9.1 (сборка, образ, QEMU, транскрипт) — одной командой:
+Один прогон suite 0.9.2 (сборка, образ, QEMU, транскрипт) — одной командой:
 
 ```sh
-sh tests/live/live091.sh
+sh tests/live/live092.sh
 ```
 
 Вручную:
@@ -133,7 +175,7 @@ mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py-live.img 64M
 
 python3 tests/live/qemu_driver.py \
   --disk /tmp/py-live.img \
-  --commands tests/live/live091.cmds \
+  --commands tests/live/live092.cmds \
   --transcript /tmp/live.txt
 ```
 
@@ -483,7 +525,9 @@ CPython).
   данные, текстовый требует валидный UTF-8.
 - **Память и стек ограничены:** bump-heap 1 МиБ не освобождается, поэтому
   большие строки/списки/set и долгие циклы с накоплением данных упрутся в
-  `MemoryError` или закончатся раньше. Рекурсия ограничена 56 кадрами.
+  `MemoryError` или закончатся раньше. Рекурсия вызовов ограничена 56
+  Python-кадрами (`RecursionError`), глубина вычисления выражения — 256
+  уровнями AST (0.9.2).
 - **Вложенность исходника ограничена 200 уровнями (0.9.1, аудит F-rt-4).**
   Скобки ограничивает лексер: 200 вложенных `(){}[]` разбираются, 201-я даёт
   `SyntaxError: too many nested parentheses`. Остальные рекурсивные
@@ -494,6 +538,22 @@ CPython).
   уровней, дальше срабатывает проверка остатка стека с тем же
   `SyntaxError` — вместо `[user] pythonc killed: store page fault`, которым
   заканчивался 506-байтный PoC до исправления.
+- **Глубина вычисления ограничена 256 уровнями (0.9.2, аудит F-r2-py-1/2).**
+  Парсерные пределы не спасали от лево-ассоциативных цепочек: `1+1+…`
+  парсер сворачивает циклом, а `eval_expr` обходил получившееся лево-глубокое
+  дерево рекурсивно. Теперь каждый узел AST (включая левый операнд, то есть
+  всю цепочку, а также цепочки `a.b.b…` и `a[0][0]…`) стоит один уровень:
+  256 термов вычисляются, 257-й даёт ловимое
+  `RecursionError: maximum recursion depth exceeded (256 expression levels)`
+  — не store page fault. Предел выбран выше парсерных 200, потому что 200
+  вложенных `not` — это 201 уровень AST, и вычислитель не должен отвергать
+  то, что парсер принял. Перед каждым узлом проверяется и остаток стека: на
+  процессе — окно 1 МиБ с запасом 64 КиБ, на файбере генератора — его
+  64-КиБ буфер (запас 8 КиБ), поэтому то же выражение внутри генератора даёт
+  `RecursionError: generator stack exhausted (… bytes left of 64 KiB)`
+  вместо wild-pointer падения и порчи кучи. Счётчик глубины привязан к
+  текущему стеку: генератор, приостановленный на `yield` внутри выражения,
+  хранит свои уровни отдельно и не отнимает бюджет вызывающего.
 - **Генераторы — файберы, и это видно.** Стек 64 КиБ выделяется при первом
   `next()` (генератор, который только создали, ничего не стоит), одновременно
   «приостановленных» генераторов не больше 8 — на девятом `MemoryError`
@@ -516,16 +576,16 @@ CPython).
   `StopIteration.value`; у генератора нет `gi_frame`/`gi_code`/
   `gi_yieldfrom` и метода `__next__` (только `send`/`throw`/`close`);
   генератор нельзя скопировать или сериализовать.
-- **Рекурсия упирается в стек, а не в константу.** `RECURSION_LIMIT = 56`
-  кадров недостижим в этой сборке: Rust-кадры интерпретатора стоят несколько
-  КиБ на Python-вызов, поэтому 64 КиБ стека процесса хватает примерно на
-  двенадцать вложенных вызовов (`fib(10)` из `tests/live/functions.py`
-  проходит у самого края). Глубже ядро убивает процесс по store page fault
-  (`[user] /mnt/pythonc killed: store page fault`), а не сообщает
-  `RecursionError` — это унаследованное ограничение 0.4.0, в 0.5.0 оно не
-  менялось; проверка стека есть только у файберов генераторов, потому что там
-  переполнение испортило бы кучу интерпретатора. Полноценное лечение —
-  уменьшить кадры интерпретатора или исполнять модуль на большом файбере.
+- **Рекурсия вызовов упирается в `RECURSION_LIMIT = 56`, а не в стек.**
+  На pagh-riscv у процесса 1 МиБ user-стека (`USER_STACK_FLOOR`), которого
+  хватает на 55 вложенных Python-вызовов; следующий даёт
+  `RecursionError: maximum recursion depth exceeded (56 Python frames)`.
+  Это проверено живьём в `tests/live/recursion_limit.py` (0.9.2). Прежняя
+  редакция этого раздела утверждала, что рекурсия убивает процесс по
+  `store page fault` из-за 64-КиБ стека: это было верно для старых ядер, но
+  не для 0.24.1. Отдельно от рекурсии вызовов глубина дерева выражения
+  ограничена 256 уровнями (см. выше), а на файбере генератора переполнение
+  ловит проверка headroom.
 - **Декораторы:** кроме `staticmethod` нет `classmethod`, `property`,
   `functools.wraps`/`lru_cache` и дескрипторного протокола; декоратор
   вызывается как обычная функция (без `__set_name__` и т.п.).
@@ -547,12 +607,21 @@ CPython).
 
 ```sh
 cd hostcheck
-cargo test                 # 42 unit-теста интерпретатора
-cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (42 PASS)
+cargo test                 # 44 unit-теста интерпретатора
+cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (44 PASS)
 cargo run -- ../tests/live/hello.py
 ```
 
-Проверки 0.9.1: `parser bracket nesting` (199 и 200 вложенных скобок, списков,
+Проверки 0.9.2: `evaluation depth` (200 и 256 термов вычисляются, 257/720/800
+дают `RecursionError: maximum recursion depth exceeded`; attribute/subscript
+цепочки — 255 звеньев проходят, 256-е отвергается; 3000-термная цепочка в
+невызываемой функции исполняется; `RecursionError` ловится и интерпретатор
+продолжает работу) и `evaluation depth generator` (20-термная цепочка в
+генераторе работает; 300 термов в генераторной функции и в generator
+expression дают `RecursionError: generator stack exhausted` вместо
+wild-pointer фолта; генератор, приостановленный внутри выражения, не
+отнимает глубину у вызывающего). Проверки 0.9.1: `parser bracket nesting` (199
+и 200 вложенных скобок, списков,
 вызовов, tuple-целей и comprehension-слоёв разбираются, 201 — `too many
 nested parentheses`) и `parser recursion depth` (199 и 200 унарных
 `not`/`-`, `**`, условных выражений, лямбд и вложенных `if` разбираются, 201 —
@@ -594,27 +663,32 @@ expressions`, `decorators`, `percent format`, `os.path`, `time`, `random` и
 диагностик; `GEN METHODS OK`, `GEN DELEGATION OK`, `GEN FIBERS OK`) и
 прогон 0.8.0 на том же ядре (44 запуска, 38 PASS, 6 намеренных
 диагностик; `DICT SET OK`), прогон 0.9.0 на том же ядре (45 запусков,
-39 PASS, 6 намеренных диагностик; `KEYWORD ONLY OK`) и прогон 0.9.1 на ядре
+39 PASS, 6 намеренных диагностик; `KEYWORD ONLY OK`), прогон 0.9.1 на ядре
 0.24.1 (54 запуска, 43 PASS, 11 намеренных диагностик; `NESTING OK`,
-`PARENS150 OK`, `NOT200 OK`, `BLOCKS200 OK` и пять nesting-диагностик) —
+`PARENS150 OK`, `NOT200 OK`, `BLOCKS200 OK` и пять nesting-диагностик) и
+прогон 0.9.2 на ядре 0.24.1 (69 запусков, 51 PASS, 18 намеренных
+диагностик; `EVAL CHAIN 200 OK`, `EVAL CHAIN 256 OK`, `EVAL RECOVERED OK`,
+`PARSE OK`, `INTERLEAVE OK`, `GEN GUARD OK`, `ALIVE AFTER GEN BOMB`,
+`RECURSION LIMIT OK`, `SUITE ALIVE`) —
 PASS-листы и сырые логи: [`docs/live-testing.md`](docs/live-testing.md),
-транскрипты 0.5.0–0.9.1 —
+транскрипты 0.5.0–0.9.2 —
 [`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
 [`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt),
 [`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt),
 [`docs/live-pythonc-080.txt`](docs/live-pythonc-080.txt),
-[`docs/live-pythonc-090.txt`](docs/live-pythonc-090.txt) и
-[`docs/live-pythonc-091.txt`](docs/live-pythonc-091.txt), скрипты —
+[`docs/live-pythonc-090.txt`](docs/live-pythonc-090.txt),
+[`docs/live-pythonc-091.txt`](docs/live-pythonc-091.txt) и
+[`docs/live-pythonc-092.txt`](docs/live-pythonc-092.txt), скрипты —
 [`tests/live/`](tests/live/).
 
 ## CI
 
 `.github/workflows/ci.yml` чекаутит соседний `pagh-api` (main), ставит
 тулчейн из `rust-toolchain.toml` и гоняет два гейта: `cargo test` в
-`hostcheck` (42 проверки) и `cargo build --release` для
+`hostcheck` (44 проверки) и `cargo build --release` для
 `riscv64gc-unknown-none-elf` с проверкой, что `pythonc` не превышает лимит
 ядра в 1 МиБ. Живой QEMU-прогон в CI намеренно не входит: для него нужны
-ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live091.sh`.
+ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live092.sh`.
 
 ## Устройство
 

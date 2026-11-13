@@ -1,0 +1,118 @@
+# Live suite for pythonc 0.9.1 on the pagh 0.24.1 kernel: the 0.1.2-0.9.0
+# regression commands plus the parser-nesting boundary scripts (audit F-rt-4),
+# one boot, in order.
+# Each script checks itself with asserts; the kernel prints
+# "run: /mnt/pythonc exited with code N" after every run.
+cat /mnt/hello.py
+run /mnt/pythonc /mnt/hello.py
+run /mnt/pythonc /mnt/functions.py
+run /mnt/pythonc /mnt/collections_demo.py
+run /mnt/pythonc /mnt/classes.py
+run /mnt/pythonc /mnt/exceptions.py
+run /mnt/pythonc /mnt/fileio.py
+cat /mnt/py.txt
+cat /mnt/print.txt
+run /mnt/pythonc /mnt/import_main.py
+run /mnt/pythonc /mnt/argv.py one two
+run /mnt/pythonc -c print(6*7)
+run /mnt/pythonc
+run /mnt/pythonc /mnt/syntax_error.py
+run /mnt/pythonc /mnt/uncaught.py
+run /mnt/pythonc /mnt/float_arithmetic.py
+run /mnt/pythonc /mnt/float_division.py
+run /mnt/pythonc /mnt/float_format.py
+run /mnt/pythonc /mnt/float_compare.py
+run /mnt/pythonc /mnt/float_math.py
+run /mnt/pythonc /mnt/float_errors.py
+run /mnt/pythonc -c print(1/2)
+run /mnt/pythonc /mnt/lambda_map.py
+run /mnt/pythonc /mnt/with_open.py
+run /mnt/pythonc /mnt/sets_demo.py
+run /mnt/pythonc /mnt/bytes_demo.py
+run /mnt/pythonc /mnt/bytes_file.py
+run /mnt/pythonc /mnt/fstrings_demo.py
+run /mnt/pythonc /mnt/os_demo.py
+run /mnt/pythonc /mnt/json_demo.py
+run /mnt/pythonc /mnt/os_proc.py
+run /mnt/pythonc /mnt/star_args.py
+run /mnt/pythonc /mnt/str_format.py
+run /mnt/pythonc /mnt/generators.py
+run /mnt/pythonc /mnt/genexpr.py
+run /mnt/pythonc /mnt/decorators.py
+run /mnt/pythonc /mnt/percent_format.py
+run /mnt/pythonc /mnt/stdlib_modules.py
+run /mnt/pythonc /mnt/stack_depth.py
+run /mnt/pythonc /mnt/yield_from.py
+run /mnt/pythonc /mnt/gen_methods.py
+run /mnt/pythonc /mnt/gen_delegation.py
+run /mnt/pythonc /mnt/gen_fibers.py
+run /mnt/pythonc /mnt/dict_set.py
+run /mnt/pythonc /mnt/keyword_only.py
+run /mnt/pythonc /mnt/generator_syntax.py
+run /mnt/pythonc /mnt/decorator_syntax.py
+run /mnt/pythonc /mnt/yield_from_syntax.py
+
+# ── F-rt-4: parser nesting limits (0.9.1) ───────────────────────────────────
+# Accepted deep input: 100 levels of parentheses, `not`, conditional
+# expressions, lambdas and nested if blocks; the marker is NESTING OK.
+run /mnt/pythonc /mnt/nesting_ok.py
+# 150 nested parentheses: inside both limits and inside the target 1 MiB stack.
+run /mnt/pythonc /mnt/nesting_parens_150.py
+# 200 unary `not`s = exactly MAX_PARSE_DEPTH: accepted.
+run /mnt/pythonc /mnt/nesting_operators_200.py
+# 201 unary `not`s: SyntaxError "maximum recursion depth exceeded", exit 1.
+run /mnt/pythonc /mnt/nesting_operators_201.py
+# 200 nested if blocks = exactly MAX_PARSE_DEPTH: accepted.
+run /mnt/pythonc /mnt/nesting_blocks_200.py
+# 201 nested if blocks: SyntaxError "maximum recursion depth exceeded", exit 1.
+run /mnt/pythonc /mnt/nesting_blocks_201.py
+# The audit F-rt-4 PoC verbatim: 506 bytes, 200 nested parentheses. The lexer
+# limit (200) admits it, but on pagh-riscv the 1 MiB user stack cannot hold the
+# parser frames, so the stack-headroom guard raises the same SyntaxError instead
+# of walking into the guard page and killing the interpreter.
+cat /mnt/nesting_parens_200.py
+run /mnt/pythonc /mnt/nesting_parens_200.py
+# 201 nested parentheses: rejected by the lexer with CPython's message.
+run /mnt/pythonc /mnt/nesting_parens_201.py
+# The audit's parse-time PoC: 300 unbalanced opens, no valid program at all.
+run /mnt/pythonc /mnt/nesting_unbalanced_300.py
+
+# ── F-r2-py-1/2: evaluator recursion limits (0.9.2) ─────────────────────────
+# The 0.9.1 parser-depth fix did not bound the evaluator: a left-associative
+# chain is folded by a parser *loop*, so a 740-term `x = 1+1+...` walked the
+# stack into the kernel guard page, and the same expression in a generator
+# overran the 64 KiB heap fiber stack (no guard page) with wild-pointer
+# faults. The evaluator now charges one level per AST node and checks stack
+# headroom, so every one of these is a clean RecursionError.
+#
+# A 200-term chain is well inside the limit: accepted.
+run /mnt/pythonc /mnt/eval_chain_200.py
+# Exactly EXPR_RECURSION_LIMIT = 256 evaluation levels: accepted.
+run /mnt/pythonc /mnt/eval_chain_256.py
+# The 257th level: RecursionError, exit 1.
+run /mnt/pythonc /mnt/eval_chain_257.py
+# The audit threshold: 720 terms (the last size that "worked" on 0.9.1).
+run /mnt/pythonc /mnt/eval_chain_720.py
+# 740 terms: killed 0.9.1 at USER_STACK_FLOOR (stval=0x3feffd68).
+run /mnt/pythonc /mnt/eval_chain_740.py
+# The audit F-r2-py-1 PoC verbatim shape: 800 terms, 1626 bytes.
+cat /mnt/eval_chain_800.py
+run /mnt/pythonc /mnt/eval_chain_800.py
+# Parsing is iterative: a 3000-term chain in an uncalled function exits 0.
+run /mnt/pythonc /mnt/eval_chain_func_uncalled.py
+# The RecursionError is catchable and the interpreter stays usable.
+run /mnt/pythonc /mnt/eval_chain_caught.py
+# Per-stack depth: a generator suspended inside an expression keeps its own.
+run /mnt/pythonc /mnt/eval_chain_interleave.py
+# Attribute and subscript chains are the same loop-built left-deep shape.
+run /mnt/pythonc /mnt/eval_chain_attr.py
+run /mnt/pythonc /mnt/eval_chain_sub.py
+# F-r2-py-2: the generator/fiber variants. 20 terms still work; 100 terms were
+# a wild-pointer crash on 0.9.1 and are now a catchable RecursionError; 300
+# terms uncaught are exit 1 with the interpreter alive.
+run /mnt/pythonc /mnt/gen_chain_20.py
+run /mnt/pythonc /mnt/gen_chain_100.py
+run /mnt/pythonc /mnt/gen_chain_300.py
+# Regression: plain Python call recursion still stops at RECURSION_LIMIT=56.
+run /mnt/pythonc /mnt/recursion_limit.py
+echo SUITE ALIVE

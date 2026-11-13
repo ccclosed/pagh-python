@@ -467,6 +467,14 @@ pub struct Generator {
     /// `StopIteration.value` (the interpreter itself has no exception
     /// attributes, so it is kept here instead of on the StopIteration object).
     pub returned: Option<Value>,
+    /// The evaluator depth this generator was suspended at.
+    ///
+    /// [`crate::interp::Interp::expr_depth`] counts levels on the *running*
+    /// stack, and a suspended generator's frames are parked on its own fiber.
+    /// The resumer saves its counter here before switching in and restores it
+    /// after the switch, so a `yield` inside a deep expression neither leaks
+    /// its depth into the caller nor loses it across resumes.
+    pub eval_depth: usize,
 }
 
 /// What the resumer asked the suspended generator to do when it resumes.
