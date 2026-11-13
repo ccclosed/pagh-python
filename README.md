@@ -11,10 +11,35 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
 
 ## Статус
 
-**Рабочая версия 0.9.0.** Язык и встроенные функции реализованы настолько,
+**Рабочая версия 0.9.1.** Язык и встроенные функции реализованы настолько,
 насколько это нужно для небольших скриптов на 1 MiB bump-heap ядра pagh.
 
-Новое в 0.9.0 — keyword-only параметры: сигнатуры функций и лямбд стали
+Новое в 0.9.1 — пределы вложенности парсера (аудит F-rt-4): 506-байтный
+скрипт вида `x = (((…1…)))` больше не убивает интерпретатор.
+
+- **Скобки: 200 уровней, как у CPython.** Предел проверяется лексером
+  итеративно, до рекурсии: 200 вложенных `()`, `[]`, `{}` (включая скобки
+  вызовов, подписок и tuple-целей) разбираются, 201-я даёт
+  `SyntaxError: too many nested parentheses` — то же сообщение и тот же
+  предел, что у токенизатора CPython (`MAXLEVEL = 200`).
+- **Явный счётчик глубины парсера — 200 уровней.** Рекурсивный спуск берёт
+  уровень на каждый вложенный `not`/унарный оператор, правую часть `**`,
+  ветку `else` условного выражения, тело лямбды, блок операторов, цель
+  присваивания и операнд `yield`; 201-й уровень даёт
+  `SyntaxError: maximum recursion depth exceeded`. F-string-фрагмент
+  наследует глубину внешнего выражения, а не начинает счёт заново.
+- **Остаток стека проверяется на pagh-riscv.** Один уровень вложенности —
+  это несколько КиБ Rust-кадров, а стек процесса на pagh — 1 МиБ, поэтому на
+  цели перед каждым уровнем парсер сверяет `sp` с `USER_STACK_FLOOR` и
+  запасом в 128 КиБ и поднимает тот же `SyntaxError`. Именно это превращает
+  200 скобок из `[user] pythonc killed: store page fault` в обычную
+  диагностику с кодом 1 (201 скобка отвергается ещё лексером). На текущей
+  сборке цель принимает примерно до 186 вложенных скобок — точное число
+  зависит от кадров парсера и контрактом не является; унарные цепочки и
+  блоки операторов принимаются до 200. Хостовый harness, у которого нет
+  фиксированного дна стека, проверяет точную границу 199/200/201.
+
+В 0.9.0 появились keyword-only параметры: сигнатуры функций и лямбд стали
 полными по Python 3.
 
 - **`def f(a, *, b)` и `def f(a, *args, b=2, **kwargs)`.** Всё после `*`
@@ -34,20 +59,24 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
   `*`/`**`, параметр после `**kwargs` и повторяющиеся имена
   (`duplicate argument 'a' in function definition`).
 
-Живая проверка 0.9.0 — на ядре **0.21.2** (`pagh-riscv`, коммит `a0933ee`,
+Живая проверка 0.9.1 — на ядре **0.24.1** (`pagh-riscv`, коммит `aa8f1a9`,
 QEMU `virt`, ext2 64 MiB, драйвер `tests/live/qemu_driver.py`, одна
-загрузка): полный suite [`tests/live/live09.cmds`](tests/live/live09.cmds) —
-45 запусков, 39 с кодом 0, шесть намеренных диагностик (usage — код 2;
-`syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
-`decorator_syntax.py`, `yield_from_syntax.py` — код 1), и новая проверка
-[`tests/live/keyword_only.py`](tests/live/keyword_only.py) печатает
-`KEYWORD ONLY OK` (def/lambda/методы/генераторы, `*args` + keyword-only +
-`**kwargs`, значения по умолчанию и `missing ... keyword-only argument`).
-Прежние маркеры `DICT SET OK`, `GEN METHODS OK`, `GEN DELEGATION OK`,
-`GEN FIBERS OK`, `YIELD FROM OK` и `child: True status: 0`/`proc ok` на
-месте. Сырой транскрипт:
-[`docs/live-pythonc-090.txt`](docs/live-pythonc-090.txt), PASS-лист и детали —
-[`docs/live-testing.md`](docs/live-testing.md).
+загрузка): полный suite [`tests/live/live091.cmds`](tests/live/live091.cmds) —
+54 запуска, 43 с кодом 0, одиннадцать намеренных диагностик (usage — код 2;
+прежние `syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
+`decorator_syntax.py`, `yield_from_syntax.py` и новые
+`nesting_operators_201.py`, `nesting_blocks_201.py`, `nesting_parens_200.py`,
+`nesting_parens_201.py`, `nesting_unbalanced_300.py` — код 1). Допустимая
+глубина печатает `NESTING OK`, `PARENS150 OK`, `NOT200 OK` и `BLOCKS200 OK`;
+201 вложенный `not`/`if` даёт `SyntaxError: maximum recursion depth
+exceeded`, 201 скобка — `too many nested parentheses`, а PoC аудита
+(`nesting_parens_200.py`, 506 байт, 200 скобок) — тот же `SyntaxError` и код
+1 вместо убийства процесса. Прежние маркеры `KEYWORD ONLY OK` (0.9.0),
+`DICT SET OK`, `GEN METHODS OK`, `GEN DELEGATION OK`, `GEN FIBERS OK`,
+`YIELD FROM OK` и `child: True status: 0`/`proc ok` на месте. Сырой
+транскрипт: [`docs/live-pythonc-091.txt`](docs/live-pythonc-091.txt); прогон
+0.9.0 — [`docs/live-pythonc-090.txt`](docs/live-pythonc-090.txt), PASS-листы и
+детали — [`docs/live-testing.md`](docs/live-testing.md).
 
 Размер release-ELF — 582 056 байт (569 КиБ; лимит ядра — 1 МиБ): профиль
 `release` теперь использует `strip = "symbols"`, потому что одна таблица
@@ -82,10 +111,10 @@ cargo build --release
 
 ## Запуск в QEMU
 
-Один прогон suite 0.9.0 (сборка, образ, QEMU, транскрипт) — одной командой:
+Один прогон suite 0.9.1 (сборка, образ, QEMU, транскрипт) — одной командой:
 
 ```sh
-sh tests/live/live09.sh
+sh tests/live/live091.sh
 ```
 
 Вручную:
@@ -97,7 +126,7 @@ mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py-live.img 64M
 
 python3 tests/live/qemu_driver.py \
   --disk /tmp/py-live.img \
-  --commands tests/live/live09.cmds \
+  --commands tests/live/live091.cmds \
   --transcript /tmp/live.txt
 ```
 
@@ -448,6 +477,16 @@ CPython).
 - **Память и стек ограничены:** bump-heap 1 МиБ не освобождается, поэтому
   большие строки/списки/set и долгие циклы с накоплением данных упрутся в
   `MemoryError` или закончатся раньше. Рекурсия ограничена 56 кадрами.
+- **Вложенность исходника ограничена 200 уровнями (0.9.1, аудит F-rt-4).**
+  Скобки ограничивает лексер: 200 вложенных `(){}[]` разбираются, 201-я даёт
+  `SyntaxError: too many nested parentheses`. Остальные рекурсивные
+  конструкции (унарные цепочки, `**`, `if/else`, лямбды, блоки, цели,
+  `yield`-операнды) считает сам парсер: 200 уровней проходят, 201-й —
+  `maximum recursion depth exceeded`; тело `def` — тоже уровень. На
+  pagh-riscv из-за 1 МиБ стека процесса скобки принимаются примерно до 186
+  уровней, дальше срабатывает проверка остатка стека с тем же
+  `SyntaxError` — вместо `[user] pythonc killed: store page fault`, которым
+  заканчивался 506-байтный PoC до исправления.
 - **Генераторы — файберы, и это видно.** Стек 64 КиБ выделяется при первом
   `next()` (генератор, который только создали, ничего не стоит), одновременно
   «приостановленных» генераторов не больше 8 — на девятом `MemoryError`
@@ -501,16 +540,23 @@ CPython).
 
 ```sh
 cd hostcheck
-cargo test                 # 40 unit-тестов интерпретатора
-cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (40 PASS)
+cargo test                 # 42 unit-теста интерпретатора
+cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (42 PASS)
 cargo run -- ../tests/live/hello.py
 ```
 
-Проверки 0.9.0: `keyword-only parameters` (def/lambda/методы/генераторы,
+Проверки 0.9.1: `parser bracket nesting` (199 и 200 вложенных скобок, списков,
+вызовов, tuple-целей и comprehension-слоёв разбираются, 201 — `too many
+nested parentheses`) и `parser recursion depth` (199 и 200 унарных
+`not`/`-`, `**`, условных выражений, лямбд и вложенных `if` разбираются, 201 —
+`maximum recursion depth exceeded`; `yield`-операнды: 199 проходит, 200 — нет,
+потому что тело `def` уже занимает уровень; comprehension/yield-guard даёт
+прежнее отдельное сообщение) — плюс прежние проверки: 0.9.0 —
+`keyword-only parameters` (def/lambda/методы/генераторы,
 `*args`+keyword-only+`**kwargs`, чередование default'ов, сообщения
 `missing ... keyword-only argument`, `**`-распаковка на вызове) и
 `keyword-only errors` (голый `*` без имён, параметр после `**kwargs`,
-повторный `*`/`**`, дубликаты имён) — плюс 38 проверок 0.8.0
+повторный `*`/`**`, дубликаты имён), а также 38 проверок 0.8.0
 (`dict views` (`len`/итерация/`in`/`repr`/имена типов,
 живость view, равенство keys/items как множеств и values по идентичности,
 `dict(d.items())`, unhashable view), `bitwise operators` (int-семантика,
@@ -540,30 +586,36 @@ expressions`, `decorators`, `percent format`, `os.path`, `time`, `random` и
 прогон 0.7.0 на ядре 0.21.2 (43 запуска, 37 PASS, 6 намеренных
 диагностик; `GEN METHODS OK`, `GEN DELEGATION OK`, `GEN FIBERS OK`) и
 прогон 0.8.0 на том же ядре (44 запуска, 38 PASS, 6 намеренных
-диагностик; `DICT SET OK`) и прогон 0.9.0 на том же ядре (45 запусков,
-39 PASS, 6 намеренных диагностик; `KEYWORD ONLY OK`) — PASS-листы и сырые
-логи: [`docs/live-testing.md`](docs/live-testing.md), транскрипты 0.5.0–0.9.0
-— [`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
+диагностик; `DICT SET OK`), прогон 0.9.0 на том же ядре (45 запусков,
+39 PASS, 6 намеренных диагностик; `KEYWORD ONLY OK`) и прогон 0.9.1 на ядре
+0.24.1 (54 запуска, 43 PASS, 11 намеренных диагностик; `NESTING OK`,
+`PARENS150 OK`, `NOT200 OK`, `BLOCKS200 OK` и пять nesting-диагностик) —
+PASS-листы и сырые логи: [`docs/live-testing.md`](docs/live-testing.md),
+транскрипты 0.5.0–0.9.1 —
+[`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
 [`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt),
 [`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt),
-[`docs/live-pythonc-080.txt`](docs/live-pythonc-080.txt) и
-[`docs/live-pythonc-090.txt`](docs/live-pythonc-090.txt), скрипты —
+[`docs/live-pythonc-080.txt`](docs/live-pythonc-080.txt),
+[`docs/live-pythonc-090.txt`](docs/live-pythonc-090.txt) и
+[`docs/live-pythonc-091.txt`](docs/live-pythonc-091.txt), скрипты —
 [`tests/live/`](tests/live/).
 
 ## CI
 
 `.github/workflows/ci.yml` чекаутит соседний `pagh-api` (main), ставит
 тулчейн из `rust-toolchain.toml` и гоняет два гейта: `cargo test` в
-`hostcheck` (40 проверок) и `cargo build --release` для
+`hostcheck` (42 проверки) и `cargo build --release` для
 `riscv64gc-unknown-none-elf` с проверкой, что `pythonc` не превышает лимит
 ядра в 1 МиБ. Живой QEMU-прогон в CI намеренно не входит: для него нужны
-ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live09.sh`.
+ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live091.sh`.
 
 ## Устройство
 
 ```text
-src/lexer.rs      токены, отступы, строковые/bytes/f-string литералы
-src/parser.rs     рекурсивный спуск, AST, lambda/with/comprehensions
+src/lexer.rs      токены, отступы, строковые/bytes/f-string литералы, предел
+                  вложенности скобок (MAX_BRACKET_DEPTH = 200)
+src/parser.rs     рекурсивный спуск, бюджет глубины (MAX_PARSE_DEPTH = 200),
+                  проверка остатка стека, AST, lambda/with/comprehensions
 src/ast.rs        узлы AST
 src/value.rs      значения, объектная модель, dict/set, итераторы, repr
 src/fiber.rs      файберы генераторов: переключение стека (asm), пул стеков

@@ -796,3 +796,89 @@ KEYWORD ONLY OK
   (у них нет сигнатуры), очень длинные сигнатуры с `*args`+`**kwargs`+
   keyword-only в одном `def` (hostcheck покрывает), `staticmethod` с
   keyword-only (hostcheck: методы и `staticmethod` используют один binder).
+
+---
+
+# Живой прогон pythonc 0.9.1 на ядре 0.24.1
+
+Дата: 2026-11-13. Ядро: `pagh-riscv` 0.24.1, коммит `aa8f1a9`, debug ELF,
+`sha256 21bd93cfc9c8368031ded80c937c1bc42c5714bcdd4737cf336f924e6b1d485e`.
+QEMU `qemu-system-riscv64` 10.2.2, машина `virt`, 256 MiB, serial на
+Unix-сокете, 64 MiB ext2. `pythonc` — release, 582 056 байт,
+`sha256 560f9997e5963d5335879916c8b275f04f839a571a6e73bb53e178322e03c5fd`.
+
+**Одна загрузка**, все команды подряд; драйвер — собственный
+[`../tests/live/qemu_driver.py`](../tests/live/qemu_driver.py), обёртка —
+[`../tests/live/live091.sh`](../tests/live/live091.sh), список команд —
+[`../tests/live/live091.cmds`](../tests/live/live091.cmds). Сырой транскрипт:
+[`live-pythonc-091.txt`](live-pythonc-091.txt).
+
+## Итог 0.9.1
+
+**54 запуска pythonc: 43 с кодом 0, 11 намеренных диагностик** (usage — 2;
+прежние `syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
+`decorator_syntax.py`, `yield_from_syntax.py` и новые `nesting_*` — 1), плюс
+четыре `cat`.
+
+Новое в 0.9.1 — аудит `F-rt-4`: предел вложенности парсера и проверка остатка
+стека. Раньше 506-байтный PoC (`nesting_parens_200.py`, 200 скобок)
+заканчивался `[user] pythonc killed: store page fault`; теперь это
+`SyntaxError` и код 1.
+
+| Скрипт | Что проверяет | Результат |
+|---|---|---|
+| `nesting_ok.py` | 100 уровней скобок, `not`, условных выражений, лямбд и вложенных `if` — принятая глубина разбирается и исполняется | `NESTING OK`, exit 0 |
+| `nesting_parens_150.py` | 150 вложенных скобок на 1 МиБ стека цели | `PARENS150 OK 1`, exit 0 |
+| `nesting_operators_200.py` | 200 унарных `not` = ровно `MAX_PARSE_DEPTH` | `NOT200 OK True`, exit 0 |
+| `nesting_operators_201.py` | 201-й уровень — счётчик парсера | `SyntaxError: maximum recursion depth exceeded`, exit 1 |
+| `nesting_blocks_200.py` | 200 вложенных `if` = ровно `MAX_PARSE_DEPTH` | `BLOCKS200 OK`, exit 0 |
+| `nesting_blocks_201.py` | 201 вложенный блок | `SyntaxError: maximum recursion depth exceeded`, exit 1 |
+| `nesting_parens_200.py` | PoC аудита verbatim: 506 байт, 200 скобок (до 0.9.1 — stack fault) | `SyntaxError: maximum recursion depth exceeded`, exit 1 |
+| `nesting_parens_201.py` | 201 скобка — предел лексера | `SyntaxError: too many nested parentheses`, exit 1 |
+| `nesting_unbalanced_300.py` | PoC «валидной программы нет»: 300 открывающих скобок | `SyntaxError: too many nested parentheses`, exit 1 |
+
+Регрессия: весь suite 0.1.2–0.9.0 (включая `KEYWORD ONLY OK`, `DICT SET OK`,
+`GEN METHODS OK`, `GEN DELEGATION OK`, `GEN FIBERS OK`, `YIELD FROM OK`,
+`GENERATORS OK`, `child: True status: 0`/`proc ok`) проходит на ядре 0.24.1
+без изменений.
+
+## Ключевые строки 0.9.1
+
+```text
+NESTING OK
+PARENS150 OK 1
+NOT200 OK True
+/mnt/nesting_operators_201.py:3:809: SyntaxError: maximum recursion depth exceeded
+BLOCKS200 OK
+/mnt/nesting_blocks_201.py:203:209: SyntaxError: maximum recursion depth exceeded
+/mnt/nesting_parens_200.py:2:192: SyntaxError: maximum recursion depth exceeded
+/mnt/nesting_parens_201.py:3:205: SyntaxError: too many nested parentheses
+/mnt/nesting_unbalanced_300.py:2:205: SyntaxError: too many nested parentheses
+```
+
+`nesting_parens_200.py` — это ровно тот файл из аудита: его `cat` в
+транскрипте показывает 506 байт и 200 вложенных скобок, а `run` сразу после
+— `SyntaxError` с кодом 1 и без строки `killed`.
+
+## Честные пробелы 0.9.1
+
+- **Эффективная глубина скобок на цели меньше 200.** Языковой предел — 200
+  уровней, и hostcheck проверяет его точно; на pagh-riscv 1 МиБ user-стека
+  вмещает примерно 186 вложенных скобок (один уровень стоит несколько КиБ
+  Rust-кадров), дальше stack-headroom guard поднимает тот же `SyntaxError`.
+  Число зависит от сборки и кадров парсера и контрактом не является; дешёвые
+  уровни (`not`, блоки) доходят до 200 и на цели — это видно в таблице.
+- **Два предела независимы.** Скобки ограничены лексером, остальные
+  конструкции — счётчиком парсера; «суммарного 200» на смесь «много лямбд +
+  много скобок» нет. На хосте каждый предел проверяется отдельно, на цели
+  физический предохранитель один — остаток стека.
+- **Парсер на heap-стеке файбера.** Если `import` выполняется внутри
+  генератора, `parser::parse` работает на 64 КиБ heap-стеке файбера, а не на
+  process stack: адресная проверка `USER_STACK_FLOOR` к такой памяти
+  неприменима (она пропускается), счётчики вложенности при этом действуют.
+  Живьём этот путь в 0.9.1 не проверялся; отдельного теста на глубокий
+  импорт из генератора нет.
+- **Константы ядра.** Нижняя граница стека (`0x3ff0_0000`) и запас 128 КиБ
+  записаны в `src/platform.rs`/`src/parser.rs` по контракту pagh-riscv 0.24.1
+  (`pagh-riscv/src/user/elf.rs`: `USER_STACK_FLOOR`, 1 МиБ); при изменении
+  контракта ядра их нужно пересмотреть.

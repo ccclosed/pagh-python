@@ -26,6 +26,20 @@ use alloc::vec::Vec;
 
 use crate::error::SyntaxError;
 
+/// The deepest bracket nesting the lexer accepts before the recursive-descent
+/// parser ever sees a token: CPython's tokenizer refuses 201 nested
+/// parentheses with `SyntaxError: too many nested parentheses` (`MAXLEVEL` is
+/// 200 there), so this is the same boundary and the same message.
+///
+/// The check lives in the lexer because bracket nesting is exactly the kind of
+/// recursion a *token-level*, iterative pass can bound without using any Rust
+/// stack: a 506-byte file of 200 `(` used to kill the interpreter by exhausting
+/// its 1 MiB user stack inside the parser (audit F-rt-4). The parser additionally
+/// caps the recursion of constructs that are not delimited by brackets (unary
+/// chains, `**`, conditional expressions, lambdas, statement blocks, targets and
+/// `yield` operands); see [`MAX_PARSE_DEPTH`](crate::parser::MAX_PARSE_DEPTH).
+pub const MAX_BRACKET_DEPTH: usize = 200;
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum Tok {
     Name(Rc<str>),
@@ -1450,6 +1464,15 @@ impl Lexer {
         }
         if matches!(op, Op::LParen | Op::LBracket | Op::LBrace) {
             self.depth += 1;
+            // Reject the 201st open bracket before the parser can recurse on
+            // it; CPython's tokenizer uses the same limit and message.
+            if self.depth > MAX_BRACKET_DEPTH {
+                return Err(self.error_at(
+                    String::from("too many nested parentheses"),
+                    line,
+                    column,
+                ));
+            }
         } else if matches!(op, Op::RParen | Op::RBracket | Op::RBrace) {
             if self.depth == 0 {
                 return Err(self.error_at(

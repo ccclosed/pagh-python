@@ -14,6 +14,24 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// The address window the pagh kernel maps for this process's user stack, or
+/// `None` when the platform does not document one.
+///
+/// pagh-riscv gives every process a 1 MiB stack: the initial 64 KiB window is
+/// mapped at load time and demand growth extends it down to `USER_STACK_FLOOR`
+/// (see `pagh-riscv/src/user/elf.rs`: `USER_TOP` is `0x4000_0000` and
+/// `USER_STACK_MAX_SIZE` is 1 MiB). The recursive-descent parser checks its own
+/// stack pointer against this window before descending another level, so a
+/// hostile script cannot walk the stack into the unmapped guard page; the
+/// check and its safety margin live in [`crate::parser`] (audit F-rt-4).
+///
+/// The window is a kernel contract, not a guess: it is the same 1 MiB cap the
+/// interpreter's README documents as the per-process stack limit, and the
+/// kernel's ELF loader maps nothing else in `0x3ff0_0000..0x4000_0000`.
+pub fn process_stack_bounds() -> Option<(usize, usize)> {
+    Some((0x3ff0_0000, 0x4000_0000))
+}
+
 /// Write a string to standard output (fd 1), ignoring a write error: there is
 /// nowhere sensible to report it from inside `print`.
 pub fn write_stdout(text: &str) {
