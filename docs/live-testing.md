@@ -527,11 +527,131 @@ generator failure: generator stack exhausted (3872 bytes left of 64 KiB)
 
 ## Честные пробелы 0.6.0
 
-- **`send`/`throw`/`close` у генераторов нет**, поэтому делегация проверена
-  только по итерационному протоколу: `yield from` не передаёт значения
-  обратно в подгенератор и не даёт его `return`-значение (выражение — `None`).
+- **`send`/`throw`/`close` у генераторов нет** (закрыто в 0.7.0), поэтому
+  делегация проверена только по итерационному протоколу: `yield from` не
+  передаёт значения обратно в подгенератор и не даёт его `return`-значение
+  (выражение — `None`).
 - **Глубина цепочки делегирования** больше 8 не проверялась: каждый уровень
   держит приостановленный файбер, лимит 0.5.0 (`не больше 8`) не менялся.
 - Не проверялись живьём: `yield from` внутри `try/finally` самого внешнего
   генератора, делегирование объекту, чей `__iter__` возвращает не итератор
   (ошибка `TypeError` покрыта hostcheck).
+
+---
+
+# Живой прогон pythonc 0.7.0 на ядре 0.21.2
+
+Дата: 2026-11-12. Ядро: `pagh-riscv` 0.21.2, коммит
+`a0933ee` (`Merge pull request #8 from ccclosed/night/20261112-tls-stack`),
+debug ELF, `sha256 2e8ae74637fae1d83445b843d887bfcc5ccc371ccd6174e16ff64afee88cc0b1`;
+QEMU `qemu-system-riscv64` 10.2.2, машина `virt`, 256 MiB, serial на
+Unix-сокете. Диск: 64 MiB ext2, собран на хосте
+
+```sh
+truncate -s 64M /tmp/py-live-0.7.0.img
+mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py-live-0.7.0.img
+```
+
+Ядро собрано из **git-архива** коммита `a0933ee` в `/tmp`:
+
+```sh
+mkdir -p /tmp/pagh-kernel-a0933ee
+git -C /home/oleg/pagh-riscv archive a0933ee | tar -x -C /tmp/pagh-kernel-a0933ee
+cd /tmp/pagh-kernel-a0933ee && cargo build --locked
+```
+
+Чекаут `/home/oleg/pagh-riscv` при этом не изменялся, а ELF, лежавший в его
+`target/`, был собран раньше коммита (00:41 против 17:43), поэтому для
+транскрипта взята сборка именно `a0933ee`; её `sha256` совпал с отдельной
+сборкой с явным `--target-dir`. Путь к ядру в шапке транскрипта — этот
+архив.
+
+**Одна загрузка**, все команды подряд; драйвер — собственный
+[`../tests/live/qemu_driver.py`](../tests/live/qemu_driver.py), обёртка —
+[`../tests/live/live07.sh`](../tests/live/live07.sh), список команд —
+[`../tests/live/live07.cmds`](../tests/live/live07.cmds). Сырой транскрипт:
+[`live-pythonc-070.txt`](live-pythonc-070.txt).
+
+## Итог 0.7.0
+
+**43 запуска pythonc: 37 с кодом 0, 6 намеренных диагностик** (usage — 2;
+`syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
+`decorator_syntax.py`, `yield_from_syntax.py` — 1), плюс три `cat`, которые
+показывают staged-скрипт и два файла, записанных `fileio.py` и
+`print(file=...)`. Все языковые проверки — assert-скрипты, поэтому код 0
+означает совпадение значений, а не только напечатанные строки.
+
+Новое в 0.7.0 (три скрипта, см. «Честные пробелы» про 1 МиБ):
+
+| Скрипт | Что проверяет | Результат |
+|---|---|---|
+| `gen_methods.py` | `send(value)`/`send(None)`/`send` в незапущенный и исчерпанный генератор, `throw` экземпляром/классом/класс+аргументы (включая пользовательский класс), необработанный `throw`, `throw` в незапущенный, `close()` с `finally`, `close()` незапущенного, `RuntimeError` на теле, игнорирующем `GeneratorExit`, иерархия `GeneratorExit`, `PEP 479` (`throw(StopIteration)` → `RuntimeError`) | `GEN METHODS OK`, exit 0 |
+| `gen_delegation.py` | `send`/`throw`/`close` через `yield from`, значение `return` делегированного генератора (однократное), особый случай `throw(GeneratorExit)` через `yield from`, вложенность, сужение для обычного итератора | `GEN DELEGATION OK`, exit 0 |
+| `gen_fibers.py` | рецикл 200 стеков, лимит 8 приостановленных генераторов и его снятие через `close()` | `GEN FIBERS OK`, exit 0 |
+
+Регрессия: все прежние проверки 0.6.0 (включая `YIELD FROM OK`,
+`GENERATORS OK`, `os_proc.py` с `child: True status: 0`/`proc ok`) проходят
+на ядре 0.21.2 без изменений.
+
+## Ключевые строки 0.7.0
+
+```text
+send: ready one True                                     # gen_methods.py
+send fresh: can't send non-None value to a just-started generator
+send driven: 0 2 5
+send exhausted: StopIteration
+throw instance: value:boom
+throw class / class+args: key, value:msg
+throw user class: mine:custom mine:made
+throw escapes: escaping
+throw unstarted: body not run
+close finally: ['cleanup']
+close unstarted: nothing ran
+close ignored: generator ignored GeneratorExit
+close: GeneratorExit is BaseException
+pep479: generator raised StopIteration
+GEN METHODS OK
+
+delegate send: sub return                                # gen_delegation.py
+delegate throw: handled bad
+delegate close: ['inner', 'outer']
+delegate return value: answer
+delegate nested: deep level1 down
+delegate plain send: AttributeError
+delegate plain throw: caught plain
+recycled: 200 generators
+limit: cannot start a generator: 8 are already suspended (64 KiB each)
+GEN DELEGATION OK
+
+child: True status: 0                                    # os_proc.py
+proc ok
+```
+
+## Честные пробелы 0.7.0
+
+- **Трёхаргументная форма `throw(type, value, traceback)` не поддерживается**
+  и отвергается `TypeError` (у исключений этого интерпретатора нет
+  traceback-объектов); CPython сам объявил её deprecated.
+- **Делегация через `yield from` полная только для pagh-генератора.** Для
+  обычного итератора (`range`, список) `send` не-`None` даёт `AttributeError`
+  (hostcheck/live), а `throw`/`close` поднимаются в точке `yield from`.
+- **Значение `return`** доступно только как значение `yield from`; через
+  `StopIteration.value` оно не выставляется (у исключений нет атрибута
+  `value`), и у генератора нет `gi_frame`/`gi_code`/`gi_yieldfrom` и метода
+  `__next__`.
+- **Проверки разделены по процессам из-за 1 МиБ.**
+  Проверка лимита 8 требует 8 × 64 КиБ стеков (512 КиБ) — больше половины
+  bump-heap ядра, а AST скрипта и уже созданные строки тоже занимают память.
+  Первая версия была одним файлом на ~330 строк: `send`/`throw`/`close`
+  проходили, а цикл на 200 генераторов в том же процессе получал
+  `pythonc: out of memory (brk failed); requested 104 bytes` (код 102).
+  Затем лимит переехал в общий скрипт с делегацией, и тот стал падать на
+  девятом стеке (`requested 65536 bytes`). Поэтому suite разделён на три
+  маленьких скрипта, у каждого свой процесс; `gen_fibers.py` — самый
+  короткий, чтобы 512 КиБ стеков гарантированно помещались.
+- Не проверялись живьём: `send`/`throw`/`close` на generator expression
+  (hostcheck: `send` отбрасывается, `throw`/`close` поднимаются в `yield`),
+  цепочка делегации длиннее двух уровней (hostcheck — два уровня),
+  `close()` во время выполнения `finally` самого генератора, `throw`
+  в генератор, который в этот момент уже выполняется (hostcheck:
+  `ValueError: generator already executing`).

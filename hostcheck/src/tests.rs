@@ -13,6 +13,20 @@ use crate::interp::Interp;
 use crate::parser;
 use crate::value::{env_lookup, Value};
 
+/// Generators are fibers, and the fiber pool plus the 8-live limit are
+/// process-wide statics. `cargo test` runs checks on several threads, so every
+/// check that can hold a suspended generator takes this lock: otherwise one
+/// check's live fibers are counted against another's and the grid measures the
+/// test runner instead of the interpreter. (The freestanding interpreter has
+/// no threads, so this is a harness concern only.)
+static FIBER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn fiber_guard() -> std::sync::MutexGuard<'static, ()> {
+    FIBER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn describe(error: &PyError) -> String {
     if error.message.is_empty() {
         error.type_name().to_string()
@@ -584,6 +598,7 @@ unsafe extern "C" fn fiber_probe(_argument: *mut u8) -> ! {
 }
 
 fn fibers() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
     // SAFETY: a single fiber is alive and one thread runs the test; the fiber
     // only reaches statics this test owns.
     unsafe {
@@ -620,6 +635,7 @@ fn fibers() -> Result<(), String> {
 }
 
 fn generators() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
     // Basic lazy iteration, `next`, and the StopIteration contract.
     expect_repr(
         "def counter(n):\n    i = 0\n    while i < n:\n        yield i\n        i += 1\nx = list(counter(3))",
@@ -707,6 +723,7 @@ fn generators() -> Result<(), String> {
 }
 
 fn generator_expressions() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
     expect_repr("x = list(v * v for v in range(4))", "x", "[0, 1, 4, 9]")?;
     expect_repr("x = sum(v for v in range(6) if v % 2 == 0)", "x", "6")?;
     // The parenthesized form is a lazy iterator, not a list.
@@ -754,6 +771,7 @@ fn generator_expressions() -> Result<(), String> {
 }
 
 fn yield_from() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
     // Delegation to another generator function: the delegated values come out
     // of the outer generator in order, between the outer `yield`s.
     expect_repr(
@@ -815,6 +833,271 @@ fn yield_from() -> Result<(), String> {
         "def f():\n    yield from",
         "expected an expression",
     )?;
+    Ok(())
+}
+
+fn generator_send() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
+    // `send(value)` makes the suspended `yield` expression evaluate to it, and
+    // sending into a generator whose body already ended is a StopIteration.
+    expect_repr(
+        "def echo():\n    first = yield 'ready'\n    second = yield first\n    return second\ng = echo()\na = g.send(None)\nb = g.send('one')\ntry:\n    g.send('two')\n    x = 'no error'\nexcept StopIteration:\n    x = (a, b) + ('stopped',)\ndel g",
+        "x",
+        "('ready', 'one', 'stopped')",
+    )?;
+    // `send(None)` is `next()`; any other value delivered to a generator that
+    // has not started is a TypeError, exactly as in CPython.
+    expect_repr(
+        "def one():\n    yield 'first'\ng = one()\na = g.send(None)\ng2 = one()\ntry:\n    g2.send(1)\n    x = 'no error'\nexcept TypeError as error:\n    x = (a, str(error))\ndel g",
+        "x",
+        "('first', 'can\\'t send non-None value to a just-started generator')",
+    )?;
+    // A generator driven entirely by send; the value replaces `yield`'s result.
+    expect_repr(
+        "def counter():\n    total = 0\n    while True:\n        value = yield total\n        total += value\ng = counter()\na = next(g)\nb = g.send(2)\nc = g.send(3)\ng.close()\nx = (a, b, c)",
+        "x",
+        "(0, 2, 5)",
+    )?;
+    // Re-entering a running generator through `send` is refused like `next`.
+    expect_repr(
+        "me = None\ndef selfish():\n    yield me.send('x')\nme = selfish()\ntry:\n    me.send(None)\n    x = 'no error'\nexcept ValueError as error:\n    x = str(error)\ndel me",
+        "x",
+        "'generator already executing'",
+    )?;
+    // A generator expression has no name for the sent value: it is discarded
+    // (CPython does the same), while the iteration itself is unaffected.
+    expect_repr(
+        "g = (v for v in range(3))\na = next(g)\nb = g.send(99)\nc = next(g)\nd = list(g)\ndel g\nx = (a, b, c, d)",
+        "x",
+        "(0, 1, 2, [])",
+    )?;
+    Ok(())
+}
+
+fn generator_throw() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
+    // A caught `throw` is raised at the suspended `yield`; if the body then
+    // returns, `throw` itself reports the normal end as StopIteration.
+    expect_repr(
+        "def catcher():\n    try:\n        yield 'ready'\n    except ValueError as error:\n        return 'caught ' + str(error)\ng = catcher()\na = next(g)\nmessage = ''\ntry:\n    g.throw(ValueError('boom'))\nexcept StopIteration:\n    message = 'stopped'\nx = (a, message)",
+        "x",
+        "('ready', 'stopped')",
+    )?;
+    // An exception that the body does not catch escapes from `throw`.
+    expect_repr(
+        "def plain():\n    yield 1\ng = plain()\nnext(g)\ntry:\n    g.throw(RuntimeError('escaping'))\n    x = 'no error'\nexcept RuntimeError as error:\n    x = str(error)",
+        "x",
+        "'escaping'",
+    )?;
+    // The accepted forms: an instance, a class, and a class with arguments
+    // (a tuple is unpacked, a single value is passed as one argument).
+    expect_repr(
+        "def catcher():\n    try:\n        yield 'ready'\n    except KeyError:\n        yield 'key'\n    except ValueError as error:\n        yield ('value', error.args)\ng = catcher()\nnext(g)\na = g.throw(KeyError)\ng.close()\ng = catcher()\nnext(g)\nb = g.throw(ValueError, ('a', 'b'))\ng.close()\ng = catcher()\nnext(g)\nc = g.throw(ValueError('instance'))\ng.close()\nx = (a, b, c)",
+        "x",
+        "('key', ('value', ('a', 'b')), ('value', ('instance',)))",
+    )?;
+    // Throwing into a generator that never started does not run the body: the
+    // exception is raised in the caller and the generator is closed.
+    expect_repr(
+        "log = []\ndef guarded():\n    try:\n        yield 1\n    finally:\n        log.append('finally')\ng = guarded()\ntry:\n    g.throw(RuntimeError('early'))\nexcept RuntimeError:\n    pass\nx = (log, next(g, 'done'))",
+        "x",
+        "([], 'done')",
+    )?;
+    // Throwing into an exhausted generator raises the given exception in the
+    // caller (CPython 3.13+ behaviour), unlike `close`/`send`.
+    expect_repr(
+        "def one():\n    yield 1\ng = one()\nlist(g)\ntry:\n    g.throw(ValueError('late'))\n    x = 'no error'\nexcept ValueError as error:\n    x = str(error)",
+        "x",
+        "'late'",
+    )?;
+    // Arity and type errors: no arguments, a non-exception, and the
+    // three-argument form this interpreter does not implement.
+    expect_repr(
+        "def one():\n    yield 1\ng = one()\nnext(g)\ntry:\n    g.throw()\nexcept TypeError as error:\n    a = str(error)\ntry:\n    g.throw(5)\nexcept TypeError as error:\n    b = str(error)\ntry:\n    g.throw(ValueError, 'v', 'tb')\nexcept TypeError as error:\n    c = str(error)\ng.close()\nx = (a, b, c)",
+        "x",
+        "('throw expected at least 1 argument, got 0', 'exceptions must derive from BaseException, not \\'int\\'', 'throw(type, value, traceback) is not supported: pass an exception instance or a class and its arguments')",
+    )?;
+    // PEP 479: a StopIteration escaping the body is an error, not the end of
+    // the iteration, so it becomes RuntimeError("generator raised
+    // StopIteration") both when thrown in and when raised by the body.
+    expect_repr(
+        "def plain():\n    yield 1\np = plain()\nnext(p)\ntry:\n    p.throw(StopIteration('stop'))\n    x = 'no error'\nexcept RuntimeError as error:\n    x = str(error)",
+        "x",
+        "'generator raised StopIteration'",
+    )?;
+    expect_repr(
+        "def raises():\n    yield 1\n    raise StopIteration('x')\ng = raises()\nnext(g)\ntry:\n    next(g)\n    x = 'no error'\nexcept RuntimeError as error:\n    x = str(error)",
+        "x",
+        "'generator raised StopIteration'",
+    )?;
+    // `throw(class, value)` uses the value as-is when it already is an
+    // instance of the class, instead of wrapping it again.
+    expect_repr(
+        "def catcher():\n    try:\n        yield 'ready'\n    except ValueError as error:\n        yield ('args', error.args)\ng = catcher()\nnext(g)\nx = g.throw(ValueError, ValueError('pre'))\ng.close()",
+        "x",
+        "('args', ('pre',))",
+    )?;
+    // CPython's `gen_throw` special case: throwing GeneratorExit through a
+    // `yield from` whose delegate swallows it and yields means the delegate
+    // "ignored GeneratorExit"; if the delegate returns instead, the
+    // GeneratorExit is raised at this `yield from`.
+    expect_repr(
+        "log = []\ndef sub():\n    try:\n        yield 1\n    except GeneratorExit:\n        log.append('sub')\n        yield 'caught'\ndef outer():\n    try:\n        yield from sub()\n    finally:\n        log.append('outer')\ng = outer()\nnext(g)\ntry:\n    g.throw(GeneratorExit())\n    message = 'no error'\nexcept RuntimeError as error:\n    message = str(error)\nx = (message, log)",
+        "x",
+        "('generator ignored GeneratorExit', ['sub', 'outer'])",
+    )?;
+    expect_repr(
+        "def sub():\n    try:\n        yield 1\n    except GeneratorExit:\n        return 'done'\ndef outer():\n    yield from sub()\ng = outer()\nnext(g)\ntry:\n    g.throw(GeneratorExit())\n    x = 'no error'\nexcept GeneratorExit:\n    x = 'exit'",
+        "x",
+        "'exit'",
+    )?;
+    // `throw(GeneratorExit())` is an ordinary injected exception when the
+    // generator is *not* delegating: when it is not caught it reaches the
+    // caller and ends the generator.
+    expect_repr(
+        "def plain():\n    yield 1\ng = plain()\nnext(g)\ntry:\n    g.throw(GeneratorExit())\n    x = 'no error'\nexcept GeneratorExit:\n    x = ('exit', next(g, 'done'))",
+        "x",
+        "('exit', 'done')",
+    )?;
+    Ok(())
+}
+
+fn generator_close() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
+    // `close()` raises GeneratorExit at the `yield`, so `finally` runs and the
+    // generator cannot be resumed again.
+    expect_repr(
+        "log = []\ndef guarded():\n    try:\n        yield 1\n        yield 2\n    finally:\n        log.append('cleanup')\ng = guarded()\na = next(g)\nr = g.close()\nafter = next(g, 'done')\nx = (a, r, log, after)",
+        "x",
+        "(1, None, ['cleanup'], 'done')",
+    )?;
+    // Closing a generator that never started does not run its body at all.
+    expect_repr(
+        "log = []\ndef guarded():\n    try:\n        yield 1\n    finally:\n        log.append('finally')\ng = guarded()\nr = g.close()\nx = (r, log, next(g, 'done'))",
+        "x",
+        "(None, [], 'done')",
+    )?;
+    // A body that swallows GeneratorExit and yields again is refused.
+    expect_repr(
+        "def stubborn():\n    try:\n        yield 1\n    except GeneratorExit:\n        yield 2\ng = stubborn()\nnext(g)\ntry:\n    g.close()\n    x = 'no error'\nexcept RuntimeError as error:\n    x = str(error)\ng.close()\ndel g",
+        "x",
+        "'generator ignored GeneratorExit'",
+    )?;
+    // `GeneratorExit` derives from BaseException, not Exception (as in
+    // CPython), so an `except Exception` handler must not swallow a close.
+    expect_repr(
+        "def guarded():\n    try:\n        yield 1\n    except Exception:\n        yield 'caught by Exception'\ng = guarded()\nnext(g)\nr = g.close()\nx = (r, isinstance(GeneratorExit(), BaseException), isinstance(GeneratorExit(), Exception))",
+        "x",
+        "(None, True, False)",
+    )?;
+    // Closing an exhausted generator is a no-op, and a running one is refused.
+    expect_repr(
+        "def one():\n    yield 1\ng = one()\nlist(g)\na = g.close()\nme = None\ndef selfish():\n    yield me.close()\nme = selfish()\ntry:\n    next(me)\n    b = 'no error'\nexcept ValueError as error:\n    b = str(error)\ndel me\nx = (a, b)",
+        "x",
+        "(None, 'generator already executing')",
+    )?;
+    // A `yield` inside `finally` runs during close(), so the body yields
+    // while closing and is refused.
+    expect_repr(
+        "def finally_yield():\n    try:\n        yield 1\n    finally:\n        yield 2\ng = finally_yield()\nnext(g)\ntry:\n    g.close()\n    x = 'no error'\nexcept RuntimeError as error:\n    x = str(error)\ng.close()\ndel g",
+        "x",
+        "'generator ignored GeneratorExit'",
+    )?;
+    // Close delegates to a `yield from`: a delegate that swallows
+    // GeneratorExit and yields again makes the outer close a RuntimeError,
+    // and the outer `finally` still runs.
+    expect_repr(
+        "log = []\ndef sub():\n    try:\n        yield 1\n    except GeneratorExit:\n        log.append('sub')\n        yield 'caught'\ndef outer():\n    try:\n        yield from sub()\n    finally:\n        log.append('outer')\ng = outer()\nnext(g)\ntry:\n    g.close()\n    message = 'no error'\nexcept RuntimeError as error:\n    message = str(error)\nx = (message, log)",
+        "x",
+        "('generator ignored GeneratorExit', ['sub', 'outer'])",
+    )?;
+    // A generator expression is a generator too: close() and throw() reach
+    // its internal `yield`.
+    expect_repr(
+        "g = (v for v in range(4))\nnext(g)\na = g.close()\ng = (v for v in range(4))\nnext(g)\ntry:\n    g.throw(KeyError('genexp'))\n    b = 'no error'\nexcept KeyError:\n    b = 'keyerror'\nx = (a, b)",
+        "x",
+        "(None, 'keyerror')",
+    )?;
+    // The 8-suspended-generator limit is verified in the live script
+    // (tests/live/gen_methods.py), where one clean process owns the pool: here
+    // the leaked fibers of earlier checks make the count order-dependent.
+    Ok(())
+}
+
+fn generator_delegation() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
+    // A suspended generator owns a fiber slot until it is finished or
+    // dropped; that leak is invisible from Python, so the check measures the
+    // process-wide counter across the whole check and requires it to come
+    // back to where it started.
+    let fibers_before = crate::fiber::live_fibers();
+    // `yield from` routes `send` to the delegated generator, and the value of
+    // the delegated expression is the delegate's `return` value.
+    expect_repr(
+        "def sub():\n    while True:\n        v = yield\n        if v == 'stop':\n            return 'sub return'\ndef outer():\n    r = yield from sub()\n    yield r\ng = outer()\na = next(g)\nb = g.send('x')\nc = g.send('stop')\ng.close()\nx = (a, b, c)",
+        "x",
+        "(None, None, 'sub return')",
+    )?;
+    expect_repr(
+        "def inner():\n    yield 1\n    return 'answer'\ndef outer():\n    r = yield from inner()\n    yield r\nx = list(outer())",
+        "x",
+        "[1, 'answer']",
+    )?;
+    // `throw` is routed to the delegate; a class argument works too.
+    expect_repr(
+        "def sub():\n    try:\n        yield 1\n    except ValueError as error:\n        yield 'handled ' + str(error)\ndef outer():\n    yield from sub()\ng = outer()\nnext(g)\na = g.throw(ValueError('bad'))\ng.close()\ndef sub2():\n    try:\n        yield 1\n    except KeyError:\n        yield 'key'\ndef outer2():\n    yield from sub2()\ng = outer2()\nnext(g)\nb = g.throw(KeyError)\ng.close()\nx = (a, b)",
+        "x",
+        "('handled bad', 'key')",
+    )?;
+    // `close` closes the delegate first (its `finally` runs), then raises
+    // GeneratorExit at the outer `yield from`, so the outer `finally` runs too.
+    expect_repr(
+        "log = []\ndef inner():\n    try:\n        yield 10\n    finally:\n        log.append('inner')\ndef outer():\n    try:\n        yield from inner()\n    finally:\n        log.append('outer')\ng = outer()\nnext(g)\nr = g.close()\nx = (r, log)",
+        "x",
+        "(None, ['inner', 'outer'])",
+    )?;
+    // Delegation nests: the request travels down the whole chain.
+    expect_repr(
+        "def first():\n    v = yield 'deep'\n    yield ('first', v)\ndef second():\n    yield from first()\ndef third():\n    yield from second()\ng = third()\na = next(g)\nb = g.send('down')\ng.close()\nx = (a, b)",
+        "x",
+        "('deep', ('first', 'down'))",
+    )?;
+    // A plain iterator has no send/throw: sending a value is an AttributeError
+    // raised at the `yield from`, and close still runs the outer `finally`.
+    expect_repr(
+        "def plain():\n    try:\n        yield from [1, 2]\n    except AttributeError as error:\n        yield 'send' in str(error)\ng = plain()\nnext(g)\na = g.send('value')\ng.close()\nlog = []\ndef closer():\n    try:\n        yield from [1, 2]\n    finally:\n        log.append('outer')\ng = closer()\nnext(g)\nr = g.close()\nx = (a, r, log)",
+        "x",
+        "(True, None, ['outer'])",
+    )?;
+    // Throwing into a `yield from` over a plain iterator raises at the outer
+    // yield point, where the outer body can catch it.
+    expect_repr(
+        "def outer():\n    try:\n        yield from [1, 2]\n    except ValueError as error:\n        yield 'caught ' + str(error)\ng = outer()\nnext(g)\nx = g.throw(ValueError('plain'))\ng.close()",
+        "x",
+        "'caught plain'",
+    )?;
+    // The delegated `return` value is taken once: a second delegation to the
+    // same exhausted generator sees None, like StopIteration.value.
+    expect_repr(
+        "def inner():\n    yield 1\n    return 'answer'\ndef capture():\n    got = yield from inner()\n    yield got\ndone = inner()\nlist(done)\ndef again():\n    got = yield from done\n    yield got\nx = (list(capture()), list(again()))",
+        "x",
+        "([1, 'answer'], [None])",
+    )?;
+    // A delegated generator that raises still propagates its exception.
+    expect_repr(
+        "def boom():\n    yield 1\n    raise ValueError('inner')\ndef wrap():\n    yield from boom()\ng = wrap()\nfirst = next(g)\ntry:\n    next(g)\n    x = (first, 'no error')\nexcept ValueError as error:\n    x = (first, str(error))",
+        "x",
+        "(1, 'inner')",
+    )?;
+    // Nothing above may leave a suspended generator (and its fiber slot)
+    // behind.
+    let fibers_after = crate::fiber::live_fibers();
+    if fibers_after != fibers_before {
+        return Err(format!(
+            "fiber slots leaked: {} live before the check, {} after",
+            fibers_before, fibers_after
+        ));
+    }
     Ok(())
 }
 
@@ -1246,6 +1529,10 @@ fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
         ("arithmetic", arithmetic as fn() -> Result<(), String>),
         ("generators", generators),
         ("yield from", yield_from),
+        ("generator send", generator_send),
+        ("generator throw", generator_throw),
+        ("generator close", generator_close),
+        ("generator delegation", generator_delegation),
         ("generator expressions", generator_expressions),
         ("decorators", decorators),
         ("percent format", percent_formatting),
@@ -1423,6 +1710,26 @@ fn generator_expressions_work() {
 #[test]
 fn yield_from_works() {
     yield_from().unwrap();
+}
+
+#[test]
+fn generator_send_works() {
+    generator_send().unwrap();
+}
+
+#[test]
+fn generator_throw_works() {
+    generator_throw().unwrap();
+}
+
+#[test]
+fn generator_close_works() {
+    generator_close().unwrap();
+}
+
+#[test]
+fn generator_delegation_works() {
+    generator_delegation().unwrap();
 }
 
 #[test]

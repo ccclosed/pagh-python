@@ -11,36 +11,54 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
 
 ## Статус
 
-**Рабочая версия 0.6.0.** Язык и встроенные функции реализованы настолько,
+**Рабочая версия 0.7.0.** Язык и встроенные функции реализованы настолько,
 насколько это нужно для небольших скриптов на 1 MiB bump-heap ядра pagh.
 
-Новое в 0.6.0:
+Новое в 0.7.0 — полный протокол генератора поверх тех же файберов:
 
-- **`yield from`.** Делегирование итерации: `yield from <iterable>` выдаёт
-  все значения операнда, а не только генератора — работают генераторы,
-  `range`, списки, generator expressions и объекты с `__iter__`.
-  Делегирование ленивое, вкладывается на любую глубину (внешний файбер
-  резюмирует внутренний, как `for`), а по завершении выражение даёт `None`:
-  значения `return` у генераторов по-прежнему нет, `send`/`throw`/`close` не
-  реализованы, поэтому это итерационный протокол, а не полная делегация
-  CPython. Стек завершённого делегированного генератора возвращается в пул,
-  лимит в 8 одновременно приостановленных генераторов — прежний.
+- **`send(value)`, `throw(exc)`, `close()`.** Генератор стал корутиной.
+  `send(v)` резюмирует приостановленный `yield` так, что выражение `yield`
+  даёт `v`; `send(None)` — это `next()`, а не-`None` в ещё не запущенный
+  генератор — `TypeError` (в исчерпанный — `StopIteration`). `throw`
+  поднимает исключение в точке `yield`; формы — экземпляр, класс, класс +
+  аргументы (кортеж распаковывается), трёхаргументная форма CPython с
+  traceback не поддерживается и отвергается `TypeError`. `close()` поднимает
+  `GeneratorExit` в точке `yield`, поэтому выполняются `finally`; тело,
+  которое после этого снова выдало значение, получает
+  `RuntimeError: generator ignored GeneratorExit`. `GeneratorExit` наследует
+  `BaseException`, как в CPython, поэтому `except Exception` его не ловит.
+  `PEP 479` работает: `StopIteration`, вылетевший из тела, — это
+  `RuntimeError`, а не тихое завершение итератора.
+- **`yield from` делегирует `send`/`throw`/`close`** и вкладывается цепочкой:
+  `send` уходит в подгенератор, `throw` поднимается в нём, `close` сначала
+  закрывает подгенератор, а затем поднимает `GeneratorExit` во внешнем.
+  Выражение `yield from` теперь даёт значение `return` подгенератора (`None`
+  для обычного итератора). Для не-генератора делегация сужена и
+  задокументирована: `send` не-`None` — `AttributeError`, `throw` и `close`
+  поднимаются в точке `yield from`.
+- **Лимиты не изменились:** генераторы по-прежнему файберы на 64 КиБ,
+  одновременно приостановленных не больше 8 (девятый — `MemoryError`), а
+  стек и кадр завершённого/закрытого генератора возвращаются в пулы — цикл
+  на 200 генераторов с `send`/`close` проходит.
 
-Живая проверка 0.6.0 — на ядре **0.21.0** (`pagh-riscv`, QEMU `virt`, ext2
-64 MiB, драйвер `tests/live/qemu_driver.py`, одна загрузка): полный suite
-[`tests/live/live06.cmds`](tests/live/live06.cmds) — 40 запусков, 34 с кодом
-0, шесть намеренных диагностик (usage — код 2; `syntax_error.py`,
-`uncaught.py`, `generator_syntax.py`, `decorator_syntax.py`,
-`yield_from_syntax.py` — код 1), и новый
-[`tests/live/yield_from.py`](tests/live/yield_from.py) печатает
-`YIELD FROM OK`. `os_proc.py` (`os.fork`/`os.execv`/`os.waitpid`), который
-на ядре 0.19.0 не доходил до вывода, на 0.21.0 печатает
-`child: True status: 0` и `proc ok` — расхождение ядро/ABI из отчёта 0.5.0
-закрыто. Сырой транскрипт:
-[`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt), PASS-лист и детали —
+Живая проверка 0.7.0 — на ядре **0.21.2** (`pagh-riscv`, коммит `a0933ee`,
+QEMU `virt`, ext2 64 MiB, драйвер `tests/live/qemu_driver.py`, одна
+загрузка): полный suite [`tests/live/live07.cmds`](tests/live/live07.cmds) —
+43 запуска, 37 с кодом 0, шесть намеренных диагностик (usage — код 2;
+`syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
+`decorator_syntax.py`, `yield_from_syntax.py` — код 1), и три новые проверки:
+[`tests/live/gen_methods.py`](tests/live/gen_methods.py) печатает
+`GEN METHODS OK` (`send`/`throw`/`close`, иерархия `GeneratorExit`, PEP 479),
+[`tests/live/gen_delegation.py`](tests/live/gen_delegation.py) —
+`GEN DELEGATION OK` (делегация трёх методов и значение `return`),
+[`tests/live/gen_fibers.py`](tests/live/gen_fibers.py) — `GEN FIBERS OK`
+(лимит 8 приостановленных генераторов и рецикл стеков). Прежние маркеры
+`YIELD FROM OK`, `GENERATORS OK` и `child: True status: 0`/`proc ok` на месте.
+Сырой транскрипт:
+[`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt), PASS-лист и детали —
 [`docs/live-testing.md`](docs/live-testing.md).
 
-Размер release-ELF — 545 192 байта (532 КиБ; лимит ядра — 1 МиБ): профиль
+Размер release-ELF — 553 384 байта (541 КиБ; лимит ядра — 1 МиБ): профиль
 `release` теперь использует `strip = "symbols"`, потому что одна таблица
 символов занимала ~540 КиБ из 1085 КиБ файла 0.4.0. Потоков, сигналов, сети и
 динамического загрузчика в языке нет. Интерпретатор исполняет настоящие
@@ -73,10 +91,10 @@ cargo build --release
 
 ## Запуск в QEMU
 
-Один прогон suite 0.6.0 (сборка, образ, QEMU, транскрипт) — одной командой:
+Один прогон suite 0.7.0 (сборка, образ, QEMU, транскрипт) — одной командой:
 
 ```sh
-sh tests/live/live06.sh
+sh tests/live/live07.sh
 ```
 
 Вручную:
@@ -88,7 +106,7 @@ mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py-live.img 64M
 
 python3 tests/live/qemu_driver.py \
   --disk /tmp/py-live.img \
-  --commands tests/live/live06.cmds \
+  --commands tests/live/live07.cmds \
   --transcript /tmp/live.txt
 ```
 
@@ -172,13 +190,35 @@ keyword-only после `*args` (`def f(*args, x)`) и голый `*` не
 comprehension отвергается парсером). Вызов генераторной функции связывает
 параметры (ошибка арности — сразу `TypeError`) и возвращает генератор; тело
 не исполняется до первого `next()`. Поддерживаются `yield value`, `yield` без
-значения, `yield a, b` (кортеж), `x = yield value`, `next(gen)`,
-`next(gen, default)`, `StopIteration`, `for`/`in`/`list()`/`sum()` по
-генератору, `finally` при исчерпании, распространение исключения из тела в
-вызывающий `next()`, вложенные генераторы (внешний резюмирует внутренний),
-`iter(gen) is gen` и `yield from` для любого iterable (делегация, см. 0.6.0).
-Значение `return` из генератора теряется, повторный `next()` после исключения
-даёт `StopIteration`.
+значения, `yield a, b` (кортеж), `x = yield value` (значение приходит из
+`send`), `next(gen)`, `next(gen, default)`, `send(value)`, `throw(exc)`,
+`close()`, `StopIteration`, `for`/`in`/`list()`/`sum()` по генератору,
+`finally` при исчерпании и при `close()`, распространение исключения из тела
+в вызывающий `next()`/`throw()`, вложенные генераторы (внешний резюмирует
+внутренний), `iter(gen) is gen` и `yield from` для любого iterable
+(делегация `send`/`throw`/`close` и значение `return` — см. 0.7.0).
+
+Точные формы протокола (0.7.0): `send(None)` = `next()`, `send(v)` в ещё не
+запущенный генератор — `TypeError` (`can't send non-None value to a
+just-started generator`), в исчерпанный — `StopIteration`; `throw(instance)`,
+`throw(class)`, `throw(class, value)` (экземпляр класса используется как
+есть, кортеж распаковывается в аргументы) — необработанное исключение
+выходит из `throw`, а если тело после обработки завершилось, `throw` даёт
+`StopIteration`; `throw` в незапущенный генератор тело не исполняет, а в
+исчерпанный — поднимает переданное исключение в вызывающем (поведение
+CPython 3.13+); `close()` возвращает `None`, `GeneratorExit` можно поймать,
+но если тело после этого снова выдаст значение — `RuntimeError`. `PEP 479`
+реализован: `StopIteration`, вылетевший из тела генератора (в том числе из
+`throw(StopIteration)`), превращается в
+`RuntimeError: generator raised StopIteration`, а не завершает итерацию
+молча. `throw(GeneratorExit)` через `yield from` — особый случай CPython
+`gen_throw`: если подгенератор проглотил `GeneratorExit` и выдал значение —
+`RuntimeError: generator ignored GeneratorExit`, если подгенератор
+завершился — `GeneratorExit` поднимается в точке `yield from` (оба
+поведения проверены). Значение `return` самого генератора доступно только
+как значение `yield from`, но не через `StopIteration.value` (у исключений
+этого интерпретатора нет атрибута `value`); повторный `next()` после
+исключения даёт `StopIteration`.
 
 **Generator expressions:** `(element for target in iterable if cond ...)` —
 ленивый генератор, а не список: поддерживаются несколько `for`/`if`, захват
@@ -395,12 +435,17 @@ dict (`{k: v for k in ...}`), с несколькими `for` и `if`.
   — чистую ошибку вместо порчи кучи. Сборщика циклов
   нет: генератор, который приостановили и не исчерпали, оставаясь при этом
   достижимым из собственной области видимости (например `g = counter(10)` на
-  уровне модуля), держит свой слот до конца процесса — `del g` или
+  уровне модуля), держит свой слот до конца процесса — `del g`, `close()` или
   исчерпание (`list(g)`) его освобождают; `finally` такого брошенного
-  генератора не исполняется. Нет `send()`, `close()` и `throw()`; `yield from`
-  выполняет только итерационный протокол (см. 0.6.0) и даёт `None`; значение
-  `return` теряется; генератор нельзя скопировать или
-  сериализовать.
+  генератора не исполняется. `send`/`throw`/`close` есть (0.7.0), но с
+  задокументированными сужениями: у `throw` нет трёхаргументной формы
+  `(type, value, traceback)`; через `yield from` делегируется только
+  pagh-генератор — для обычного итератора `send` не-`None` даёт
+  `AttributeError`, а `throw`/`close` поднимаются в точке `yield from`;
+  значение `return` видно только как значение `yield from`, но не как
+  `StopIteration.value`; у генератора нет `gi_frame`/`gi_code`/
+  `gi_yieldfrom` и метода `__next__` (только `send`/`throw`/`close`);
+  генератор нельзя скопировать или сериализовать.
 - **Рекурсия упирается в стек, а не в константу.** `RECURSION_LIMIT = 56`
   кадров недостижим в этой сборке: Rust-кадры интерпретатора стоят несколько
   КиБ на Python-вызов, поэтому 64 КиБ стека процесса хватает примерно на
@@ -432,16 +477,22 @@ dict (`{k: v for k in ...}`), с несколькими `for` и `if`.
 
 ```sh
 cd hostcheck
-cargo test                 # 31 unit-тест интерпретатора
-cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (31 PASS)
+cargo test                 # 35 unit-тестов интерпретатора
+cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (35 PASS)
 cargo run -- ../tests/live/hello.py
 ```
 
-Проверки 0.6.0: `yield from` (делегирование генератору, `range`, generator
-expression и объекту с `__iter__`, ленивость, вложенность, `TypeError` на
-не-iterable, два фронтенд-отказа) — плюс 30 проверок 0.5.0 (`fibers`,
-`generators`, `generator expressions`, `decorators`, `percent format`,
-`os.path`, `time`, `random` и прежние 22).
+Проверки 0.7.0: `generator send` (значение в точке `yield`, `send(None)`,
+`TypeError` в незапущенный генератор, `StopIteration` в исчерпанный,
+повторный вход, generator expression), `generator throw` (экземпляр, класс,
+класс + аргументы, необработанное исключение, незапущенный и исчерпанный
+генератор, arity/типы), `generator close` (`finally`, `close()` незапущенного,
+`RuntimeError` на «игнорирующем» теле, иерархия `GeneratorExit`, повторный
+вход) и `generator delegation` (`send`/`throw`/`close` через `yield from`,
+значение `return`, вложенность, сужение для обычного итератора) — плюс 31
+проверка 0.6.0 (`fibers`, `generators`, `yield from`, `generator
+expressions`, `decorators`, `percent format`, `os.path`, `time`, `random` и
+прежние).
 
 `hostcheck --parse file.py` и `--tokens file.py` проверяют только фронтенд.
 `hostcheck` не умеет `os.fork`/`execv`/`waitpid` (у него нет libpagh); эти
@@ -450,20 +501,23 @@ expression и объекту с `__iter__`, ленивость, вложенно
 Живой QEMU-прогон suite 0.1.2 (30 PASS), отдельные прогоны `*args`/`**kwargs`
 и `str.format` (0.4.0), прогон 0.5.0 на ядре 0.19.0, полный прогон 0.6.0 на
 ядре 0.21.0 (40 запусков, 34 PASS, 6 намеренных диагностик; `YIELD FROM OK`)
-— PASS-листы и сырые логи:
-[`docs/live-testing.md`](docs/live-testing.md), транскрипты 0.5.0 и 0.6.0 —
-[`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt) и
-[`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt), скрипты —
+и прогон 0.7.0 на ядре 0.21.2 (43 запуска, 37 PASS, 6 намеренных
+диагностик; `GEN METHODS OK`, `GEN DELEGATION OK`, `GEN FIBERS OK`) —
+PASS-листы и сырые
+логи: [`docs/live-testing.md`](docs/live-testing.md), транскрипты 0.5.0,
+0.6.0 и 0.7.0 — [`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
+[`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt) и
+[`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt), скрипты —
 [`tests/live/`](tests/live/).
 
 ## CI
 
 `.github/workflows/ci.yml` чекаутит соседний `pagh-api` (main), ставит
 тулчейн из `rust-toolchain.toml` и гоняет два гейта: `cargo test` в
-`hostcheck` (31 проверка) и `cargo build --release` для
+`hostcheck` (35 проверок) и `cargo build --release` для
 `riscv64gc-unknown-none-elf` с проверкой, что `pythonc` не превышает лимит
 ядра в 1 МиБ. Живой QEMU-прогон в CI намеренно не входит: для него нужны
-ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live06.sh`.
+ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live07.sh`.
 
 ## Устройство
 

@@ -35,8 +35,8 @@ use crate::value;
 use crate::value::{
     attr_get, attr_set, class_is_subclass, class_lookup, dict_get, dict_set, env_find_nonlocal,
     env_lookup, is_same, set_find, set_insert, values_equal, BuiltinId, BuiltinType, BuiltinValue,
-    Class, Env, EnvRef, Function, FunctionBody, Generator, Instance, IterState, ModuleValue,
-    RangeValue, Value,
+    Class, Env, EnvRef, Function, FunctionBody, Generator, GeneratorPending, Instance, IterState,
+    ModuleValue, RangeValue, Value,
 };
 
 /// Maximum number of nested Python calls. See the module docs.
@@ -152,6 +152,25 @@ struct ActiveFiber {
     /// `call_stack` length just below the generator's own frame: a `yield`
     /// parks the frames above it so the resumer's tracebacks stay its own.
     frame_depth: usize,
+}
+
+/// What the resumer asked for when the generator suspended at a `yield`.
+///
+/// `fiber_yield` returns this instead of a plain value because `yield from`
+/// has to route `send`/`throw`/`close` to the delegated generator, and a
+/// plain `next()` is not the same request as `send(None)`.
+enum YieldResume {
+    /// `next()` / `for` iteration: the `yield` expression evaluates to `None`.
+    Next,
+    /// `generator.send(value)`: the `yield` expression evaluates to `value`.
+    Send(Value),
+    /// `generator.throw(error)`: raise `error` at the `yield`.
+    Throw(PyError),
+    /// `generator.close()`: raise `GeneratorExit` at the `yield`, closing a
+    /// delegated generator first. Kept apart from `Throw(GeneratorExit)`
+    /// because CPython's `gen_close` calls `delegate.close()`, while
+    /// `throw(GeneratorExit)` goes through `delegate.throw()`.
+    Close,
 }
 
 pub struct Frame {
@@ -277,6 +296,10 @@ impl Interp {
         let assertion = exception_class("AssertionError", alloc::vec![exception.clone()], None);
         let memory = exception_class("MemoryError", alloc::vec![exception.clone()], None);
         let system_exit = exception_class("SystemExit", alloc::vec![base_exception.clone()], None);
+        // `GeneratorExit` derives from `BaseException`, not `Exception`, as in
+        // CPython, so `except Exception` does not swallow a `close()`.
+        let generator_exit =
+            exception_class("GeneratorExit", alloc::vec![base_exception.clone()], None);
 
         let exceptions = alloc::vec![
             base_exception,
@@ -309,6 +332,7 @@ impl Interp {
             assertion,
             memory,
             system_exit,
+            generator_exit,
         ];
 
         let module_env = Env::new(None);
@@ -1298,22 +1322,107 @@ impl Interp {
                     Some(expression) => self.eval_expr(expression, env)?,
                     None => Value::None,
                 };
-                self.fiber_yield(produced)
+                match self.fiber_yield(produced)? {
+                    YieldResume::Next => Ok(Value::None),
+                    YieldResume::Send(value) => Ok(value),
+                    YieldResume::Throw(error) => Err(error),
+                    YieldResume::Close => Err(self.generator_exit_error()),
+                }
             }
             Expr::YieldFrom(iterable) => {
-                // `yield from` is the iteration protocol in this interpreter:
-                // the operand is evaluated once, then every value it produces
-                // is yielded on to the resumer. A delegated generator is
-                // resumed through the same nesting path as a `for` loop (the
-                // outer fiber resumes the inner one), so laziness and the
-                // 8-suspended-fiber limit are unchanged. The expression
-                // evaluates to `None`: there is no `return` value to capture.
-                let iterable = self.eval_expr(iterable, env)?;
-                let iterator = self.make_iterator(iterable)?;
-                while let Some(item) = self.next_from_iterator(&iterator)? {
-                    self.fiber_yield(item)?;
+                // `yield from` is iteration plus delegation: the operand is
+                // evaluated once, every value it produces is yielded on to the
+                // resumer, and `send`/`throw`/`close` are routed to it the way
+                // CPython's `gen_send_ex`/`gen_throw`/`gen_close` route them.
+                //
+                // A pagh generator delegate gets real delegation (its fiber is
+                // resumed from inside this one, so nesting and the
+                // 8-suspended-fiber limit are those of the iteration path).
+                // For any other iterator there is no `send`/`throw`: sending a
+                // non-None value is an `AttributeError`, throwing raises at the
+                // `yield from` expression, and closing just raises
+                // `GeneratorExit` here — the same narrowing the README
+                // documents.
+                let operand = self.eval_expr(iterable, env)?;
+                let iterator = self.make_iterator(operand)?;
+                let mut request = YieldResume::Next;
+                loop {
+                    let produced = match request {
+                        YieldResume::Next => match &iterator {
+                            Value::Generator(generator) => {
+                                let generator = generator.clone();
+                                self.generator_delegated(&generator, Value::None, None)?
+                            }
+                            _ => self.next_from_iterator(&iterator)?,
+                        },
+                        YieldResume::Send(value) => match &iterator {
+                            Value::Generator(generator) => {
+                                let generator = generator.clone();
+                                self.generator_delegated(&generator, value, None)?
+                            }
+                            _ => {
+                                if matches!(value, Value::None) {
+                                    self.next_from_iterator(&iterator)?
+                                } else {
+                                    return Err(self.err(
+                                        "AttributeError",
+                                        format!(
+                                            "'{}' object has no attribute 'send'",
+                                            iterator.type_name()
+                                        ),
+                                    ));
+                                }
+                            }
+                        },
+                        YieldResume::Throw(error) => match &iterator {
+                            Value::Generator(generator) => {
+                                // `throw(GeneratorExit)` into a delegate is
+                                // special-cased by CPython's `gen_throw`: the
+                                // delegate must die. If it yields a value it
+                                // "ignored GeneratorExit" (RuntimeError at
+                                // this `yield from`), and if it returns
+                                // normally the GeneratorExit is raised here.
+                                let generator_exit = error.type_name() == "GeneratorExit";
+                                let generator = generator.clone();
+                                match self.generator_delegated(
+                                    &generator,
+                                    Value::None,
+                                    Some(GeneratorPending::Throw(error)),
+                                ) {
+                                    Ok(Some(_value)) if generator_exit => {
+                                        return Err(self.err(
+                                            "RuntimeError",
+                                            String::from("generator ignored GeneratorExit"),
+                                        ))
+                                    }
+                                    Ok(None) if generator_exit => {
+                                        return Err(self.generator_exit_error())
+                                    }
+                                    Ok(produced) => produced,
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            // No `throw()` on a plain iterator: CPython raises
+                            // the exception at the outer `yield from` point,
+                            // which is exactly `return Err(error)` here.
+                            _ => return Err(error),
+                        },
+                        YieldResume::Close => {
+                            if let Value::Generator(generator) = &iterator {
+                                let generator = generator.clone();
+                                // A delegate that ignores GeneratorExit makes
+                                // its own close() raise RuntimeError, which
+                                // replaces the close of this generator.
+                                self.generator_close(&generator)?;
+                            }
+                            return Err(self.generator_exit_error());
+                        }
+                    };
+                    match produced {
+                        Some(item) => request = self.fiber_yield(item)?,
+                        None => return Ok(self.delegated_return_value(&iterator)),
+                    }
                 }
-                Ok(Value::None)
             }
             Expr::GeneratorExp { element, generators } => {
                 self.make_generator_expression(element, generators, env)
@@ -1746,13 +1855,20 @@ impl Interp {
                     String::from("'break' or 'return' outside a loop/function"),
                 )),
             },
-            Err(error) => Err(error),
+            // PEP 479: a StopIteration escaping the body is not the end of
+            // the iteration, it is an error: `for` would silently misread it
+            // as normal exhaustion. CPython turns it into a RuntimeError here,
+            // and so does this entry point.
+            Err(error) => Err(interp.generator_stop_iteration(error)),
         };
         if let Some(fiber) = fiber {
             (*generator).finished = true;
             (*generator).running = false;
             match outcome {
-                Ok(value) => (*generator).yielded = Some(value),
+                // The body's `return` value: `yield from` exposes it as the
+                // value of the delegated expression (CPython's
+                // StopIteration.value), so it is kept apart from `yielded`.
+                Ok(value) => (*generator).returned = Some(value),
                 Err(error) => (*generator).failed = Some(error),
             }
             // Hand control back for the last time, then park: a finished
@@ -1809,7 +1925,14 @@ impl Interp {
     ) -> PyResult<()> {
         if index >= generators.len() {
             let value = self.eval_expr(element, env)?;
-            self.fiber_yield(value)?;
+            // A generator expression has no name to bind the sent value to,
+            // so `send()` values are discarded (as in CPython); `throw()` and
+            // `close()` still raise at the `yield`.
+            match self.fiber_yield(value)? {
+                YieldResume::Next | YieldResume::Send(_) => {}
+                YieldResume::Throw(error) => return Err(error),
+                YieldResume::Close => return Err(self.generator_exit_error()),
+            }
             return Ok(());
         }
         let generator = &generators[index];
@@ -1853,10 +1976,13 @@ impl Interp {
             name: function.name.clone(),
             fiber: None,
             running: false,
+            started: false,
             finished: false,
             failed: None,
             yielded: None,
             sent: Value::None,
+            pending: None,
+            returned: None,
         })));
         Ok(generator)
     }
@@ -1889,6 +2015,22 @@ impl Interp {
     pub fn generator_resume(
         &mut self,
         generator: &Rc<RefCell<Generator>>,
+    ) -> PyResult<Option<Value>> {
+        self.generator_resume_with(generator, Value::None, None)
+    }
+
+    /// Resume a generator, optionally delivering a value (`send`) or an
+    /// exception (`throw`/`close`) to the suspended `yield`.
+    ///
+    /// The two "requests" are written into the generator before the switch, so
+    /// the running fiber sees them when it comes back from `yield_to_caller`
+    /// inside [`Interp::fiber_yield`]; the fields are never touched by both
+    /// sides at once.
+    fn generator_resume_with(
+        &mut self,
+        generator: &Rc<RefCell<Generator>>,
+        sent: Value,
+        pending: Option<GeneratorPending>,
     ) -> PyResult<Option<Value>> {
         {
             let borrowed = generator.borrow();
@@ -1943,7 +2085,10 @@ impl Interp {
         // its two pointers before it can yield.
         unsafe {
             (*generator_ptr).running = true;
+            (*generator_ptr).started = true;
             (*generator_ptr).yielded = None;
+            (*generator_ptr).sent = sent;
+            (*generator_ptr).pending = pending;
         }
         self.active_fibers.push(ActiveFiber {
             fiber: fiber_ptr,
@@ -1971,10 +2116,21 @@ impl Interp {
         if unsafe { (*generator_ptr).finished } {
             unsafe {
                 (*generator_ptr).fiber = None;
-                // Drop the captured frame too: it is one half of that cycle,
-                // and a finished body cannot need it again.
-                (*generator_ptr).env = Env::new(None);
+                // The frames parked by a `yield` never came back (the fiber
+                // ended instead of yielding); drop the request that was not
+                // delivered.
+                (*generator_ptr).pending = None;
+                (*generator_ptr).sent = Value::None;
             }
+            // Drop the captured frame too: it is one half of that
+            // generator/environment cycle, and a finished body cannot need it
+            // again. The frame goes to the environment pool when it is
+            // uniquely owned (the usual case), not just to the allocator:
+            // pagh's bump heap never returns memory, and a script that creates
+            // and closes many generators in a loop must not spend a frame per
+            // iteration.
+            let frame = unsafe { core::mem::replace(&mut (*generator_ptr).env, Env::new(None)) };
+            self.release_env(frame);
         }
         let mut borrowed = keep.borrow_mut();
         borrowed.running = false;
@@ -1987,9 +2143,298 @@ impl Interp {
         Ok(borrowed.yielded.take())
     }
 
+    /// Resume a delegated generator from `yield from`.
+    ///
+    /// Same state checks as the public methods, narrowed to what `yield from`
+    /// needs: "the delegate's body ended" is `Ok(None)` (the `yield from`
+    /// expression then evaluates to the delegate's `return` value) instead of
+    /// being reported as `StopIteration`, which is what `send`/`throw` mean to
+    /// their caller.
+    fn generator_delegated(
+        &mut self,
+        generator: &Rc<RefCell<Generator>>,
+        sent: Value,
+        pending: Option<GeneratorPending>,
+    ) -> PyResult<Option<Value>> {
+        {
+            let borrowed = generator.borrow();
+            if borrowed.running {
+                return Err(self.err(
+                    "ValueError",
+                    String::from("generator already executing"),
+                ));
+            }
+            if borrowed.finished {
+                // An exhausted delegate is the normal end of a `yield from`,
+                // not its own StopIteration: the expression just takes the
+                // (already consumed) return value, i.e. None.
+                return Ok(None);
+            }
+            if !borrowed.started {
+                match pending {
+                    Some(GeneratorPending::Throw(error)) => {
+                        generator.borrow_mut().finished = true;
+                        return Err(error);
+                    }
+                    Some(GeneratorPending::Close) => {
+                        generator.borrow_mut().finished = true;
+                        return Ok(None);
+                    }
+                    None => {
+                        if !matches!(sent, Value::None) {
+                            return Err(self.err(
+                                "TypeError",
+                                String::from(
+                                    "can't send non-None value to a just-started generator",
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        self.generator_resume_with(generator, sent, pending)
+    }
+
+    /// `generator.send(value)`.
+    ///
+    /// `send(None)` behaves as `next()`; any other value delivered to a
+    /// generator whose body has not started yet is a `TypeError`, exactly as
+    /// in CPython (there is no `yield` to receive it). A finished generator
+    /// raises `StopIteration`.
+    pub fn generator_send(
+        &mut self,
+        generator: &Rc<RefCell<Generator>>,
+        value: Value,
+    ) -> PyResult<Value> {
+        {
+            let borrowed = generator.borrow();
+            if borrowed.running {
+                return Err(self.err(
+                    "ValueError",
+                    String::from("generator already executing"),
+                ));
+            }
+            if borrowed.finished {
+                return Err(self.err("StopIteration", String::new()));
+            }
+            if !borrowed.started && !matches!(value, Value::None) {
+                return Err(self.err(
+                    "TypeError",
+                    String::from("can't send non-None value to a just-started generator"),
+                ));
+            }
+        }
+        match self.generator_resume_with(generator, value, None)? {
+            Some(value) => Ok(value),
+            None => Err(self.err("StopIteration", String::new())),
+        }
+    }
+
+    /// `generator.throw(error)`: raise `error` at the suspended `yield`.
+    ///
+    /// If the body catches it and yields, that value comes back. If the body
+    /// ends, the caller gets `StopIteration`; if the exception escapes the
+    /// body, the caller gets the exception. Throwing into a generator that
+    /// never started does not run the body (CPython raises in the caller too)
+    /// and closes it; throwing into an exhausted generator raises `error` in
+    /// the caller (CPython 3.13+ behaviour).
+    pub fn generator_throw(
+        &mut self,
+        generator: &Rc<RefCell<Generator>>,
+        error: PyError,
+    ) -> PyResult<Value> {
+        let (running, finished, started) = {
+            let borrowed = generator.borrow();
+            (borrowed.running, borrowed.finished, borrowed.started)
+        };
+        if running {
+            return Err(self.err(
+                "ValueError",
+                String::from("generator already executing"),
+            ));
+        }
+        if finished {
+            return Err(error);
+        }
+        if !started {
+            // No `yield` exists yet, so there is nothing to raise at: CPython
+            // raises in the caller and leaves the body unexecuted.
+            generator.borrow_mut().finished = true;
+            return Err(error);
+        }
+        match self.generator_resume_with(
+            generator,
+            Value::None,
+            Some(GeneratorPending::Throw(error)),
+        )? {
+            Some(value) => Ok(value),
+            None => Err(self.err("StopIteration", String::new())),
+        }
+    }
+
+    /// `generator.close()`: raise `GeneratorExit` at the suspended `yield`.
+    ///
+    /// `finally` blocks run, a delegated generator is closed first, and a body
+    /// that yields again is refused with `RuntimeError` (CPython's "generator
+    /// ignored GeneratorExit") instead of being resumed into an inconsistent
+    /// state. A `GeneratorExit`/`StopIteration` escaping the body is the
+    /// normal end of a close; any other exception propagates.
+    pub fn generator_close(&mut self, generator: &Rc<RefCell<Generator>>) -> PyResult<()> {
+        let (running, finished, started) = {
+            let borrowed = generator.borrow();
+            (borrowed.running, borrowed.finished, borrowed.started)
+        };
+        if running {
+            return Err(self.err(
+                "ValueError",
+                String::from("generator already executing"),
+            ));
+        }
+        if finished {
+            return Ok(());
+        }
+        if !started {
+            generator.borrow_mut().finished = true;
+            return Ok(());
+        }
+        match self.generator_resume_with(generator, Value::None, Some(GeneratorPending::Close)) {
+            Ok(None) => Ok(()),
+            Ok(Some(_value)) => Err(self.err(
+                "RuntimeError",
+                String::from("generator ignored GeneratorExit"),
+            )),
+            Err(error) => {
+                if error.type_name() == "GeneratorExit" || error.type_name() == "StopIteration" {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    /// PEP 479: convert a `StopIteration` escaping a generator body into
+    /// `RuntimeError: generator raised StopIteration`.
+    ///
+    /// The generator's own traceback frames are kept: the conversion happens
+    /// after the body unwound, so a fresh snapshot would only show the
+    /// resumer's frames.
+    fn generator_stop_iteration(&self, error: PyError) -> PyError {
+        if error.type_name() != "StopIteration" {
+            return error;
+        }
+        let mut converted = PyError::builtin(
+            "RuntimeError",
+            String::from("generator raised StopIteration"),
+        );
+        converted.frames = error.frames;
+        converted
+    }
+
+    /// Build the `GeneratorExit` a close raises at the `yield`.
+    fn generator_exit_error(&self) -> PyError {
+        let mut error = PyError::builtin("GeneratorExit", String::new());
+        error.frames = self.snapshot();
+        error
+    }
+
+    /// The value a finished `yield from` delegation evaluates to: the delegate
+    /// generator's `return` value, or `None` for a plain iterator. The value
+    /// is taken, so a second delegation to the same exhausted generator (or a
+    /// later `next()`) sees `None`, as with `StopIteration.value` in CPython.
+    fn delegated_return_value(&mut self, iterator: &Value) -> Value {
+        match iterator {
+            Value::Generator(generator) => generator
+                .borrow_mut()
+                .returned
+                .take()
+                .unwrap_or(Value::None),
+            _ => Value::None,
+        }
+    }
+
+    /// Build the exception `generator.throw()` was asked to raise.
+    ///
+    /// Supported forms, deliberately narrower than CPython's and documented in
+    /// the README:
+    ///
+    /// * `throw(instance)` — the instance itself;
+    /// * `throw(class)` — `class()`;
+    /// * `throw(class, value)` — `value` when it already is an instance of
+    ///   `class`, `class(*value)` when `value` is a tuple, `class(value)`
+    ///   otherwise.
+    ///
+    /// The 3-argument `throw(class, value, traceback)` form is rejected: this
+    /// interpreter has no traceback objects.
+    pub fn exception_from_throw_args(&mut self, args: &ArgList) -> PyResult<PyError> {
+        if args.len() == 0 {
+            return Err(self.err(
+                "TypeError",
+                String::from("throw expected at least 1 argument, got 0"),
+            ));
+        }
+        if args.len() > 2 {
+            return Err(self.err(
+                "TypeError",
+                String::from(
+                    "throw(type, value, traceback) is not supported: pass an exception instance or a class and its arguments",
+                ),
+            ));
+        }
+        let first = match args.get(0) {
+            Some(value) => value.clone(),
+            None => Value::None,
+        };
+        let class = match &first {
+            Value::Class(class) if class.is_exception => Some(class.clone()),
+            Value::Instance(instance) if instance.class.is_exception => None,
+            Value::Class(_) | Value::Instance(_) => {
+                return Err(self.err(
+                    "TypeError",
+                    String::from("exceptions must derive from BaseException"),
+                ))
+            }
+            other => {
+                return Err(self.err(
+                    "TypeError",
+                    format!(
+                        "exceptions must derive from BaseException, not '{}'",
+                        other.type_name()
+                    ),
+                ))
+            }
+        };
+        let Some(class) = class else {
+            return Ok(self.error_from_raised_value(first));
+        };
+        let Some(second) = args.get(1) else {
+            return Ok(self.error_from_raised_value(first));
+        };
+        let instance = match second {
+            Value::Instance(instance) if class_is_subclass(&instance.class, &class) => {
+                Value::Instance(instance.clone())
+            }
+            Value::Tuple(items) => {
+                let mut call = ArgList::new();
+                for item in items.iter() {
+                    call.push(item.clone());
+                }
+                self.instantiate_exception(class.clone(), &call, &[])?
+            }
+            other => {
+                let mut call = ArgList::new();
+                call.push(other.clone());
+                self.instantiate_exception(class.clone(), &call, &[])?
+            }
+        };
+        Ok(self.error_from_exception(&class, instance))
+    }
+
     /// Suspend the running generator at a `yield`, handing `value` to its
-    /// resumer. Returns the value the resumer sends back (always `None`).
-    fn fiber_yield(&mut self, value: Value) -> PyResult<Value> {
+    /// resumer. Returns what the resumer asked for: the next `next`/`send`
+    /// value, or the exception it injected (`throw`/`close`).
+    fn fiber_yield(&mut self, value: Value) -> PyResult<YieldResume> {
         let active = match self.active_fibers.last().copied() {
             Some(active) => active,
             None => {
@@ -2009,10 +2454,20 @@ impl Interp {
             (*active.generator).running = true;
         }
         self.call_stack.extend(parked);
-        Ok(core::mem::replace(
-            unsafe { &mut (*active.generator).sent },
-            Value::None,
-        ))
+        // The resumer wrote exactly one of `pending`/`sent` before switching
+        // back. `pending` wins: an injected exception replaces the value.
+        unsafe {
+            match (*active.generator).pending.take() {
+                Some(GeneratorPending::Throw(error)) => Ok(YieldResume::Throw(error)),
+                Some(GeneratorPending::Close) => Ok(YieldResume::Close),
+                None => Ok(
+                    match core::mem::replace(&mut (*active.generator).sent, Value::None) {
+                        Value::None => YieldResume::Next,
+                        value => YieldResume::Send(value),
+                    },
+                ),
+            }
+        }
     }
 
     // ── calls ──────────────────────────────────────────────────────────────
@@ -3941,6 +4396,20 @@ impl Interp {
                 "step" => return Ok(Value::Int(range.step)),
                 _ => {}
             },
+            Value::Generator(_) => {
+                // The generator protocol methods. `next(gen)` and `iter(gen)`
+                // are builtins/interpreter paths, so only the three methods
+                // CPython added on top of the iterator protocol live here.
+                let id = match name {
+                    "send" => Some(BuiltinId::GenSend),
+                    "throw" => Some(BuiltinId::GenThrow),
+                    "close" => Some(BuiltinId::GenClose),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    return Ok(Value::method(id, target.clone()));
+                }
+            }
             Value::Module(module) => {
                 if let Some(value) = attr_get(&module.attrs, name) {
                     return Ok(value);
@@ -4117,7 +4586,18 @@ impl Interp {
     pub fn next_from_iterator(&mut self, iterator: &Value) -> PyResult<Option<Value>> {
         match iterator {
             Value::Iterator(state) => Ok(state.borrow_mut().next()),
-            Value::Generator(generator) => self.generator_resume(generator),
+            Value::Generator(generator) => {
+                let produced = self.generator_resume(generator)?;
+                if produced.is_none() {
+                    // CPython delivers the return value once, in the
+                    // StopIteration of the `next()` that ends the generator;
+                    // a later `yield from` of the same exhausted generator
+                    // therefore sees None. `yield from` reads it before this
+                    // point through `generator_delegated`.
+                    let _ = generator.borrow_mut().returned.take();
+                }
+                Ok(produced)
+            }
             _ => Err(self.err(
                 "TypeError",
                 format!("'{}' object is not an iterator", iterator.type_name()),
