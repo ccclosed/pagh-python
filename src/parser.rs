@@ -20,7 +20,36 @@ use crate::ast::{
     Module, Name, Param, ParamKind, Stmt, StmtKind, UnOp, WithItem,
 };
 use crate::error::SyntaxError;
+use crate::fiber;
 use crate::lexer::{tokenize, FStringLexPart, Kw, Op, Tok, Token};
+use crate::platform;
+
+/// The deepest nesting of recursive-descent *constructs* the parser will enter.
+///
+/// Brackets are bounded earlier and separately, in the lexer
+/// ([`crate::lexer::MAX_BRACKET_DEPTH`], 200 like CPython's tokenizer); this
+/// counter covers the recursion that no token-level pass can bound: chains of
+/// unary operators (`not not …`, `- - …`, `~ ~ …`), right-associative `**`,
+/// conditional expressions (`a if b else c if d else …`), lambda bodies,
+/// indented statement blocks, assignment targets and `yield` operands.
+///
+/// The limit is 200 nesting levels, the same order as CPython's parser limits.
+/// Crossing it is a `SyntaxError: maximum recursion depth exceeded`, never a
+/// Rust stack overflow.
+pub const MAX_PARSE_DEPTH: usize = 200;
+
+/// Free process-stack bytes the parser insists on keeping below itself once it
+/// is running on the platform's documented user stack.
+///
+/// The semantic limits above bound *nesting*, but one nesting level is not
+/// cheap: a parenthesized expression walks the whole precedence chain and costs
+/// several KiB of Rust frames. On pagh-riscv the whole process stack is 1 MiB
+/// (audit F-rt-4: 199 nested parentheses already walk it into the guard page),
+/// so a file inside the semantic limits would still die if the parser only
+/// counted levels. The guard in [`Parser::check_stack_headroom`] turns that
+/// last case into the same `SyntaxError`; the margin leaves room for one more
+/// descent level plus the error path.
+const STACK_SAFETY_MARGIN: usize = 128 * 1024;
 
 pub fn parse(source: &str) -> Result<Module, SyntaxError> {
     let tokens = tokenize(source)?;
@@ -29,6 +58,7 @@ pub fn parse(source: &str) -> Result<Module, SyntaxError> {
         pos: 0,
         function_yields: Vec::new(),
         comprehension_depth: 0,
+        depth: 0,
     };
     parser.parse_module()
 }
@@ -44,6 +74,11 @@ struct Parser {
     /// Non-zero while parsing a comprehension. `yield` there is a syntax error
     /// in Python 3 and stays one here.
     comprehension_depth: usize,
+    /// Nesting levels of recursive-descent constructs currently open; see
+    /// [`MAX_PARSE_DEPTH`]. Incremented by [`Self::enter_nesting`] and given
+    /// back by [`Self::leave_nesting`] on the success path only (a parse error
+    /// ends the whole parse, so nothing observes the counter afterwards).
+    depth: usize,
 }
 
 impl Parser {
@@ -91,6 +126,62 @@ impl Parser {
 
     fn error<T>(&self, message: String) -> Result<T, SyntaxError> {
         Err(SyntaxError::new(message, self.line(), self.column()))
+    }
+
+    // ── recursion budget ───────────────────────────────────────────────────
+
+    /// The one error every recursion guard raises, so hostile nesting is
+    /// reported exactly like CPython's recursion limit and never as a crash.
+    fn depth_error<T>(&self) -> Result<T, SyntaxError> {
+        self.error(String::from("maximum recursion depth exceeded"))
+    }
+
+    /// Reserve one nesting level for a recursive construct.
+    ///
+    /// Every caller holds the level until the nested construct has been parsed
+    /// and then calls [`Self::leave_nesting`]; on the error path the reserve is
+    /// simply abandoned, because the parser is never used again after an error.
+    fn enter_nesting(&mut self) -> Result<(), SyntaxError> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return self.depth_error();
+        }
+        self.check_stack_headroom()?;
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave_nesting(&mut self) {
+        self.depth -= 1;
+    }
+
+    /// Refuse to descend towards the guard page below the process stack floor.
+    ///
+    /// The parser normally runs on the process stack, and on pagh-riscv that is
+    /// a documented 1 MiB window ending at `USER_STACK_FLOOR`; the kernel's
+    /// demand growth stops there and the next store faults, killing the process
+    /// (audit F-rt-4). Counting nesting levels is not enough on its own because
+    /// one level costs several KiB, so every level also checks the actual stack
+    /// pointer against the platform's floor plus [`STACK_SAFETY_MARGIN`].
+    ///
+    /// The same check runs inside [`Self::parse_expr`], which is the entry point
+    /// for every nested expression, so bracket nesting (bounded separately and
+    /// iteratively by the lexer) is covered too.
+    ///
+    /// `process_stack_bounds` is `None` on the host harness: the parser then
+    /// relies on the counters alone, which is what lets the host tests assert
+    /// the exact 199/200/201 boundaries. The parser can also run on a generator
+    /// fiber stack when a script imports a module inside a generator; that stack
+    /// is a heap allocation with no fixed address, so the window check skips it
+    /// (and the interpreter's own fiber guard bounds that small stack).
+    fn check_stack_headroom(&self) -> Result<(), SyntaxError> {
+        let Some((floor, top)) = platform::process_stack_bounds() else {
+            return Ok(());
+        };
+        let sp = fiber::current_sp();
+        if sp >= floor && sp < top && sp < floor.saturating_add(STACK_SAFETY_MARGIN) {
+            return self.depth_error();
+        }
+        Ok(())
     }
 
     fn describe(tok: &Tok) -> String {
@@ -257,7 +348,19 @@ impl Parser {
         ))
     }
 
+    /// Parse a suite after the ':' of a compound statement.
+    ///
+    /// Nested `if`/`for`/`while`/`def`/`class`/`try`/`with` statements recurse
+    /// through here, one level per indented block, so this is the statement
+    /// half of the parser's recursion budget.
     fn parse_block(&mut self) -> Result<Vec<Stmt>, SyntaxError> {
+        self.enter_nesting()?;
+        let result = self.parse_block_inner();
+        self.leave_nesting();
+        result
+    }
+
+    fn parse_block_inner(&mut self) -> Result<Vec<Stmt>, SyntaxError> {
         // Called after the ':' of a compound statement.
         if matches!(self.peek(), Tok::Newline) {
             self.advance();
@@ -913,15 +1016,24 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, SyntaxError> {
+        // Every nested expression enters here (parentheses, call arguments,
+        // subscripts, comprehension elements/iterables, lambda and yield
+        // operands), so the actual stack headroom is re-checked here as well as
+        // per nesting level: the lexer's bracket limit bounds bracket *counts*,
+        // not the KiB one level costs on the 1 MiB pagh stack.
+        self.check_stack_headroom()?;
         let body = self.parse_or()?;
         if self.eat_kw(Kw::If) {
             let condition = self.parse_or()?;
             self.expect_kw(Kw::Else, "in a conditional expression")?;
-            let otherwise = self.parse_expr()?;
+            // `a if b else c if d else …` nests through the `else` branch.
+            self.enter_nesting()?;
+            let otherwise = self.parse_expr();
+            self.leave_nesting();
             return Ok(Expr::IfExpr {
                 body: Box::new(body),
                 condition: Box::new(condition),
-                otherwise: Box::new(otherwise),
+                otherwise: Box::new(otherwise?),
             });
         }
         Ok(body)
@@ -959,9 +1071,14 @@ impl Parser {
 
     fn parse_not(&mut self) -> Result<Expr, SyntaxError> {
         if self.eat_kw(Kw::Not) {
+            // A chain of `not`s recurses here without any bracket token, so it
+            // needs its own nesting level.
+            self.enter_nesting()?;
+            let value = self.parse_not();
+            self.leave_nesting();
             return Ok(Expr::Unary {
                 op: UnOp::Not,
-                value: Box::new(self.parse_not()?),
+                value: Box::new(value?),
             });
         }
         self.parse_comparison()
@@ -1131,35 +1248,39 @@ impl Parser {
     }
 
     fn parse_factor(&mut self) -> Result<Expr, SyntaxError> {
-        if self.eat_op(Op::Tilde) {
-            return Ok(Expr::Unary {
-                op: UnOp::Invert,
-                value: Box::new(self.parse_factor()?),
-            });
-        }
-        if self.eat_op(Op::Minus) {
-            return Ok(Expr::Unary {
-                op: UnOp::Minus,
-                value: Box::new(self.parse_factor()?),
-            });
-        }
-        if self.eat_op(Op::Plus) {
-            return Ok(Expr::Unary {
-                op: UnOp::Plus,
-                value: Box::new(self.parse_factor()?),
-            });
-        }
-        self.parse_power()
+        let op = if self.eat_op(Op::Tilde) {
+            Some(UnOp::Invert)
+        } else if self.eat_op(Op::Minus) {
+            Some(UnOp::Minus)
+        } else if self.eat_op(Op::Plus) {
+            Some(UnOp::Plus)
+        } else {
+            None
+        };
+        let Some(op) = op else {
+            return self.parse_power();
+        };
+        // Unary chains (`- - -`, `~~~`) are recursion without bracket tokens.
+        self.enter_nesting()?;
+        let value = self.parse_factor();
+        self.leave_nesting();
+        Ok(Expr::Unary {
+            op,
+            value: Box::new(value?),
+        })
     }
 
     fn parse_power(&mut self) -> Result<Expr, SyntaxError> {
         let base = self.parse_postfix()?;
         if self.eat_op(Op::StarStar) {
-            let exponent = self.parse_factor()?;
+            // `**` is right-associative: `2 ** 2 ** 2 ** …` recurses here.
+            self.enter_nesting()?;
+            let exponent = self.parse_factor();
+            self.leave_nesting();
             return Ok(Expr::Binary {
                 op: BinOp::Pow,
                 left: Box::new(base),
-                right: Box::new(exponent),
+                right: Box::new(exponent?),
             });
         }
         Ok(base)
@@ -1507,14 +1628,21 @@ impl Parser {
             }
         }
         if delegating {
-            let value = self.parse_expr()?;
-            return Ok(Expr::YieldFrom(Box::new(value)));
+            self.enter_nesting()?;
+            let value = self.parse_expr();
+            self.leave_nesting();
+            return Ok(Expr::YieldFrom(Box::new(value?)));
         }
         if self.at_yield_end() {
             return Ok(Expr::Yield(None));
         }
-        let value = self.parse_testlist()?;
-        Ok(Expr::Yield(Some(Box::new(value))))
+        // This subset accepts `yield yield …` (CPython rejects it), so the
+        // operand is its own recursion path: without a level reserve a long
+        // chain would recurse on parser frames but no bracket or operator token.
+        self.enter_nesting()?;
+        let value = self.parse_testlist();
+        self.leave_nesting();
+        Ok(Expr::Yield(Some(Box::new(value?))))
     }
 
     /// True when the token after `yield` cannot start its operand.
@@ -1667,7 +1795,11 @@ impl Parser {
         self.validate_signature(&params)?;
         self.expect_op(Op::Colon, "after the lambda parameters")?;
         self.function_yields.push(false);
-        let body = self.parse_expr()?;
+        // A nested lambda (`lambda: lambda: …`) recurses through its body.
+        self.enter_nesting()?;
+        let body = self.parse_expr();
+        self.leave_nesting();
+        let body = body?;
         if self.function_yields.pop().unwrap_or(false) {
             return self.error(String::from(
                 "'yield' inside a lambda is not supported; use a def",
@@ -1694,7 +1826,10 @@ impl Parser {
                     spec,
                     conversion,
                 } => {
-                    let expression = parse_expression_fragment(text, line, column)?;
+                    // The fragment is tokenized and parsed by its own Parser;
+                    // it inherits the nesting already open around the f-string
+                    // so a fragment cannot reset the recursion budget.
+                    let expression = parse_expression_fragment(text, line, column, self.depth)?;
                     out.push(FStringPart::Value {
                         expression: Box::new(expression),
                         spec: spec.clone(),
@@ -1731,7 +1866,10 @@ impl Parser {
             if self.check_op(Op::RParen) {
                 return self.error(String::from("cannot assign to an empty tuple"));
             }
-            let target = self.parse_target()?;
+            self.enter_nesting()?;
+            let target = self.parse_target();
+            self.leave_nesting();
+            let target = target?;
             self.expect_op(Op::RParen, "after the tuple assignment target")?;
             return Ok(target);
         }
@@ -1739,7 +1877,10 @@ impl Parser {
             if self.check_op(Op::RBracket) {
                 return self.error(String::from("cannot assign to an empty list"));
             }
-            let target = self.parse_target()?;
+            self.enter_nesting()?;
+            let target = self.parse_target();
+            self.leave_nesting();
+            let target = target?;
             self.expect_op(Op::RBracket, "after the list assignment target")?;
             return Ok(target);
         }
@@ -1878,7 +2019,17 @@ fn contains_yield(expression: &Expr) -> bool {
     }
 }
 
-fn parse_expression_fragment(text: &str, line: u32, column: u32) -> Result<Expr, SyntaxError> {
+/// Parse one embedded f-string expression.
+///
+/// `depth` is the nesting the surrounding expression already holds: the
+/// fragment gets its own token stream and `Parser`, and starting it at zero
+/// would let `f"{(yield from …)}"`-style nesting reset the recursion budget.
+fn parse_expression_fragment(
+    text: &str,
+    line: u32,
+    column: u32,
+    depth: usize,
+) -> Result<Expr, SyntaxError> {
     let tokens = tokenize(text).map_err(|error| {
         SyntaxError::new(
             format!("in f-string expression: {}", error.message),
@@ -1891,6 +2042,7 @@ fn parse_expression_fragment(text: &str, line: u32, column: u32) -> Result<Expr,
         pos: 0,
         function_yields: Vec::new(),
         comprehension_depth: 0,
+        depth,
     };
     let expression = parser.parse_testlist().map_err(|error| {
         SyntaxError::new(

@@ -8,6 +8,16 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+/// The host harness does not document a process-stack window: `std` tests run
+/// on threads whose stacks the C library sizes (usually 2-8 MiB) and whose
+/// bottom is not exposed portably. The parser's stack-headroom guard is
+/// therefore target-only; on the host the parser limits are purely the
+/// bracket-nesting and recursion-depth counters, which is also what makes them
+/// testable at their exact boundaries here.
+pub fn process_stack_bounds() -> Option<(usize, usize)> {
+    None
+}
+
 pub fn write_stdout(text: &str) {
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();

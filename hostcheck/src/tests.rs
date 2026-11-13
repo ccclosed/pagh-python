@@ -1779,6 +1779,160 @@ fn binary_files() -> Result<(), String> {
     Ok(())
 }
 
+// ── parser nesting limits (audit F-rt-4) ──────────────────────────────────
+//
+// The interpreter's recursive-descent parser used to accept any nesting and a
+// 506-byte script (`x = ` + 200 `(`) exhausted the process stack on pagh-riscv
+// and killed `pythonc`. The front end now has two deterministic limits, and
+// these checks pin both at their exact boundary: 199 and 200 nesting levels
+// parse, the 201st is a `SyntaxError` -- never a crash. Brackets are rejected
+// iteratively by the lexer with CPython's "too many nested parentheses"
+// message; constructs that are not bracket-delimited are counted by the parser
+// and rejected with "maximum recursion depth exceeded".
+
+/// Parse `source` and require success. The checks are parse-only: a 200-deep
+/// AST is not worth evaluating just to prove that the front end accepted it.
+fn expect_parses(source: &str) -> Result<(), String> {
+    match parser::parse(source) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!(
+            "expected the source to parse, got {:?} at {}:{}",
+            error.message, error.line, error.column
+        )),
+    }
+}
+
+fn nested_parentheses(depth: usize) -> String {
+    format!("x = {}1{}\n", "(".repeat(depth), ")".repeat(depth))
+}
+
+fn nested_lists(depth: usize) -> String {
+    format!("x = {}1{}\n", "[".repeat(depth), "]".repeat(depth))
+}
+
+fn nested_calls(depth: usize) -> String {
+    format!("x = {}1{}\n", "f(".repeat(depth), ")".repeat(depth))
+}
+
+fn nested_comprehensions(depth: usize) -> String {
+    // One `[x for x in …]` layer per level; the innermost `[]` is one extra
+    // bracket, so `depth` here means `depth + 1` open brackets in total.
+    format!(
+        "x = {}[]{}\n",
+        "[x for x in ".repeat(depth),
+        "]".repeat(depth)
+    )
+}
+
+fn nested_nots(depth: usize) -> String {
+    format!("x = {}True\n", "not ".repeat(depth))
+}
+
+fn nested_unary_minus(depth: usize) -> String {
+    format!("x = {}1\n", "-".repeat(depth))
+}
+
+fn nested_powers(depth: usize) -> String {
+    format!("x = {}1\n", "2**".repeat(depth))
+}
+
+fn chained_conditionals(depth: usize) -> String {
+    format!("x = {}3\n", "1 if True else ".repeat(depth))
+}
+
+fn nested_lambdas(depth: usize) -> String {
+    format!("x = {}1\n", "lambda: ".repeat(depth))
+}
+
+fn nested_blocks(depth: usize) -> String {
+    let mut source = String::new();
+    for level in 0..depth {
+        for _ in 0..level {
+            source.push(' ');
+        }
+        source.push_str("if True:\n");
+    }
+    for _ in 0..depth {
+        source.push(' ');
+    }
+    source.push_str("x = 1\n");
+    source
+}
+
+fn nested_yields(depth: usize) -> String {
+    format!("def f():\n    x = {}1\n", "yield ".repeat(depth))
+}
+
+fn nested_targets(depth: usize) -> String {
+    format!(
+        "for {}a{} in []:\n    pass\n",
+        "(".repeat(depth),
+        ")".repeat(depth)
+    )
+}
+
+/// Bracket nesting is bounded by the lexer before the parser recurses, exactly
+/// at CPython's tokenizer boundary (`MAXLEVEL = 200`): 199 and 200 are valid,
+/// 201 is `SyntaxError: too many nested parentheses`.
+fn parser_bracket_nesting() -> Result<(), String> {
+    for depth in [199, 200] {
+        expect_parses(&nested_parentheses(depth))?;
+        expect_parses(&nested_lists(depth))?;
+        expect_parses(&nested_calls(depth))?;
+        expect_parses(&nested_targets(depth))?;
+    }
+    // 199 comprehension layers plus the innermost `[]` are exactly 200 open
+    // brackets; 200 layers plus `[]` are 201 and must be refused.
+    expect_parses(&nested_comprehensions(199))?;
+    for source in [
+        nested_parentheses(201),
+        nested_lists(201),
+        nested_calls(201),
+        nested_targets(201),
+        nested_comprehensions(200),
+    ] {
+        expect_syntax_error(&source, "too many nested parentheses")?;
+    }
+    Ok(())
+}
+
+/// Constructs that recurse without bracket tokens (unary chains, `**`,
+/// conditional expressions, lambdas, statement blocks, targets, `yield`
+/// operands) are bounded by the parser's explicit depth counter.
+fn parser_recursion_depth() -> Result<(), String> {
+    for depth in [199, 200] {
+        expect_parses(&nested_nots(depth))?;
+        expect_parses(&nested_unary_minus(depth))?;
+        expect_parses(&nested_powers(depth))?;
+        expect_parses(&chained_conditionals(depth))?;
+        expect_parses(&nested_lambdas(depth))?;
+        expect_parses(&nested_blocks(depth))?;
+    }
+    for source in [
+        nested_nots(201),
+        nested_unary_minus(201),
+        nested_powers(201),
+        chained_conditionals(201),
+        nested_lambdas(201),
+        nested_blocks(201),
+    ] {
+        expect_syntax_error(&source, "maximum recursion depth exceeded")?;
+    }
+    // The `def` body is itself one nesting level (`parse_block`), so 199
+    // nested `yield` operands reach the 200-level budget and the 200th does not.
+    expect_parses(&nested_yields(199))?;
+    expect_syntax_error(&nested_yields(200), "maximum recursion depth exceeded")?;
+    expect_syntax_error(&nested_yields(201), "maximum recursion depth exceeded")?;
+
+    // The existing comprehension/yield guard is independent of the depth
+    // counter and must keep its specific message.
+    expect_syntax_error(
+        "def f():\n    return [yield 1 for x in []]\n",
+        "'yield' inside a comprehension is not supported",
+    )?;
+    Ok(())
+}
+
 fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
     alloc::vec![
         ("arithmetic", arithmetic as fn() -> Result<(), String>),
@@ -1821,6 +1975,8 @@ fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
         ("json", json_module),
         ("os", os_module),
         ("binary files", binary_files),
+        ("parser bracket nesting", parser_bracket_nesting),
+        ("parser recursion depth", parser_recursion_depth),
     ]
 }
 
@@ -2040,4 +2196,14 @@ fn time_module_works() {
 #[test]
 fn random_module_works() {
     random_module().unwrap();
+}
+
+#[test]
+fn parser_bracket_nesting_works() {
+    parser_bracket_nesting().unwrap();
+}
+
+#[test]
+fn parser_recursion_depth_works() {
+    parser_recursion_depth().unwrap();
 }

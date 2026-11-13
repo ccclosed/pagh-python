@@ -1,0 +1,4 @@
+# 201 unary `not`s: one past MAX_PARSE_DEPTH; must be a SyntaxError
+# ("maximum recursion depth exceeded"), never a stack fault.
+x = not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not not True
+print('unreachable')
