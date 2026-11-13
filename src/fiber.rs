@@ -56,17 +56,14 @@ pub const STACK_MARGIN: usize = 8 * 1024;
 
 /// The process stack the kernel gives a U-mode task (see the ABI).
 ///
-/// Only the interpreter's README quotes it; the code does not check it.
-///
-/// The interpreter does *not* check this one: its Rust frames cost a few KiB
-/// per Python call, so roughly twelve nested calls fill it, and a check that
-/// leaves room for the deepest single call would refuse recursion depths that
-/// today still work (`tests/live/functions.py`'s `fib(10)` runs at the very
-/// edge of the 64 KiB). The fiber guard below covers the stack this module
-/// owns instead; the process stack's limit is documented in the README as a
-/// known, pre-existing gap.
+/// pagh-riscv maps the initial 64 KiB at load and grows the stack on demand
+/// down to `USER_STACK_FLOOR`, 1 MiB in total. Only the interpreter's README
+/// quotes this constant; the parser and the evaluator obtain the documented
+/// window itself from `platform::process_stack_bounds` and check their own
+/// `sp` against it (audits F-rt-4 and F-r2-py-1/2). The fiber guard below
+/// covers the stack this module owns.
 #[allow(dead_code)] // documentation constant: the README quotes it, no code reads it
-pub const PROCESS_STACK: usize = 64 * 1024;
+pub const PROCESS_STACK: usize = 1024 * 1024;
 
 /// How many fibers may be alive at once. Suspended generators keep their stack
 /// for as long as they live, so this is the worst-case footprint of the

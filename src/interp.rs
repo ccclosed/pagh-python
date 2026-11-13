@@ -11,9 +11,14 @@
 //! * positional arguments use [`ArgList`], a small inline array with a `Vec`
 //!   spill only for calls with more than eight arguments.
 //!
-//! Recursion is capped at [`RECURSION_LIMIT`] Python call frames so a runaway
-//! recursive program raises `RecursionError` instead of running off the small
-//! U-mode stack.
+//! Recursion is capped twice. [`RECURSION_LIMIT`] Python call frames bound
+//! function recursion, and [`EXPR_RECURSION_LIMIT`] evaluation levels bound
+//! the recursive tree walk itself: a left-associative chain such as
+//! `1+1+…+1` is built by a parser *loop*, so the parser's nesting counter does
+//! not grow, while `eval_expr` recurses once per AST node. Without the second
+//! cap such a chain walks off the 1 MiB process stack (or, inside a generator,
+//! the 64 KiB fiber stack first). Both caps raise `RecursionError`, never a
+//! stack fault.
 
 use alloc::format;
 use alloc::rc::Rc;
@@ -42,6 +47,37 @@ use crate::value::{
 
 /// Maximum number of nested Python calls. See the module docs.
 pub const RECURSION_LIMIT: usize = 56;
+
+/// Maximum number of nested [`Interp::eval_expr`] levels.
+///
+/// Every AST node the evaluator visits is one Rust frame (about 1.4 KiB in the
+/// release build), so this is the evaluator's counterpart to the parser's
+/// [`parser::MAX_PARSE_DEPTH`]: a left-deep tree built by a parser loop — a
+/// `1+1+…+1` chain, an `a.b.b…` attribute chain, nested list displays — costs
+/// one level per node at run time. 256 levels cost at most ~370 KiB of the
+/// 1 MiB process stack, which leaves room for the Python call frames that may
+/// sit above them; on a generator's 64 KiB fiber the headroom guard stops the
+/// walk long before this counter does.
+///
+/// The value is deliberately above the parser's 200: 200 nested unary
+/// operators (accepted by `MAX_PARSE_DEPTH`) are 201 evaluation levels, so the
+/// evaluator must not reject an AST the parser accepted. Everything the parser
+/// builds iteratively is counted here instead -- a `1+1+…+1` chain costs one
+/// level per term, so 256 terms run and 257 raise.
+///
+/// The check is on every node, so the left-associative productions that the
+/// parser folds iteratively cannot bypass the limit. Crossing it is a
+/// `RecursionError: maximum recursion depth exceeded`, like CPython's limit.
+pub const EXPR_RECURSION_LIMIT: usize = 256;
+
+/// Free process-stack bytes the evaluator insists on keeping below itself.
+///
+/// The semantic limit above is the primary bound, but Rust frame sizes are not
+/// a contract and Python calls share the same stack, so before every node the
+/// evaluator also compares `sp` with the platform's documented stack window
+/// (target only; the host harness has no fixed floor). The margin leaves room
+/// for one more node plus the error/traceback path.
+const EVAL_STACK_MARGIN: usize = 64 * 1024;
 
 /// A positional argument list that does not allocate for the common case.
 ///
@@ -197,7 +233,12 @@ pub struct Interp {
     pub call_stack: Vec<Frame>,
     pub pool: Vec<EnvRef>,
     pub active_errors: Vec<Option<PyError>>,
+    /// Python call frames currently active (bounded by [`RECURSION_LIMIT`]).
     pub depth: usize,
+    /// Nested [`Self::eval_expr`] levels on the *currently running* stack.
+    /// A generator's parked frames live on its own fiber, so the value is
+    /// saved into and restored from the generator across a fiber switch.
+    pub expr_depth: usize,
     pub class_env: Option<EnvRef>,
     /// Stable `id()` values. Python's contract is only "unique while the
     /// object lives"; a monotonic counter keyed by identity gives the same
@@ -351,6 +392,7 @@ impl Interp {
             pool: Vec::new(),
             active_errors: Vec::new(),
             depth: 0,
+            expr_depth: 0,
             class_env: None,
             ids: Vec::new(),
             stat_class: None,
@@ -492,6 +534,11 @@ impl Interp {
 
     fn exec_stmt(&mut self, statement: &Stmt, env: &EnvRef) -> PyResult<Flow> {
         self.set_line(statement.line);
+        // Nested statement blocks are bounded by the parser, but a generator
+        // body runs on a 64 KiB fiber without a guard page. Refuse to descend
+        // once the running stack's headroom is gone, exactly like a Python
+        // call does, instead of writing past the end of the heap buffer.
+        self.check_eval_stack_headroom()?;
         match &statement.kind {
             StmtKind::Expr(expression) => {
                 self.eval_expr(expression, env)?;
@@ -1308,7 +1355,35 @@ impl Interp {
 
     // ── expressions ────────────────────────────────────────────────────────
 
+    /// Evaluate one expression node, charging one level against
+    /// [`EXPR_RECURSION_LIMIT`].
+    ///
+    /// This wrapper is entered for *every* node, including the left operand of
+    /// a binary operator, so productions the parser folds in a loop (chains of
+    /// `+`/`-`/`*`, attribute and subscript chains, list/tuple displays) are
+    /// counted exactly like the recursive-descent productions are. It also
+    /// checks the actual stack headroom before descending; see
+    /// [`Self::check_eval_stack_headroom`].
     fn eval_expr(&mut self, expression: &Expr, env: &EnvRef) -> PyResult<Value> {
+        if self.expr_depth >= EXPR_RECURSION_LIMIT {
+            return Err(self.err(
+                "RecursionError",
+                format!(
+                    "maximum recursion depth exceeded ({} expression levels)",
+                    EXPR_RECURSION_LIMIT
+                ),
+            ));
+        }
+        self.check_eval_stack_headroom()?;
+        self.expr_depth += 1;
+        let result = self.eval_expr_node(expression, env);
+        self.expr_depth -= 1;
+        result
+    }
+
+    /// The node dispatch behind [`Self::eval_expr`]; child nodes must go
+    /// through the wrapper so every level is charged and checked.
+    fn eval_expr_node(&mut self, expression: &Expr, env: &EnvRef) -> PyResult<Value> {
         match expression {
             Expr::None => Ok(Value::None),
             Expr::True => Ok(Value::Bool(true)),
@@ -2060,6 +2135,7 @@ impl Interp {
             sent: Value::None,
             pending: None,
             returned: None,
+            eval_depth: 0,
         })));
         Ok(generator)
     }
@@ -2173,6 +2249,16 @@ impl Interp {
             generator: generator_ptr,
             frame_depth: self.call_stack.len(),
         });
+        // The evaluator depth is per running stack: save the resumer's count,
+        // run the body with the count the generator was suspended at, then put
+        // both back. A fresh generator starts at 0, and a suspended one keeps
+        // the frames parked on its fiber, so neither context borrows the
+        // other's budget.
+        //
+        // SAFETY: `generator_ptr` stays valid for the whole resume (`keep`
+        // owns it) and only the running context touches its fields.
+        let caller_eval_depth = self.expr_depth;
+        self.expr_depth = unsafe { (*generator_ptr).eval_depth };
         // SAFETY: the fiber is suspended (checked above) and this is the only
         // running context; the resumer's frame outlives the switch.
         unsafe {
@@ -2184,7 +2270,9 @@ impl Interp {
             } else {
                 (*fiber_ptr).resume();
             }
+            (*generator_ptr).eval_depth = self.expr_depth;
         }
+        self.expr_depth = caller_eval_depth;
         self.active_fibers.pop();
         // A finished generator never runs again, so its stack goes back to the
         // pool immediately: without this, a script that creates generators in
@@ -5290,13 +5378,39 @@ impl Interp {
 
     // ── tracebacks ─────────────────────────────────────────────────────────
 
+    /// Refuse to descend one more evaluator level when the running stack is
+    /// close to its documented floor.
+    ///
+    /// Two stacks are involved. On the process stack, `sp` is compared with
+    /// the platform's 1 MiB window (the same check the parser makes after
+    /// audit F-rt-4); on a generator fiber the address is a heap allocation,
+    /// so the window test is skipped and the fiber's own 64 KiB budget is
+    /// enforced by [`Self::check_fiber_headroom`] instead. Either way the
+    /// result is a catchable `RecursionError`, never a wild-pointer fault from
+    /// a stack that ran past the end of a `Vec<u8>`.
+    fn check_eval_stack_headroom(&self) -> PyResult<()> {
+        if let Some((floor, top)) = platform::process_stack_bounds() {
+            let sp = fiber::current_sp();
+            if sp >= floor && sp < top && sp < floor.saturating_add(EVAL_STACK_MARGIN) {
+                return Err(self.err(
+                    "RecursionError",
+                    format!(
+                        "maximum recursion depth exceeded ({} KiB of process stack left)",
+                        sp.saturating_sub(floor) / 1024
+                    ),
+                ));
+            }
+        }
+        self.check_fiber_headroom()
+    }
+
     /// Refuse to start another Python call when the running generator's fiber
     /// stack is nearly exhausted.
     ///
     /// A fiber has no guard page under it and overrunning it would corrupt the
     /// interpreter's heap, so a generator body that recurses too deeply gets
     /// the `RecursionError` Python expects. (The *process* stack, which plain
-    /// calls use, is not checked: see [`fiber::PROCESS_STACK`].)
+    /// calls use, is not checked here: see [`fiber::PROCESS_STACK`].)
     fn check_fiber_headroom(&self) -> PyResult<()> {
         let active = match self.active_fibers.last() {
             Some(active) => active,

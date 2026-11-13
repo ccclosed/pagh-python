@@ -1977,6 +1977,8 @@ fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
         ("binary files", binary_files),
         ("parser bracket nesting", parser_bracket_nesting),
         ("parser recursion depth", parser_recursion_depth),
+        ("evaluation depth", eval_recursion_depth),
+        ("evaluation depth generator", eval_recursion_generator),
     ]
 }
 
@@ -2206,4 +2208,196 @@ fn parser_bracket_nesting_works() {
 #[test]
 fn parser_recursion_depth_works() {
     parser_recursion_depth().unwrap();
+}
+
+// ── evaluator recursion limits (audit F-r2-py-1/2) ─────────────────────────
+//
+// The parser builds a left-associative chain (`1+1+...1`) as a left-deep tree
+// in a loop, so its nesting counter never grows, and the evaluator used to
+// recurse once per node with no limit: 720 terms walked the process stack into
+// the kernel's guard page, and the same expression inside a generator overran
+// the 64 KiB heap fiber stack (wild-pointer faults -- there is no guard page
+// under it). `eval_expr` now charges one level per node against
+// EXPR_RECURSION_LIMIT and checks the running stack's headroom; these checks
+// pin the depth boundary, the clean generator error, and the fact that the
+// interpreter stays usable and the generator counter stays per-stack.
+
+fn chained_binary(operator: &str, terms: usize) -> String {
+    let mut source = String::from("x = 1");
+    for _ in 1..terms {
+        source.push_str(operator);
+        source.push('1');
+    }
+    source.push('\n');
+    source
+}
+
+/// The expression part of [`chained_binary`] for contexts such as `return`,
+/// `yield` or a call argument.
+fn chained_expr(operator: &str, terms: usize) -> String {
+    let source = chained_binary(operator, terms);
+    String::from(source.trim_start_matches("x = ").trim_end())
+}
+
+fn expect_run_error(source: &str, kind: &str, needle: &str) -> Result<(), String> {
+    match run_source(source, None) {
+        Ok(_) => Err(format!(
+            "expected {} containing {:?}, but the source ran",
+            kind, needle
+        )),
+        Err(message) => {
+            if message.starts_with(kind) && message.contains(needle) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected {} containing {:?}, got {:?}",
+                    kind, needle, message
+                ))
+            }
+        }
+    }
+}
+
+fn eval_recursion_depth() -> Result<(), String> {
+    // The limit is the evaluator's, not the parser's: 256 terms are exactly
+    // 256 eval levels (255 binary nodes plus the leaf) and evaluate; the 257th
+    // term is the 257th level and raises. The limit sits above the parser's
+    // 200 so that 200 nested unary operators (201 eval levels) still run. The
+    // same boundary applies to every operator the parser folds in a loop, and
+    // to attribute/subscript chains.
+    expect_repr(&chained_binary("+", 256), "x", "256")?;
+    expect_repr(&chained_binary("*", 256), "x", "1")?;
+    for terms in [257, 720, 800] {
+        expect_run_error(
+            &chained_binary("+", terms),
+            "RecursionError",
+            "maximum recursion depth exceeded",
+        )?;
+    }
+
+    // Attribute and subscript chains are the other productions the parser
+    // folds in a loop. 255 links plus the base name are 256 eval levels; the
+    // 256th link would be one level too deep. The identity check is a separate
+    // statement so it does not add a level to the chain under test.
+    let class = "class C:\n    pass\n\nc = C()\nc.self = c\n";
+    expect_repr(
+        &format!(
+            "{}ok = c{}\nok_is_c = ok is c\n",
+            class,
+            ".self".repeat(255)
+        ),
+        "ok_is_c",
+        "True",
+    )?;
+    expect_run_error(
+        &format!("{}bad = c{}\n", class, ".self".repeat(256)),
+        "RecursionError",
+        "maximum recursion depth exceeded",
+    )?;
+    let list = "l = []\nl.append(l)\n";
+    expect_repr(
+        &format!("{}ok = l{}\nok_is_l = ok is l\n", list, "[0]".repeat(255)),
+        "ok_is_l",
+        "True",
+    )?;
+    expect_run_error(
+        &format!("{}bad = l{}\n", list, "[0]".repeat(256)),
+        "RecursionError",
+        "maximum recursion depth exceeded",
+    )?;
+    Ok(())
+}
+
+fn eval_recursion_generator() -> Result<(), String> {
+    // The 64 KiB fiber cannot hold 200 Rust frames, so a generator hits its
+    // headroom guard first -- cleanly, with the interpreter and heap intact.
+    // The short chain proves the guard does not eat ordinary generator work.
+    let short = format!(
+        "def g():\n    yield {}\nv = next(g())\n",
+        chained_expr("+", 20)
+    );
+    expect_repr(&short, "v", "20")?;
+
+    let bomb = format!(
+        "def g():\n    yield {}\n\
+         caught = False\n\
+         try:\n\
+         \x20   next(g())\n\
+         except RecursionError:\n\
+         \x20   caught = True\n\
+         after = 6 * 7\n\
+         assert caught and after == 42\n",
+        chained_expr("+", 300)
+    );
+    run_source(&bomb, None)?;
+
+    // A generator expression is the same fiber path.
+    let genexpr = format!(
+        "caught = False\n\
+         try:\n\
+         \x20   next({} for _ in [0])\n\
+         except RecursionError:\n\
+         \x20   caught = True\n\
+         after = 6 * 7\n\
+         assert caught and after == 42\n",
+        chained_expr("+", 300)
+    );
+    run_source(&genexpr, None)?;
+
+    // A deep chain in a function that is never called parses and runs: the
+    // parser's iterative productions are not evaluation (the audit's
+    // `func_add_3000.py` control), while calling it raises cleanly.
+    let deep_body = format!(
+        "def f():\n    return {}\n",
+        chained_expr("+", 3000)
+    );
+    run_source(&deep_body, None)?;
+    let called = format!(
+        "def f():\n    return {}\nprint(f())\n",
+        chained_expr("+", 300)
+    );
+    expect_run_error(
+        &called,
+        "RecursionError",
+        "maximum recursion depth exceeded",
+    )?;
+
+    // Catching the error leaves the interpreter fully usable.
+    let caught_chain = format!(
+        "caught = False\n\
+         try:\n\
+         \x20   x = {}\n\
+         except RecursionError:\n\
+         \x20   caught = True\n\
+         assert caught and 1 + 1 == 2\n",
+        chained_expr("+", 800)
+    );
+    run_source(&caught_chain, None)?;
+
+    // The depth counter is per running stack: a generator suspended inside a
+    // deep expression must not steal the caller's budget (or lose its own on
+    // resume). `(yield 1)` leaves four eval wrappers parked on the fiber.
+    let interleave = format!(
+        "def g():\n\
+         \x20   x = (1 + 1 + 1 + (yield 1))\n\
+         \x20   yield x\n\
+         a = g()\n\
+         first = next(a)\n\
+         full = {}\n\
+         second = a.send(40)\n\
+         assert first == 1 and full == 256 and second == 43\n",
+        chained_expr("+", 256)
+    );
+    run_source(&interleave, None)?;
+    Ok(())
+}
+
+#[test]
+fn eval_recursion_depth_works() {
+    eval_recursion_depth().unwrap();
+}
+
+#[test]
+fn eval_recursion_generator_works() {
+    eval_recursion_generator().unwrap();
 }
