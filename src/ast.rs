@@ -278,6 +278,8 @@ pub enum UnOp {
     Minus,
     Plus,
     Not,
+    /// `~x`, only for ints.
+    Invert,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -289,6 +291,15 @@ pub enum BinOp {
     FloorDiv,
     Mod,
     Pow,
+    /// Bitwise operators on ints, and the set operators Python spells with
+    /// the same tokens (`|` union, `&` intersection, `^` symmetric
+    /// difference).
+    BitOr,
+    BitXor,
+    BitAnd,
+    /// `<<` / `>>` on ints (shift counts are checked, never wrapped).
+    Shl,
+    Shr,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

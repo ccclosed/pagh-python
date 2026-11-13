@@ -70,6 +70,18 @@ pub enum Op {
     Gt,
     Ge,
     Assign,
+    /// Bitwise/boolean operators: `& | ^ ~ << >>` and their `=` forms.
+    Amp,
+    Pipe,
+    Caret,
+    Tilde,
+    Shl,
+    Shr,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
     PlusEq,
     MinusEq,
     StarEq,
@@ -1389,12 +1401,29 @@ impl Lexer {
                     ))
                 }
             },
-            '<' => match two(self) {
-                Some('=') => (Op::Le, 2),
+            '&' => match two(self) {
+                Some('=') => (Op::AmpEq, 2),
+                _ => (Op::Amp, 1),
+            },
+            '|' => match two(self) {
+                Some('=') => (Op::PipeEq, 2),
+                _ => (Op::Pipe, 1),
+            },
+            '^' => match two(self) {
+                Some('=') => (Op::CaretEq, 2),
+                _ => (Op::Caret, 1),
+            },
+            '~' => (Op::Tilde, 1),
+            '<' => match (two(self), three(self)) {
+                (Some('<'), Some('=')) => (Op::ShlEq, 3),
+                (Some('<'), _) => (Op::Shl, 2),
+                (Some('='), _) => (Op::Le, 2),
                 _ => (Op::Lt, 1),
             },
-            '>' => match two(self) {
-                Some('=') => (Op::Ge, 2),
+            '>' => match (two(self), three(self)) {
+                (Some('>'), Some('=')) => (Op::ShrEq, 3),
+                (Some('>'), _) => (Op::Shr, 2),
+                (Some('='), _) => (Op::Ge, 2),
                 _ => (Op::Gt, 1),
             },
             '(' => (Op::LParen, 1),

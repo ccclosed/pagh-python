@@ -655,3 +655,79 @@ proc ok
   `close()` во время выполнения `finally` самого генератора, `throw`
   в генератор, который в этот момент уже выполняется (hostcheck:
   `ValueError: generator already executing`).
+
+---
+
+# Живой прогон pythonc 0.8.0 на ядре 0.21.2
+
+Дата: 2026-11-13. Ядро: `pagh-riscv` 0.21.2, коммит
+`a0933ee`, debug ELF,
+`sha256 2e8ae74637fae1d83445b843d887bfcc5ccc371ccd6174e16ff64afee88cc0b1`
+(собран из git-архива коммита, как и для 0.7.0: ELF в чекауте ядра был старше
+коммита; сам чекаут не изменялся). QEMU `qemu-system-riscv64` 10.2.2, машина
+`virt`, 256 MiB, serial на Unix-сокете, 64 MiB ext2.
+
+**Одна загрузка**, все команды подряд; драйвер — собственный
+[`../tests/live/qemu_driver.py`](../tests/live/qemu_driver.py), обёртка —
+[`../tests/live/live08.sh`](../tests/live/live08.sh), список команд —
+[`../tests/live/live08.cmds`](../tests/live/live08.cmds). Сырой транскрипт:
+[`live-pythonc-080.txt`](live-pythonc-080.txt).
+
+## Итог 0.8.0
+
+**44 запуска pythonc: 38 с кодом 0, 6 намеренных диагностик** (usage — 2;
+`syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
+`decorator_syntax.py`, `yield_from_syntax.py` — 1), плюс три `cat`.
+
+Новое в 0.8.0 (один скрипт; генераторная часть 0.7.0 остаётся тремя
+маленькими скриптами из-за 512 КиБ под 8 стеков — см. 0.7.0):
+
+| Скрипт | Что проверяет | Результат |
+|---|---|---|
+| `dict_set.py` | `dict_keys`/`dict_values`/`dict_items` как живые view-объекты (`len`, итерация, `in`, `repr`, имена типов, отражение мутации, `dict(d.items())`, равенство), побитовые `& | ^ ~ << >>` с приоритетами и ошибками, set-алгебра `| & - ^`, in-place `|= &= -= ^=` с алиасами, `update`-семейство, `symmetric_difference`, `isdisjoint`, `pop` и диагностика | `DICT SET OK`, exit 0 |
+
+Регрессия: все прежние проверки (включая `GEN METHODS OK`,
+`GEN DELEGATION OK`, `GEN FIBERS OK`, `YIELD FROM OK`, `GENERATORS OK`,
+`os_proc.py` с `child: True status: 0`/`proc ok`) проходят на 0.21.2.
+
+## Ключевые строки 0.8.0
+
+```text
+views: dict_keys(['a', 'b']) dict_values([1, 2]) dict_items([('a', 1), ('b', 2)])
+views are live: dict_keys(['b', 'c'])
+views round-trip: dict(items) and for-over-values
+bitwise: 2 7 5 -7 16 8
+bitwise errors: integer left shift overflow | negative shift count | unsupported operand type(s) for &: 'str' and 'int'
+set operators: {1, 2, 3, 4} {3} {1, 2} {1, 2, 4}
+in-place set operators: aliases see the update
+set update methods: {2, 6}
+symmetric_difference/isdisjoint/subset/popping worked
+set errors: pop from an empty set | unsupported operand type(s) for |: 'set' and 'list'
+DICT SET OK
+```
+
+Видимое изменение поведения для существующих скриптов: `keys()`/`values()`/
+`items()` больше не возвращают список, поэтому `print(counts.items())`
+(`collections_demo.py`) печатает `dict_items([...])`, а не `[('a', 1), ...]`.
+Итерация, `sorted()`, `list()`, `dict()` и `in` работают как раньше.
+
+## Честные пробелы 0.8.0
+
+- **View узкие:** нет set-операций над `dict_keys`/`dict_items`
+  (`d.keys() | {…}`), нет сравнения view с `set`, нет `.mapping`; `values`
+  view сравнивается только по идентичности объекта (как и в CPython, где у
+  `dict_values` нет содержательного равенства).
+- **Set-операторы требуют два `set`:** `set | list` — `TypeError`; методы
+  (`union`, `update`, …) принимают любые iterable, как в CPython.
+  `frozenset` нет.
+- **Побитовые операторы 64-битные:** `1 << 64` — `OverflowError` (CPython
+  вернул бы произвольное целое); `~True` = `-2` без DeprecationWarning.
+- **Размер словаря во время итерации.** CPython поднимает
+  `RuntimeError: dictionary changed size during iteration`; здесь итератор
+  view/словаря идёт по индексу и ошибку не проверяет — мутация во время
+  итерации даёт неопределённый, но не портящий память результат. Не
+  проверялось живьём отдельным скриптом.
+- Не проверялись живьём: `dict.keys() | set` (не поддерживается — см. выше),
+  огромные сдвиги на границе i64, view после `clear()`/`update()` словаря в
+  тех же выражениях (hostcheck покрывает мутацию/удаление после создания
+  view).

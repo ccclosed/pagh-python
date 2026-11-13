@@ -2,7 +2,7 @@ name: ci
 
 # Two gates, one job:
 #   * the host harness (`hostcheck`) compiles the interpreter sources with a
-#     std `platform` and runs its 35-check grid on x86_64;
+#     std `platform` and runs its 38-check grid on x86_64;
 #   * the freestanding interpreter builds for riscv64gc-unknown-none-elf with
 #     the pinned toolchain and the pagh linker script, and the resulting ELF
 #     fits the kernel's 1 MiB image limit.

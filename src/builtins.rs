@@ -787,6 +787,7 @@ fn builtin_len(
         Value::List(items) => items.borrow().len() as i64,
         Value::Tuple(items) => items.len() as i64,
         Value::Dict(entries) => entries.borrow().len() as i64,
+        Value::DictView(view) => view.entries.borrow().len() as i64,
         Value::Set(items) => items.borrow().len() as i64,
         Value::Bytes(data) => data.len() as i64,
         Value::Range(range) => range.len,
@@ -2042,6 +2043,25 @@ fn call_method(
         BuiltinId::SetIntersection => set_intersection(interp, builtin, args, kwargs),
         BuiltinId::SetDifference => set_difference(interp, builtin, args, kwargs),
         BuiltinId::SetIssubset => set_issubset(interp, builtin, args, kwargs),
+        BuiltinId::SetPop => set_pop(interp, builtin, args, kwargs),
+        BuiltinId::SetUpdate => set_update(interp, builtin, args, kwargs),
+        BuiltinId::SetDifferenceUpdate => {
+            set_update_like(interp, builtin, args, kwargs, SetUpdateKind::Difference)
+        }
+        BuiltinId::SetIntersectionUpdate => {
+            set_update_like(interp, builtin, args, kwargs, SetUpdateKind::Intersection)
+        }
+        BuiltinId::SetSymmetricDifferenceUpdate => set_update_like(
+            interp,
+            builtin,
+            args,
+            kwargs,
+            SetUpdateKind::SymmetricDifference,
+        ),
+        BuiltinId::SetSymmetricDifference => {
+            set_symmetric_difference(interp, builtin, args, kwargs)
+        }
+        BuiltinId::SetIsDisjoint => set_isdisjoint(interp, builtin, args, kwargs),
         BuiltinId::SetSuperset => set_issuperset(interp, builtin, args, kwargs),
         BuiltinId::SetCopy => set_copy(interp, builtin, args, kwargs),
         BuiltinId::SetClear => set_clear(interp, builtin, args, kwargs),
@@ -3261,12 +3281,10 @@ fn dict_method_keys(
     no_kwargs(interp, kwargs, "keys")?;
     expect_args(interp, args, "keys", 0, 0)?;
     let entries = dict_receiver(interp, builtin, "keys")?;
-    let keys = entries
-        .borrow()
-        .iter()
-        .map(|(key, _)| key.clone())
-        .collect();
-    Ok(Value::list(keys))
+    Ok(Value::DictView(Rc::new(crate::value::DictView {
+        entries,
+        kind: crate::value::DictViewKind::Keys,
+    })))
 }
 
 fn dict_method_values(
@@ -3278,12 +3296,10 @@ fn dict_method_values(
     no_kwargs(interp, kwargs, "values")?;
     expect_args(interp, args, "values", 0, 0)?;
     let entries = dict_receiver(interp, builtin, "values")?;
-    let values = entries
-        .borrow()
-        .iter()
-        .map(|(_, value)| value.clone())
-        .collect();
-    Ok(Value::list(values))
+    Ok(Value::DictView(Rc::new(crate::value::DictView {
+        entries,
+        kind: crate::value::DictViewKind::Values,
+    })))
 }
 
 fn dict_method_items(
@@ -3295,12 +3311,10 @@ fn dict_method_items(
     no_kwargs(interp, kwargs, "items")?;
     expect_args(interp, args, "items", 0, 0)?;
     let entries = dict_receiver(interp, builtin, "items")?;
-    let items = entries
-        .borrow()
-        .iter()
-        .map(|(key, value)| Value::tuple(alloc::vec![key.clone(), value.clone()]))
-        .collect();
-    Ok(Value::list(items))
+    Ok(Value::DictView(Rc::new(crate::value::DictView {
+        entries,
+        kind: crate::value::DictViewKind::Items,
+    })))
 }
 
 fn dict_method_update(
@@ -3897,6 +3911,142 @@ fn set_issuperset(
         .iter()
         .all(|value| set_find(&borrowed, value).is_some());
     Ok(Value::Bool(superset))
+}
+
+fn set_pop(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "pop")?;
+    expect_args(interp, args, "pop", 0, 0)?;
+    let items = set_receiver(interp, builtin, "pop")?;
+    let mut borrowed = items.borrow_mut();
+    if borrowed.is_empty() {
+        return Err(interp.err("KeyError", String::from("pop from an empty set")));
+    }
+    // This implementation keeps insertion order, so `pop()` removes the
+    // first element, like CPython's arbitrary-but-deterministic set order
+    // would pick *some* element; scripts must not depend on which one.
+    Ok(borrowed.remove(0))
+}
+
+fn set_update(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "update")?;
+    let items = set_receiver(interp, builtin, "update")?;
+    for index in 0..args.len() {
+        let source = argument(interp, args, index, "update")?.clone();
+        for value in interp.collect_iterable(source)? {
+            require_set_hashable(interp, &value)?;
+            set_insert(&mut items.borrow_mut(), value);
+        }
+    }
+    Ok(Value::None)
+}
+
+enum SetUpdateKind {
+    Difference,
+    Intersection,
+    SymmetricDifference,
+}
+
+/// The `*_update` family: mutate the receiver (returning None) the way
+/// CPython's in-place set methods do, so aliases see the change.
+fn set_update_like(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+    kind: SetUpdateKind,
+) -> PyResult<Value> {
+    let name = match kind {
+        SetUpdateKind::Difference => "difference_update",
+        SetUpdateKind::Intersection => "intersection_update",
+        SetUpdateKind::SymmetricDifference => "symmetric_difference_update",
+    };
+    no_kwargs(interp, kwargs, name)?;
+    let items = set_receiver(interp, builtin, name)?;
+    if args.len() == 0 {
+        return Ok(Value::None);
+    }
+    let mut others: Vec<Vec<Value>> = Vec::with_capacity(args.len());
+    for index in 0..args.len() {
+        let source = argument(interp, args, index, name)?.clone();
+        others.push(interp.collect_iterable(source)?);
+    }
+    let mut borrowed = items.borrow_mut();
+    match kind {
+        SetUpdateKind::Difference => {
+            borrowed.retain(|value| others.iter().all(|other| set_find(other, value).is_none()));
+        }
+        SetUpdateKind::Intersection => {
+            borrowed.retain(|value| others.iter().all(|other| set_find(other, value).is_some()));
+        }
+        SetUpdateKind::SymmetricDifference => {
+            let removed: Vec<Value> = borrowed
+                .iter()
+                .filter(|value| set_find(&others[0], value).is_some())
+                .cloned()
+                .collect();
+            borrowed.retain(|value| !removed.iter().any(|gone| values_equal(gone, value)));
+            for value in others[0].iter() {
+                if !removed.iter().any(|gone| values_equal(gone, value)) {
+                    set_insert(&mut borrowed, value.clone());
+                }
+            }
+        }
+    }
+    Ok(Value::None)
+}
+
+fn set_symmetric_difference(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "symmetric_difference")?;
+    expect_args(interp, args, "symmetric_difference", 1, 1)?;
+    let items = set_receiver(interp, builtin, "symmetric_difference")?;
+    let source = argument(interp, args, 0, "symmetric_difference")?.clone();
+    let other = interp.collect_iterable(source)?;
+    let borrowed = items.borrow();
+    let mut result = Vec::new();
+    for value in borrowed.iter() {
+        if set_find(&other, value).is_none() {
+            set_insert(&mut result, value.clone());
+        }
+    }
+    for value in other.iter() {
+        if set_find(&borrowed, value).is_none() {
+            set_insert(&mut result, value.clone());
+        }
+    }
+    Ok(Value::set(result))
+}
+
+fn set_isdisjoint(
+    interp: &mut Interp,
+    builtin: &BuiltinValue,
+    args: &ArgList,
+    kwargs: &[(Rc<str>, Value)],
+) -> PyResult<Value> {
+    no_kwargs(interp, kwargs, "isdisjoint")?;
+    expect_args(interp, args, "isdisjoint", 1, 1)?;
+    let items = set_receiver(interp, builtin, "isdisjoint")?;
+    let source = argument(interp, args, 0, "isdisjoint")?.clone();
+    let other = interp.collect_iterable(source)?;
+    let borrowed = items.borrow();
+    let disjoint = borrowed
+        .iter()
+        .all(|value| set_find(&other, value).is_none());
+    Ok(Value::Bool(disjoint))
 }
 
 fn set_copy(

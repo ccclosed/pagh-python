@@ -11,54 +11,49 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
 
 ## Статус
 
-**Рабочая версия 0.7.0.** Язык и встроенные функции реализованы настолько,
+**Рабочая версия 0.8.0.** Язык и встроенные функции реализованы настолько,
 насколько это нужно для небольших скриптов на 1 MiB bump-heap ядра pagh.
 
-Новое в 0.7.0 — полный протокол генератора поверх тех же файберов:
+Новое в 0.8.0 — представления словаря и алгебра множеств (плюс побитовые
+операторы, которыми эта алгебра и записывается):
 
-- **`send(value)`, `throw(exc)`, `close()`.** Генератор стал корутиной.
-  `send(v)` резюмирует приостановленный `yield` так, что выражение `yield`
-  даёт `v`; `send(None)` — это `next()`, а не-`None` в ещё не запущенный
-  генератор — `TypeError` (в исчерпанный — `StopIteration`). `throw`
-  поднимает исключение в точке `yield`; формы — экземпляр, класс, класс +
-  аргументы (кортеж распаковывается), трёхаргументная форма CPython с
-  traceback не поддерживается и отвергается `TypeError`. `close()` поднимает
-  `GeneratorExit` в точке `yield`, поэтому выполняются `finally`; тело,
-  которое после этого снова выдало значение, получает
-  `RuntimeError: generator ignored GeneratorExit`. `GeneratorExit` наследует
-  `BaseException`, как в CPython, поэтому `except Exception` его не ловит.
-  `PEP 479` работает: `StopIteration`, вылетевший из тела, — это
-  `RuntimeError`, а не тихое завершение итератора.
-- **`yield from` делегирует `send`/`throw`/`close`** и вкладывается цепочкой:
-  `send` уходит в подгенератор, `throw` поднимается в нём, `close` сначала
-  закрывает подгенератор, а затем поднимает `GeneratorExit` во внешнем.
-  Выражение `yield from` теперь даёт значение `return` подгенератора (`None`
-  для обычного итератора). Для не-генератора делегация сужена и
-  задокументирована: `send` не-`None` — `AttributeError`, `throw` и `close`
-  поднимаются в точке `yield from`.
-- **Лимиты не изменились:** генераторы по-прежнему файберы на 64 КиБ,
-  одновременно приостановленных не больше 8 (девятый — `MemoryError`), а
-  стек и кадр завершённого/закрытого генератора возвращаются в пулы — цикл
-  на 200 генераторов с `send`/`close` проходит.
+- **`dict.keys()`, `dict.values()`, `dict.items()` — view-объекты, а не
+  копии-списки.** У них свои типы (`dict_keys`, `dict_values`,
+  `dict_items`), `repr` как в CPython, `len`, итерация, `in` (для keys —
+  хеш-поиск, для values — сравнение значений, для items — пар) и
+  равенство: keys/items сравниваются как множества, values — только по
+  идентичности объекта. View живой: созданный до мутации словаря view видит
+  её. `dict(d.items())` собирает словарь обратно.
+- **Побитовые операторы `& | ^ ~ << >>`** (и `&= |= ^= <<= >>=`): int-семантика
+  в 64 битах, приоритеты как в Python (`|` < `^` < `&` < сдвиги < `+ -`),
+  `~x = -x-1`, `bool`-операнды для `& | ^` дают `bool` (как CPython 3.13+),
+  `>>` арифметический и насыщается, `<<` с переполнением i64 — `OverflowError`,
+  отрицательный счётчик сдвига — `ValueError` (сдвиги за пределы 64 бит —
+  задокументированное сужение: CPython вернул бы произвольное целое).
+- **Алгебра множеств операторами и методами:** `|` объединение, `&`
+  пересечение, `-` разность, `^` симметрическая разность (для двух `set`),
+  in-place `|=`, `&=`, `-=`, `^=` **мутируют сам set**, поэтому алиас видит
+  изменение (как `__ior__` в CPython). Методы пополнены `update`,
+  `difference_update`, `intersection_update`, `symmetric_difference`,
+  `symmetric_difference_update`, `isdisjoint`, `pop`; прежние
+  `union`/`intersection`/`difference`/`issubset`/`issuperset`/`add`/`remove`/
+  `discard`/`copy`/`clear` на месте.
 
-Живая проверка 0.7.0 — на ядре **0.21.2** (`pagh-riscv`, коммит `a0933ee`,
+Живая проверка 0.8.0 — на ядре **0.21.2** (`pagh-riscv`, коммит `a0933ee`,
 QEMU `virt`, ext2 64 MiB, драйвер `tests/live/qemu_driver.py`, одна
-загрузка): полный suite [`tests/live/live07.cmds`](tests/live/live07.cmds) —
-43 запуска, 37 с кодом 0, шесть намеренных диагностик (usage — код 2;
+загрузка): полный suite [`tests/live/live08.cmds`](tests/live/live08.cmds) —
+44 запуска, 38 с кодом 0, шесть намеренных диагностик (usage — код 2;
 `syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
-`decorator_syntax.py`, `yield_from_syntax.py` — код 1), и три новые проверки:
-[`tests/live/gen_methods.py`](tests/live/gen_methods.py) печатает
-`GEN METHODS OK` (`send`/`throw`/`close`, иерархия `GeneratorExit`, PEP 479),
-[`tests/live/gen_delegation.py`](tests/live/gen_delegation.py) —
-`GEN DELEGATION OK` (делегация трёх методов и значение `return`),
-[`tests/live/gen_fibers.py`](tests/live/gen_fibers.py) — `GEN FIBERS OK`
-(лимит 8 приостановленных генераторов и рецикл стеков). Прежние маркеры
-`YIELD FROM OK`, `GENERATORS OK` и `child: True status: 0`/`proc ok` на месте.
-Сырой транскрипт:
-[`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt), PASS-лист и детали —
+`decorator_syntax.py`, `yield_from_syntax.py` — код 1), и новая проверка
+[`tests/live/dict_set.py`](tests/live/dict_set.py) печатает `DICT SET OK`
+(живые dict views, побитовые операторы, set-алгебра операторами и методами,
+in-place `|=`/`&=`/`-=`/`^=`). Прежние маркеры `GEN METHODS OK`,
+`GEN DELEGATION OK`, `GEN FIBERS OK`, `YIELD FROM OK`, `GENERATORS OK` и
+`child: True status: 0`/`proc ok` на месте. Сырой транскрипт:
+[`docs/live-pythonc-080.txt`](docs/live-pythonc-080.txt), PASS-лист и детали —
 [`docs/live-testing.md`](docs/live-testing.md).
 
-Размер release-ELF — 553 384 байта (541 КиБ; лимит ядра — 1 МиБ): профиль
+Размер release-ELF — 577 960 байт (564 КиБ; лимит ядра — 1 МиБ): профиль
 `release` теперь использует `strip = "symbols"`, потому что одна таблица
 символов занимала ~540 КиБ из 1085 КиБ файла 0.4.0. Потоков, сигналов, сети и
 динамического загрузчика в языке нет. Интерпретатор исполняет настоящие
@@ -91,10 +86,10 @@ cargo build --release
 
 ## Запуск в QEMU
 
-Один прогон suite 0.7.0 (сборка, образ, QEMU, транскрипт) — одной командой:
+Один прогон suite 0.8.0 (сборка, образ, QEMU, транскрипт) — одной командой:
 
 ```sh
-sh tests/live/live07.sh
+sh tests/live/live08.sh
 ```
 
 Вручную:
@@ -106,7 +101,7 @@ mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py-live.img 64M
 
 python3 tests/live/qemu_driver.py \
   --disk /tmp/py-live.img \
-  --commands tests/live/live07.cmds \
+  --commands tests/live/live08.cmds \
   --transcript /tmp/live.txt
 ```
 
@@ -145,13 +140,17 @@ ZeroDivisionError: integer division or modulo by zero
 
 **Типы:** `None`, `bool`, `int` (64-битный знаковый), `float` (f64),
 `str` (UTF-8), `bytes` (неизменяемые байты), `list`, `tuple`, `dict`
-(с сохранением порядка вставки), `set`, `range`, файловые объекты,
+(с сохранением порядка вставки; `keys()`/`values()`/`items()` — живые
+view-объекты `dict_keys`/`dict_values`/`dict_items`), `set`, `range`,
+файловые объекты,
 функции (включая `lambda`), классы и экземпляры.
 
 **Синтаксис и операторы:** целые и float-литералы (`1.5`, `.5`, `1e3`,
 `1.5e-2`, `1_0.5`), `bytes`-литералы (`b"..."`, `b"\x41"`, raw `rb"..."`),
 set-литералы (`{1, 2, 3}`), имена, `+ - * / // % **` (включая унарные),
-сравнения (`== != < <= > >= in not in is is not`), цепочки сравнений,
+побитовые `& | ^ ~ << >>` (int-семантика; на двух `set` `| & ^` — алгебра
+множеств, а `-` — разность), сравнения (`== != < <= > >= in not in is is
+not`), цепочки сравнений,
 `and/or/not`, тернарное `a if cond else b`, срезы `a[start:stop:step]` для
 `str`/`bytes`/`list`/`tuple`, индексация, атрибуты, вызовы с позиционными и
 именованными аргументами, а также распаковкой `*iterable` и `**mapping` на
@@ -335,10 +334,16 @@ expressions), `def` с параметрами по умолчанию, замы�
 `in`, сравнения, итерация по int, `bytes(iterable)`, `bytes(n)`,
 `bytes(str, "utf-8")`, `+`, `*`, `str.encode`. `bytearray`/`memoryview` нет.
 
-**Методы `set`:** `add`, `remove` (`KeyError`), `discard`, `union`,
-`intersection`, `difference`, `issubset`, `issuperset`, `copy`, `clear`;
-`in`, `len`, итерация, `==`, сравнения подмножества. Порядок элементов —
-порядок вставки (реализация на `Vec`; CPython не гарантирует порядок set).
+**Множества:** операции `|` (объединение), `&` (пересечение), `-`
+(разность), `^` (симметрическая разность) и in-place `|=`, `&=`, `-=`, `^=`,
+которые мутируют сам объект (алиас видит изменение). Методы `add`, `remove`
+(`KeyError`), `discard`, `pop` (пустой set — `KeyError`), `union`,
+`intersection`, `difference`, `symmetric_difference`, `update`,
+`difference_update`, `intersection_update`, `symmetric_difference_update`,
+`issubset`, `issuperset`, `isdisjoint`, `copy`, `clear`; `in`, `len`,
+итерация, `==`, сравнения подмножества (`<`, `<=`, `>`, `>=`). Порядок
+элементов — порядок вставки (реализация на `Vec`; CPython не гарантирует
+порядок set, поэтому `pop()` удаляет первый элемент, а не «случайный»).
 
 **Comprehensions:** list (`[x for x in ...]`), set (`{x for x in ...}`),
 dict (`{k: v for k in ...}`), с несколькими `for` и `if`.
@@ -347,7 +352,12 @@ dict (`{k: v for k in ...}`), с несколькими `for` и `if`.
 `insert`, `remove`, `index`, `reverse`, `clear`, `copy`.
 
 **Методы `dict`:** `get`, `keys`, `values`, `items`, `pop`, `update`,
-`setdefault`, `clear`, `copy`.
+`setdefault`, `clear`, `copy`. `keys()`/`values()`/`items()` возвращают
+живые view-объекты, а не списки: `len`, итерация, `in`, `repr`
+(`dict_keys(['a'])`, `dict_values([1])`, `dict_items([('a', 1)])`), свои
+имена типов; view отражает более поздние изменения словаря
+(`d.keys() == d.keys()` — True, `d.values() == d.values()` — False, как в
+CPython).
 
 **Файлы:** `open(path, mode)` для текстовых режимов `r`, `w`, `a` и их `+`
 вариантов, а также бинарных `rb`, `wb`, `ab`/`r+b`. Текстовые `read`,
@@ -418,6 +428,20 @@ dict (`{k: v for k in ...}`), с несколькими `for` и `if`.
   отклоняется `ValueError`, как и в этой реализации).
 - **Нет перегрузки операторов** (`__add__`, `__eq__`, ...) и `super()`;
   равенство пользовательских экземпляров — идентичность.
+- **Dict views узкие.** `dict_keys`/`dict_values`/`dict_items` дают
+  `len`/итерацию/`in`/`repr`/`type` и равенство между собой, но не
+  поддерживают set-операции (`d.keys() | other`) и сравнение с `set`
+  (`d.keys() == {'a'}`) — в CPython это работает; `.mapping` нет, как и
+  `dict.items()`-объектов с методами.
+- **Set-операторы только между двумя `set`.** `set | list`, `set & dict`,
+  `set - tuple` — `TypeError`; методы (`union`, `update`, ...) принимают
+  любые iterable, как в CPython. `frozenset` нет, поэтому set нельзя
+  положить в set/dict.
+- **Побитовые операторы — 64-битные.** `~`, `&`, `|`, `^` и `>>` совпадают с
+  CPython на всём i64, но `1 << 64` — `OverflowError`, а не произвольное
+  целое (64-битный `int` задокументирован выше); `True | False` даёт `bool`
+  (CPython 3.13+), `~True` — `-2` (`int`, в 3.14 CPython это deprecated, у
+  нас без warning'а); отрицательный счётчик сдвига — `ValueError`.
 - **Файловый I/O простой:** нет `seek`/`tell`, кодировки кроме UTF-8;
   `buffering` принимается, но игнорируется; бинарный режим не декодирует
   данные, текстовый требует валидный UTF-8.
@@ -477,19 +501,26 @@ dict (`{k: v for k in ...}`), с несколькими `for` и `if`.
 
 ```sh
 cd hostcheck
-cargo test                 # 35 unit-тестов интерпретатора
-cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (35 PASS)
+cargo test                 # 38 unit-тестов интерпретатора
+cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (38 PASS)
 cargo run -- ../tests/live/hello.py
 ```
 
-Проверки 0.7.0: `generator send` (значение в точке `yield`, `send(None)`,
+Проверки 0.8.0: `dict views` (`len`/итерация/`in`/`repr`/имена типов,
+живость view, равенство keys/items как множеств и values по идентичности,
+`dict(d.items())`, unhashable view), `bitwise operators` (int-семантика,
+приоритеты, `~`, сдвиги с насыщением и ошибками, `bool`-правило,
+augmented-формы, TypeError), `set operations` (`| & - ^`, in-place
+`|= &= -= ^=` с алиасами, `update`-семейство, `symmetric_difference`,
+`isdisjoint`, `pop`, ошибки на пустом set и на не-set операнде) — плюс 35
+проверок 0.7.0 (`generator send` (значение в точке `yield`, `send(None)`,
 `TypeError` в незапущенный генератор, `StopIteration` в исчерпанный,
 повторный вход, generator expression), `generator throw` (экземпляр, класс,
 класс + аргументы, необработанное исключение, незапущенный и исчерпанный
 генератор, arity/типы), `generator close` (`finally`, `close()` незапущенного,
 `RuntimeError` на «игнорирующем» теле, иерархия `GeneratorExit`, повторный
 вход) и `generator delegation` (`send`/`throw`/`close` через `yield from`,
-значение `return`, вложенность, сужение для обычного итератора) — плюс 31
+значение `return`, вложенность, сужение для обычного итератора) и 31
 проверка 0.6.0 (`fibers`, `generators`, `yield from`, `generator
 expressions`, `decorators`, `percent format`, `os.path`, `time`, `random` и
 прежние).
@@ -501,23 +532,25 @@ expressions`, `decorators`, `percent format`, `os.path`, `time`, `random` и
 Живой QEMU-прогон suite 0.1.2 (30 PASS), отдельные прогоны `*args`/`**kwargs`
 и `str.format` (0.4.0), прогон 0.5.0 на ядре 0.19.0, полный прогон 0.6.0 на
 ядре 0.21.0 (40 запусков, 34 PASS, 6 намеренных диагностик; `YIELD FROM OK`)
-и прогон 0.7.0 на ядре 0.21.2 (43 запуска, 37 PASS, 6 намеренных
-диагностик; `GEN METHODS OK`, `GEN DELEGATION OK`, `GEN FIBERS OK`) —
-PASS-листы и сырые
-логи: [`docs/live-testing.md`](docs/live-testing.md), транскрипты 0.5.0,
-0.6.0 и 0.7.0 — [`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
-[`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt) и
-[`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt), скрипты —
+прогон 0.7.0 на ядре 0.21.2 (43 запуска, 37 PASS, 6 намеренных
+диагностик; `GEN METHODS OK`, `GEN DELEGATION OK`, `GEN FIBERS OK`) и
+прогон 0.8.0 на том же ядре (44 запуска, 38 PASS, 6 намеренных
+диагностик; `DICT SET OK`) — PASS-листы и сырые логи:
+[`docs/live-testing.md`](docs/live-testing.md), транскрипты 0.5.0–0.8.0 —
+[`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
+[`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt),
+[`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt) и
+[`docs/live-pythonc-080.txt`](docs/live-pythonc-080.txt), скрипты —
 [`tests/live/`](tests/live/).
 
 ## CI
 
 `.github/workflows/ci.yml` чекаутит соседний `pagh-api` (main), ставит
 тулчейн из `rust-toolchain.toml` и гоняет два гейта: `cargo test` в
-`hostcheck` (35 проверок) и `cargo build --release` для
+`hostcheck` (38 проверок) и `cargo build --release` для
 `riscv64gc-unknown-none-elf` с проверкой, что `pythonc` не превышает лимит
 ядра в 1 МиБ. Живой QEMU-прогон в CI намеренно не входит: для него нужны
-ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live07.sh`.
+ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live08.sh`.
 
 ## Устройство
 
