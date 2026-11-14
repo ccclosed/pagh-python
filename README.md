@@ -127,12 +127,28 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
 f64-инструкции в U-mode, поэтому ядро обязано оставлять `sstatus.FS`
 включённым при `sret`.
 
-## Branching and releases
+## Ветвление и релизы
 
-`main` is the stable branch; `dev` is the experimental integration branch. Feature
-and fix PRs target `dev`; stable releases are tagged from `main`, release
-candidates/pre-releases from `dev` (`vX.Y.Z-rc.N`). The release workflow refuses a
-tag cut from the wrong branch. See [BRANCHING.md](BRANCHING.md).
+`main` — стабильная ветка, `dev` — ветка экспериментальной интеграции.
+Feature/fix-PR идут в `dev`, и до мержа CI (job `host tests, build, image size`)
+должен быть зелёным.
+
+Релизы tag-driven, новые теги всегда с префиксом `v`:
+
+- `vX.Y.Z` ставится с `main` и публикуется как полноценный GitHub release с
+  архивом исходников (`pagh-python-vX.Y.Z.tar.gz`) и его `.sha256`;
+- `vX.Y.Z-rc.N` ставится с `dev`, не должен быть уже на `main` и публикуется
+  как GitHub pre-release. Release candidate — единственный pre-release канал:
+  `-pre.N` больше нет.
+
+Workflow отклоняет тег, если ancestry или базовая версия не совпадают с
+`Cargo.toml`. **Hotfix** (`hotfix/*` от `main`, сразу стабильный PATCH-тег без
+RC, затем `--no-ff`-мерж обратно в `dev`) допускается только для
+critical/high подтверждённых security-находок или release-blocking регрессии в
+выпущенной версии; всё остальное идёт через `dev`.
+
+Операциональный чек-лист — [RELEASING.md](RELEASING.md); модель веток,
+конвенции тегов и release flow — [BRANCHING.md](BRANCHING.md).
 
 ## Сборка
 
