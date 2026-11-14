@@ -1275,6 +1275,7 @@ fn set_operations() -> Result<(), String> {
 }
 
 fn keyword_only_parameters() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
     // `*` / `*args` switch the rest of the signature to keyword-only: those
     // parameters can never be filled positionally, and defaults may be
     // interleaved freely on the keyword-only side.
@@ -1357,6 +1358,7 @@ fn keyword_only_errors() -> Result<(), String> {
 }
 
 fn decorators() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
     expect_repr(
         "def double(f):\n    def wrapper(*args, **kwargs):\n        return f(*args, **kwargs) * 2\n    return wrapper\n@double\ndef five():\n    return 5\nx = five()",
         "x",
@@ -2309,6 +2311,7 @@ fn eval_recursion_depth() -> Result<(), String> {
 }
 
 fn eval_recursion_generator() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
     // The 64 KiB fiber cannot hold 200 Rust frames, so a generator hits its
     // headroom guard first -- cleanly, with the interpreter and heap intact.
     // The short chain proves the guard does not eat ordinary generator work.
