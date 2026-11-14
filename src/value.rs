@@ -73,6 +73,18 @@ impl Env {
     }
 }
 
+impl Drop for Env {
+    fn drop(&mut self) {
+        // Frames and their parent chain can be deep (closures, long call
+        // chains), and this drop can run on a 64 KiB generator fiber. Hand
+        // the contents to the same iterative worklist that `Value` uses, one
+        // object per native frame instead of one per nesting level.
+        let mut pending: Vec<Pending> = Vec::new();
+        take_env_fields(self, &mut pending);
+        drain_pending(pending);
+    }
+}
+
 /// Look a name up through the lexical chain. Builtins are consulted by the
 /// interpreter after this returns `None`; the module environment is the root
 /// of the chain.
@@ -1080,14 +1092,40 @@ impl Value {
     }
 
     pub fn is_hashable(&self) -> bool {
+        // HashMap keys are compared structurally and there is no hash function,
+        // so this is a recursive tree walk over tuples. Walk it with an
+        // explicit stack: a deep tuple can be a set/dict key (audit F-r3-rt-1
+        // covers the same 64 KiB fiber limit for teardown, and a recursive
+        // check here would overrun it before the set even exists).
         match self {
-            Value::None | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => true,
-            Value::Tuple(items) => items.iter().all(Value::is_hashable),
-            Value::Bytes(_) => true,
-            Value::Class(_) | Value::Instance(_) => true,
-            Value::DictView(_) => false,
-            _ => false,
+            Value::None
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Str(_)
+            | Value::Bytes(_)
+            | Value::Class(_)
+            | Value::Instance(_) => return true,
+            Value::Tuple(_) => {}
+            _ => return false,
         }
+        let mut pending: Vec<&Value> = Vec::new();
+        pending.push(self);
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::None
+                | Value::Bool(_)
+                | Value::Int(_)
+                | Value::Float(_)
+                | Value::Str(_)
+                | Value::Bytes(_)
+                | Value::Class(_)
+                | Value::Instance(_) => {}
+                Value::Tuple(items) => pending.extend(items.iter()),
+                _ => return false,
+            }
+        }
+        true
     }
 
     pub fn to_str(&self) -> String {
@@ -1101,6 +1139,298 @@ impl Value {
         let mut out = String::new();
         write_repr(&mut out, self, 0);
         out
+    }
+}
+
+// ── iterative teardown ─────────────────────────────────────────────────────
+//
+// `Value` owns Python objects through `Rc`, so releasing a deep chain with the
+// compiler's drop glue would recurse one native frame per level. That is fine
+// on the 1 MiB process stack, but a generator body runs on a 64 KiB heap fiber
+// with no guard page (see `fiber.rs`): `a = None` on a 2000-deep list overruns
+// it and corrupts the interpreter heap (audit F-r3-rt-1). Every `Value` drop
+// therefore drains container contents through an explicit worklist instead of
+// recursion.
+//
+// The worklist only holds values that themselves own values; leaves (ints,
+// strings, bytes, files, …) are dropped in place. A linear chain therefore
+// keeps a single entry, and dropping a flat collection of leaves allocates
+// nothing at all.
+
+/// Whether dropping this value can recurse into another `Value`.
+fn owns_values(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::List(_)
+            | Value::Tuple(_)
+            | Value::Dict(_)
+            | Value::DictView(_)
+            | Value::Set(_)
+            | Value::Function(_)
+            | Value::Builtin(_)
+            | Value::Class(_)
+            | Value::Instance(_)
+            | Value::BoundMethod(_)
+            | Value::Module(_)
+            | Value::Iterator(_)
+            | Value::Generator(_)
+    )
+}
+
+/// One step of the iterative teardown: a `Value` to empty, or an environment
+/// (the only value-owning object that has no `Value` variant).
+enum Pending {
+    Value(Value),
+    Env(EnvRef),
+}
+
+/// Queue `value` unless it is a leaf that cannot own more values.
+fn push_value(pending: &mut Vec<Pending>, value: Value) {
+    if owns_values(&value) {
+        pending.push(Pending::Value(value));
+    }
+}
+
+/// Empty a container `value` one level down, queueing its children.
+///
+/// Extraction only happens when this handle is the last one: a shared
+/// container keeps its contents for its other owners, which drain them when
+/// their turn comes. The shell left behind is empty, so dropping it afterwards
+/// is a single non-recursive step.
+fn take_children(value: &mut Value, pending: &mut Vec<Pending>) {
+    match value {
+        Value::List(rc) if Rc::strong_count(rc) == 1 => {
+            if let Ok(mut items) = rc.try_borrow_mut() {
+                while let Some(item) = items.pop() {
+                    push_value(pending, item);
+                }
+            }
+        }
+        Value::Tuple(rc) => {
+            if let Some(items) = Rc::get_mut(rc) {
+                while let Some(item) = items.pop() {
+                    push_value(pending, item);
+                }
+            }
+        }
+        Value::Dict(rc) if Rc::strong_count(rc) == 1 => {
+            if let Ok(mut entries) = rc.try_borrow_mut() {
+                while let Some((key, value)) = entries.pop() {
+                    push_value(pending, key);
+                    push_value(pending, value);
+                }
+            }
+        }
+        Value::Set(rc) if Rc::strong_count(rc) == 1 => {
+            if let Ok(mut items) = rc.try_borrow_mut() {
+                while let Some(item) = items.pop() {
+                    push_value(pending, item);
+                }
+            }
+        }
+        Value::DictView(rc) => {
+            if let Some(view) = Rc::get_mut(rc) {
+                if Rc::strong_count(&view.entries) == 1 {
+                    if let Ok(mut entries) = view.entries.try_borrow_mut() {
+                        while let Some((key, value)) = entries.pop() {
+                            push_value(pending, key);
+                            push_value(pending, value);
+                        }
+                    }
+                }
+            }
+        }
+        Value::Builtin(rc) => {
+            if let Some(builtin) = Rc::get_mut(rc) {
+                if let Some(receiver) = builtin.receiver.take() {
+                    push_value(pending, receiver);
+                }
+            }
+        }
+        Value::Function(rc) => {
+            if let Some(function) = Rc::get_mut(rc) {
+                let params = core::mem::take(&mut function.params);
+                for (_, default) in params {
+                    if let Some(default) = default {
+                        push_value(pending, default);
+                    }
+                }
+                let kwonly = core::mem::take(&mut function.kwonly);
+                for (_, default) in kwonly {
+                    if let Some(default) = default {
+                        push_value(pending, default);
+                    }
+                }
+                // A function chain is a chain of environments whose variables
+                // hold functions: when the closure is uniquely owned, drain
+                // its variables onto the same worklist instead of leaving it
+                // to the recursive drop glue. A shared closure is left alone.
+                drain_env_ref(&function.closure, pending);
+            }
+        }
+        Value::Class(rc) => {
+            if let Some(class) = Rc::get_mut(rc) {
+                drain_attrs(&class.attrs, pending);
+                let bases = core::mem::take(&mut class.bases);
+                for base in bases {
+                    pending.push(Pending::Value(Value::Class(base)));
+                }
+            }
+        }
+        Value::Instance(rc) => {
+            if let Some(instance) = Rc::get_mut(rc) {
+                drain_attrs(&instance.attrs, pending);
+                // Clone the class handle before the shell dies: the queued
+                // handle is the last one exactly when the instance was the
+                // only owner, so the class then drains normally.
+                pending.push(Pending::Value(Value::Class(instance.class.clone())));
+            }
+        }
+        Value::BoundMethod(rc) => {
+            if let Some(method) = Rc::get_mut(rc) {
+                pending.push(Pending::Value(Value::Function(method.function.clone())));
+                let receiver = core::mem::replace(&mut method.receiver, Value::None);
+                push_value(pending, receiver);
+            }
+        }
+        Value::Module(rc) => {
+            if let Some(module) = Rc::get_mut(rc) {
+                drain_attrs(&module.attrs, pending);
+            }
+        }
+        Value::Generator(rc) if Rc::strong_count(rc) == 1 => {
+            if let Ok(mut generator) = rc.try_borrow_mut() {
+                pending.push(Pending::Value(Value::Function(generator.function.clone())));
+                drain_env_ref(&generator.env, pending);
+                if let Some(yielded) = generator.yielded.take() {
+                    push_value(pending, yielded);
+                }
+                let sent = core::mem::replace(&mut generator.sent, Value::None);
+                push_value(pending, sent);
+                if let Some(returned) = generator.returned.take() {
+                    push_value(pending, returned);
+                }
+                if let Some(mut error) = generator.failed.take() {
+                    if let Some(value) = error.value.take() {
+                        push_value(pending, value);
+                    }
+                }
+                if let Some(GeneratorPending::Throw(mut error)) = generator.pending.take() {
+                    if let Some(value) = error.value.take() {
+                        push_value(pending, value);
+                    }
+                }
+                // Returning the stack to the pool touches no Values.
+                let fiber = generator.fiber.take();
+                drop(fiber);
+            }
+        }
+        Value::Iterator(rc) if Rc::strong_count(rc) == 1 => {
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                let old = core::mem::replace(
+                    &mut *state,
+                    IterState::Range {
+                        current: 0,
+                        stop: 0,
+                        step: 0,
+                        remaining: 0,
+                    },
+                );
+                drop(state);
+                match old {
+                    IterState::List { items, .. } => {
+                        pending.push(Pending::Value(Value::List(items)))
+                    }
+                    IterState::Tuple { items, .. } => {
+                        pending.push(Pending::Value(Value::Tuple(items)))
+                    }
+                    IterState::DictKeys { entries, .. }
+                    | IterState::DictValues { entries, .. }
+                    | IterState::DictItems { entries, .. } => {
+                        pending.push(Pending::Value(Value::Dict(entries)))
+                    }
+                    IterState::SetElems { items, .. } => {
+                        pending.push(Pending::Value(Value::Set(items)))
+                    }
+                    IterState::Enumerate { inner, .. } => push_value(pending, inner),
+                    IterState::Zip { inners, .. } => {
+                        for inner in inners {
+                            push_value(pending, inner);
+                        }
+                    }
+                    // Range/Str/Bytes/File own no other Values; the file's own
+                    // Drop flushes it.
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn drain_attrs(attrs: &Attrs, pending: &mut Vec<Pending>) {
+    if let Ok(mut attrs) = attrs.try_borrow_mut() {
+        while let Some((_, value)) = attrs.pop() {
+            push_value(pending, value);
+        }
+    }
+}
+
+/// Move an environment's contents onto the worklist. Only called when `env` is
+/// owned uniquely by the caller: the caller keeps the handle alive and drops
+/// the emptied shell afterwards.
+fn drain_env_ref(env: &EnvRef, pending: &mut Vec<Pending>) {
+    if Rc::strong_count(env) != 1 {
+        return;
+    }
+    if let Ok(mut env) = env.try_borrow_mut() {
+        take_env_fields(&mut env, pending);
+    }
+}
+
+fn take_env_fields(env: &mut Env, pending: &mut Vec<Pending>) {
+    let vars = core::mem::take(&mut env.vars);
+    for (_, value) in vars {
+        push_value(pending, value);
+    }
+    if let Some(parent) = env.parent.take() {
+        pending.push(Pending::Env(parent));
+    }
+    env.globals.clear();
+    env.nonlocals.clear();
+}
+
+/// The explicit teardown loop. Each iteration empties one object; nothing here
+/// adds a native stack frame per nesting level.
+fn drain_pending(mut pending: Vec<Pending>) {
+    while let Some(item) = pending.pop() {
+        match item {
+            Pending::Value(mut value) => {
+                take_children(&mut value, &mut pending);
+                // The shell is empty (or shared and untouched), so this only
+                // releases the last `Rc` handle.
+                drop(value);
+            }
+            Pending::Env(env) => {
+                if Rc::strong_count(&env) == 1 {
+                    if let Ok(mut env) = env.try_borrow_mut() {
+                        take_env_fields(&mut env, &mut pending);
+                    }
+                }
+                drop(env);
+            }
+        }
+    }
+}
+
+impl Drop for Value {
+    fn drop(&mut self) {
+        if !owns_values(self) {
+            return;
+        }
+        let mut pending: Vec<Pending> = Vec::new();
+        take_children(self, &mut pending);
+        drain_pending(pending);
     }
 }
 
@@ -1264,7 +1594,7 @@ fn write_repr(out: &mut String, value: &Value, depth: usize) {
 
 fn write_exception_str(out: &mut String, instance: &Instance, depth: usize) {
     let args = attr_get(&instance.attrs, "args");
-    match args {
+    match args.as_ref() {
         Some(Value::Tuple(items)) if items.is_empty() => {}
         Some(Value::Tuple(items)) if items.len() == 1 => {
             let text = items[0].to_str();

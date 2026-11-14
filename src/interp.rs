@@ -954,8 +954,8 @@ impl Interp {
         };
         for expression in base_expressions {
             let value = self.eval_expr(expression, env)?;
-            match value {
-                Value::Class(class) => bases.push(class),
+            match &value {
+                Value::Class(class) => bases.push(class.clone()),
                 other => {
                     return Err(self.err(
                         "TypeError",
@@ -990,7 +990,10 @@ impl Interp {
             Err(error) => return Err(error),
         }
         let vars = match Rc::try_unwrap(class_env) {
-            Ok(cell) => cell.into_inner().vars,
+            Ok(cell) => {
+                let mut env = cell.into_inner();
+                core::mem::take(&mut env.vars)
+            }
             Err(still_shared) => still_shared.borrow().vars.clone(),
         };
         for (attr_name, value) in vars {
@@ -1135,7 +1138,7 @@ impl Interp {
     }
 
     fn error_from_raised_value(&self, value: Value) -> PyError {
-        match value {
+        match &value {
             Value::Class(class) => {
                 if !class.is_exception {
                     return self.err(
@@ -1154,7 +1157,7 @@ impl Interp {
                     );
                 }
                 let class = instance.class.clone();
-                self.error_from_exception(&class, Value::Instance(instance))
+                self.error_from_exception(&class, Value::Instance(instance.clone()))
             }
             other => self.err(
                 "TypeError",
@@ -2644,14 +2647,14 @@ impl Interp {
         args: ArgList,
         kwargs: Vec<(Name, Value)>,
     ) -> PyResult<Value> {
-        match function {
-            Value::Function(function) => self.call_user_function(&function, &args, &kwargs),
+        match &function {
+            Value::Function(function) => self.call_user_function(function, &args, &kwargs),
             Value::BoundMethod(method) => {
                 let call_args = ArgList::with_receiver(method.receiver.clone(), &args);
                 self.call_user_function(&method.function, &call_args, &kwargs)
             }
-            Value::Builtin(builtin) => self.call_builtin(&builtin, &args, &kwargs),
-            Value::Class(class) => self.instantiate(class, &args, &kwargs),
+            Value::Builtin(builtin) => self.call_builtin(builtin, &args, &kwargs),
+            Value::Class(class) => self.instantiate(class.clone(), &args, &kwargs),
             other => Err(self.err(
                 "TypeError",
                 format!("'{}' object is not callable", other.type_name()),
@@ -2892,19 +2895,22 @@ impl Interp {
             attrs: RefCell::new(Vec::new()),
         });
         match class_lookup(&class, "__init__") {
-            Some(Value::Function(function)) => {
-                // `call_user_function` takes positional arguments with the
-                // receiver already in slot 0; going through `call_value` with
-                // a BoundMethod would prepend it a second time.
-                let call_args = ArgList::with_receiver(Value::Instance(instance.clone()), args);
-                self.call_user_function(&function, &call_args, kwargs)?;
-            }
-            Some(_) => {
-                return Err(self.err(
-                    "TypeError",
-                    format!("{}() __init__ is not a function", class.name),
-                ))
-            }
+            Some(value) => match &value {
+                Value::Function(function) => {
+                    // `call_user_function` takes positional arguments with the
+                    // receiver already in slot 0; going through `call_value`
+                    // with a BoundMethod would prepend it a second time.
+                    let call_args =
+                        ArgList::with_receiver(Value::Instance(instance.clone()), args);
+                    self.call_user_function(function, &call_args, kwargs)?;
+                }
+                _ => {
+                    return Err(self.err(
+                        "TypeError",
+                        format!("{}() __init__ is not a function", class.name),
+                    ))
+                }
+            },
             None => {
                 if args.len() != 0 || !kwargs.is_empty() {
                     return Err(
@@ -2930,13 +2936,14 @@ impl Interp {
         }
         let values = args.to_vec();
         let instance = self.make_exception_instance(class.clone(), values.clone());
-        if let Some(Value::Function(function)) = class_lookup(&class, "__init__") {
+        let initializer = class_lookup(&class, "__init__");
+        if let Some(Value::Function(function)) = &initializer {
             let mut call_args = ArgList::new();
             call_args.push(instance.clone());
             for value in values {
                 call_args.push(value);
             }
-            self.call_user_function(&function, &call_args, &[])?;
+            self.call_user_function(function, &call_args, &[])?;
         }
         Ok(instance)
     }
@@ -3829,11 +3836,12 @@ impl Interp {
     /// o b c %`. The `%(name)s` mapping form is not implemented and reports
     /// the unsupported character.
     fn percent_format(&mut self, format: &Rc<str>, right: Value) -> PyResult<Value> {
-        let values: Vec<Value> = match right {
-            // A tuple supplies one argument per conversion; every other value
-            // (including a list) is a single argument.
-            Value::Tuple(items) => items.as_ref().clone(),
-            other => alloc::vec![other],
+        // A tuple supplies one argument per conversion; every other value
+        // (including a list) is a single argument.
+        let values: Vec<Value> = if let Value::Tuple(items) = &right {
+            items.as_ref().clone()
+        } else {
+            alloc::vec![right]
         };
         let chars: Vec<char> = format.chars().collect();
         let mut out = String::new();
@@ -4797,9 +4805,9 @@ impl Interp {
                     return Ok(value);
                 }
                 if let Some(value) = class_lookup(&instance.class, name) {
-                    if let Value::Function(function) = value {
+                    if let Value::Function(function) = &value {
                         return Ok(Value::BoundMethod(Rc::new(crate::value::BoundMethod {
-                            function,
+                            function: function.clone(),
                             receiver: target.clone(),
                         })));
                     }
@@ -5496,13 +5504,13 @@ fn exception_class(name: &str, bases: Vec<Rc<Class>>, _unused: Option<()>) -> Rc
 }
 
 fn bind_method(value: Value, receiver: Value) -> PyResult<Value> {
-    match value {
-        Value::Function(function) => Ok(Value::BoundMethod(Rc::new(crate::value::BoundMethod {
-            function,
+    if let Value::Function(function) = &value {
+        return Ok(Value::BoundMethod(Rc::new(crate::value::BoundMethod {
+            function: function.clone(),
             receiver,
-        }))),
-        other => Ok(other),
+        })));
     }
+    Ok(value)
 }
 
 fn compare_sequences(interp: &Interp, left: &[Value], right: &[Value]) -> PyResult<Ordering> {

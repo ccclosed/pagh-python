@@ -11,10 +11,38 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
 
 ## Статус
 
-**Рабочая версия 0.9.2.** Язык и встроенные функции реализованы настолько,
+**Рабочая версия 0.9.3.** Язык и встроенные функции реализованы настолько,
 насколько это нужно для небольших скриптов на 1 MiB bump-heap ядра pagh.
 
-Новое в 0.9.2 — пределы глубины *вычисления* (аудит F-r2-py-1/2):
+Новое в 0.9.3 — итеративное освобождение графов `Value` (аудит F-r3-rt-1,
+medium, verified): лимиты 0.9.2 считали узлы AST и проверяли остаток стека
+перед каждым узлом, но освобождение `Rc`-контейнеров — это нативный
+рекурсивный drop glue, который не проходит через `eval_expr`/`exec_stmt`.
+`a = None` для 2000-вложенного списка в генераторе переполнял 64-КиБ
+heap-фибер без guard-страницы и портил кучу интерпретатора
+(`load page fault`, `stval=0x5204c1930`), а 4000-deep list/tuple умирали с
+`store page fault` (`stval=0x1ffffff8`); 1800 уровней выживало, 2000 — нет.
+
+- **Явный worklist вместо рекурсии.** `Value::drop` обходит граф объектов
+  циклом: содержимое контейнеров `list`/`tuple`/`dict`/`set` переезжает в
+  очередь, оболочки освобождаются по одной. Тот же механизм покрывает
+  `dict`-view, `Instance`/`Class` (attrs и bases), `Module`, `Function`
+  (defaults и closure-окружение), `BoundMethod`, `Generator` (включая
+  `yielded`/`sent`/`returned` и захваченную ошибку), `Iterator`
+  (list/tuple/dict/set/enumerate/zip) и `Builtin` с receiver'ом. Очередь
+  принимает только значения, которые сами владеют значениями: плоский
+  список скаляров не аллоцирует, линейная цепочка держит один элемент.
+- **`Env` освобождается так же.** Кадры функций и генераторов идут через
+  общий worklist: освобождение 4000-deep локальной переменной при возврате
+  функции (`release_env`) и цепочки closure-окружений не рекурсирует.
+- **`is_hashable` итеративный.** Чтобы `{deep_tuple}` можно было построить,
+  проверка хэшируемости tuple-цепочки тоже обходится циклом — раньше она
+  рекурсировала на том же 64-КиБ файбере ещё до самого drop.
+- **Что осталось рекурсивным.** Парсер и `eval_expr` — с прежними
+  пределами; `repr` ограничен глубиной 12; сборщика циклов по-прежнему нет
+  (ссылающиеся на себя контейнеры не освобождаются, как и раньше).
+
+В 0.9.2 — пределы глубины *вычисления* (аудит F-r2-py-1/2):
 лево-ассоциативная цепочка `x = 1+1+…` строится парсером в цикле, поэтому
 фикс вложенности 0.9.1 её не видел, а `eval_expr` рекурсивно обходил дерево
 без счётчика. Цепочка из 740 термов выводила стек процесса на guard page
@@ -89,6 +117,21 @@ pagh:rv64> run /mnt/pythonc /mnt/script.py
   единого имени после него (`named arguments must follow bare *`), повторный
   `*`/`**`, параметр после `**kwargs` и повторяющиеся имена
   (`duplicate argument 'a' in function definition`).
+
+Живая проверка 0.9.3 — на ядре **0.24.2** (`pagh-riscv`, чистое дерево
+`origin/main` на `23fe825`, QEMU `virt`, ext2 64 MiB, драйвер
+`tests/live/qemu_driver.py`, одна загрузка): полный suite
+[`tests/live/live093.cmds`](tests/live/live093.cmds) — 80 запусков, 62 с
+кодом 0, восемнадцать намеренных диагностик, плюс пять `cat`. Секция
+F-r3-rt-1: `SURVIVED 1800` (контроль прежнего порога), `FIBER DROP OK 2000`,
+`FIBER DROP OK 4000`, `TUPLE FIBER OK`, а также `DICT FIBER OK`,
+`SET FIBER OK`, `ENV FIBER OK`, `INSTANCE FIBER OK`, `FUNCTION FIBER OK`,
+`ITERATOR FIBER OK`, `VIEW FIBER OK` и `ALIVE AFTER DROP TESTS`. На той же
+сборке ядра stock 0.9.2 отдельной загрузкой падает на тех же PoC:
+`load page fault (stval=0x5204c1930)` для 2000-deep list и
+`store page fault (stval=0x1ffffff8)` для 4000-deep list/tuple; 1800
+выживает. Сырой транскрипт: [`docs/live-pythonc-093.txt`](docs/live-pythonc-093.txt);
+для сравнения — [`docs/live-pythonc-092.txt`](docs/live-pythonc-092.txt).
 
 Живая проверка 0.9.2 — на ядре **0.24.1** (`pagh-riscv`, чистое дерево
 `origin/main` на `a3f3a70`, QEMU `virt`, ext2 64 MiB, драйвер
@@ -176,10 +219,10 @@ cargo build --release
 
 ## Запуск в QEMU
 
-Один прогон suite 0.9.2 (сборка, образ, QEMU, транскрипт) — одной командой:
+Один прогон suite 0.9.3 (сборка, образ, QEMU, транскрипт) — одной командой:
 
 ```sh
-sh tests/live/live092.sh
+sh tests/live/live093.sh
 ```
 
 Вручную:
@@ -191,7 +234,7 @@ mke2fs -q -t ext2 -F -b 4096 -d /tmp/py-rootfs /tmp/py-live.img 64M
 
 python3 tests/live/qemu_driver.py \
   --disk /tmp/py-live.img \
-  --commands tests/live/live092.cmds \
+  --commands tests/live/live093.cmds \
   --transcript /tmp/live.txt
 ```
 
@@ -543,7 +586,9 @@ CPython).
   большие строки/списки/set и долгие циклы с накоплением данных упрутся в
   `MemoryError` или закончатся раньше. Рекурсия вызовов ограничена 56
   Python-кадрами (`RecursionError`), глубина вычисления выражения — 256
-  уровнями AST (0.9.2).
+  уровнями AST (0.9.2), а освобождение сколь угодно глубокой цепочки
+  контейнеров идёт через итеративный worklist (0.9.3), а не по нативному
+  стеку.
 - **Вложенность исходника ограничена 200 уровнями (0.9.1, аудит F-rt-4).**
   Скобки ограничивает лексер: 200 вложенных `(){}[]` разбираются, 201-я даёт
   `SyntaxError: too many nested parentheses`. Остальные рекурсивные
@@ -623,12 +668,17 @@ CPython).
 
 ```sh
 cd hostcheck
-cargo test                 # 44 unit-теста интерпретатора
-cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (44 PASS)
+cargo test                 # 45 unit-тестов интерпретатора
+cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (45 PASS)
 cargo run -- ../tests/live/hello.py
 ```
 
-Проверки 0.9.2: `evaluation depth` (200 и 256 термов вычисляются, 257/720/800
+Проверка 0.9.3: `recursive drop on fiber` — внутри генератора на 64-КиБ
+файбере строятся и освобождаются 4000-deep `list`, `tuple`, `dict`, `set`
+(с tuple-ключом), instance-цепочка, closure-цепочка, iterator над глубоким
+list, `dict_items`-view и function-frame `Env`; рекурсивный teardown
+переполнил бы стек и уронил весь harness, поэтому проверка ловит регрессию
+F-r3-rt-1. Проверки 0.9.2: `evaluation depth` (200 и 256 термов вычисляются, 257/720/800
 дают `RecursionError: maximum recursion depth exceeded`; attribute/subscript
 цепочки — 255 звеньев проходят, 256-е отвергается; 3000-термная цепочка в
 невызываемой функции исполняется; `RecursionError` ловится и интерпретатор
@@ -685,26 +735,32 @@ expressions`, `decorators`, `percent format`, `os.path`, `time`, `random` и
 прогон 0.9.2 на ядре 0.24.1 (69 запусков, 51 PASS, 18 намеренных
 диагностик; `EVAL CHAIN 200 OK`, `EVAL CHAIN 256 OK`, `EVAL RECOVERED OK`,
 `PARSE OK`, `INTERLEAVE OK`, `GEN GUARD OK`, `ALIVE AFTER GEN BOMB`,
-`RECURSION LIMIT OK`, `SUITE ALIVE`) —
+`RECURSION LIMIT OK`, `SUITE ALIVE`) и прогон 0.9.3 на ядре 0.24.2
+(80 запусков, 62 PASS, 18 намеренных диагностик; `SURVIVED 1800`,
+`FIBER DROP OK 2000`, `FIBER DROP OK 4000`, `TUPLE FIBER OK`,
+`DICT FIBER OK`, `SET FIBER OK`, `ENV FIBER OK`, `INSTANCE FIBER OK`,
+`FUNCTION FIBER OK`, `ITERATOR FIBER OK`, `VIEW FIBER OK`,
+`ALIVE AFTER DROP TESTS`, `SUITE ALIVE`) —
 PASS-листы и сырые логи: [`docs/live-testing.md`](docs/live-testing.md),
-транскрипты 0.5.0–0.9.2 —
+транскрипты 0.5.0–0.9.3 —
 [`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
 [`docs/live-pythonc-060.txt`](docs/live-pythonc-060.txt),
 [`docs/live-pythonc-070.txt`](docs/live-pythonc-070.txt),
 [`docs/live-pythonc-080.txt`](docs/live-pythonc-080.txt),
 [`docs/live-pythonc-090.txt`](docs/live-pythonc-090.txt),
-[`docs/live-pythonc-091.txt`](docs/live-pythonc-091.txt) и
-[`docs/live-pythonc-092.txt`](docs/live-pythonc-092.txt), скрипты —
+[`docs/live-pythonc-091.txt`](docs/live-pythonc-091.txt),
+[`docs/live-pythonc-092.txt`](docs/live-pythonc-092.txt) и
+[`docs/live-pythonc-093.txt`](docs/live-pythonc-093.txt), скрипты —
 [`tests/live/`](tests/live/).
 
 ## CI
 
 `.github/workflows/ci.yml` чекаутит соседний `pagh-api` (main), ставит
 тулчейн из `rust-toolchain.toml` и гоняет два гейта: `cargo test` в
-`hostcheck` (44 проверки) и `cargo build --release` для
+`hostcheck` (45 проверок) и `cargo build --release` для
 `riscv64gc-unknown-none-elf` с проверкой, что `pythonc` не превышает лимит
 ядра в 1 МиБ. Живой QEMU-прогон в CI намеренно не входит: для него нужны
-ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live092.sh`.
+ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live093.sh`.
 
 ## Устройство
 

@@ -989,3 +989,120 @@ SUITE ALIVE
   записаны в `src/platform.rs`/`src/interp.rs` по контракту pagh-riscv 0.24.1
   (`pagh-riscv/src/user/elf.rs`: `USER_STACK_FLOOR`, `USER_STACK_MAX_SIZE`);
   при изменении контракта их нужно пересмотреть.
+
+---
+
+# Живой прогон pythonc 0.9.3 на ядре 0.24.2
+
+Дата: 2026-11-14. Ядро: `pagh-riscv` 0.24.2, чистое дерево `origin/main` на
+`23fe825`, debug ELF,
+`sha256 29f0d29c76770bc88c7b5fc27accfcaaf538e149fd4cfc4d1f6ee5079e80ebdc`.
+QEMU `qemu-system-riscv64` 10.2.2, машина `virt`, 256 MiB, serial на
+Unix-сокете, 64 MiB ext2. Ядро собрано из git-архива коммита в `/tmp`
+(чекаут `/home/oleg/pagh-riscv` при этом не изменялся). `pythonc` — release,
+586 152 байт, `sha256 a65f512899644a64c7ea00a0a63924b592d6d440ccd9b45c9c5567fcc1a60cf7`.
+
+**Одна загрузка**, все команды подряд; драйвер — собственный
+[`../tests/live/qemu_driver.py`](../tests/live/qemu_driver.py), обёртка —
+[`../tests/live/live093.sh`](../tests/live/live093.sh), список команд —
+[`../tests/live/live093.cmds`](../tests/live/live093.cmds). Сырой транскрипт:
+[`live-pythonc-093.txt`](live-pythonc-093.txt).
+
+## Итог 0.9.3
+
+**80 запусков pythonc: 62 с кодом 0, 18 намеренных диагностик** (usage — 2;
+семнадцать диагностик — 1: пять прежних, пять 0.9.1 nesting-сценариев и семь
+0.9.2 evaluator-сценариев), плюс пять `cat`. После последнего запуска
+транскрипт показывает `SUITE ALIVE`: машина жива после всех «бомб», включая
+deep-drop PoC.
+
+Новое в 0.9.3 — аудит `F-r3-rt-1`: лимиты 0.9.2 считали узлы AST и проверяли
+остаток стека перед каждым узлом, но освобождение `Rc`-цепочек — нативный
+рекурсивный drop glue, который не проходит через `eval_expr`/`exec_stmt`.
+`a = None` для 2000-вложенного списка внутри генератора переполнял 64-КиБ
+heap-фибер без guard-страницы и портил кучу интерпретатора; 1800 уровней
+выживало. Теперь `Value::drop` и `Env::drop` дренируют граф объектов явным
+worklist'ом; `Set`-сценарий дополнительно требует итеративного
+`is_hashable` (иначе tuple-цепочка переполняет файбер ещё при построении
+`set`).
+
+| Скрипт | Что проверяет | Результат |
+|---|---|---|
+| `drop_sweep_1800.py` | контроль прежнего порога: 1800 вложенных списков | `SURVIVED 1800`, exit 0 |
+| `drop_fiber_2000.py` | PoC `F-r3-rt-1` verbatim: 2000-deep list, `a = None` в генераторе | `FIBER DROP OK 2000`, exit 0 |
+| `drop_fiber_4000.py` | 4000-deep list (0.9.2: `store page fault`, stval=0x1ffffff8) | `FIBER DROP OK 4000`, exit 0 |
+| `drop_fiber_tuple_4000.py` | 4000-deep tuple chain | `TUPLE FIBER OK`, exit 0 |
+| `drop_fiber_dict_2000.py` | 2000-deep dict chain | `DICT FIBER OK`, exit 0 |
+| `drop_fiber_set_2000.py` | `set` с 2000-deep tuple-ключом (плюс `is_hashable`) | `SET FIBER OK`, exit 0 |
+| `drop_fiber_env_4000.py` | 4000-deep локальная переменная освобождается при возврате функции (`Env`) | `ENV FIBER OK`, exit 0 |
+| `drop_fiber_instance_2000.py` | 2000-звенная цепочка `Instance.attrs` | `INSTANCE FIBER OK`, exit 0 |
+| `drop_fiber_function_1000.py` | 1000 closure-звеньев `Function → Env → Function` | `FUNCTION FIBER OK`, exit 0 |
+| `drop_fiber_iterator_4000.py` | iterator — последний владелец 4000-deep list | `ITERATOR FIBER OK`, exit 0 |
+| `drop_fiber_view_2000.py` | `dict_items`-view — последний владелец 2000-deep dict | `VIEW FIBER OK`, exit 0 |
+
+## Ключевые строки 0.9.3
+
+```text
+SURVIVED 1800
+FIBER DROP OK 2000
+FIBER DROP OK 4000
+TUPLE FIBER OK
+DICT FIBER OK
+SET FIBER OK
+ENV FIBER OK
+INSTANCE FIBER OK
+FUNCTION FIBER OK
+ITERATOR FIBER OK
+VIEW FIBER OK
+ALIVE AFTER DROP TESTS
+SUITE ALIVE
+```
+
+Регрессия: весь suite 0.1.2–0.9.2 проходит без изменений — `EVAL CHAIN 200 OK`,
+`EVAL CHAIN 256 OK`, `EVAL RECOVERED OK`, `PARSE OK`, `INTERLEAVE OK`,
+`GEN CHAIN 20 OK`, `GEN GUARD OK`, `ALIVE AFTER GEN BOMB`,
+`RECURSION LIMIT OK`, `KEYWORD ONLY OK`, `DICT SET OK`, `GEN METHODS OK`,
+`GEN DELEGATION OK`, `GEN FIBERS OK`, `YIELD FROM OK`, `NESTING OK`,
+`PARENS150 OK`, `NOT200 OK`, `BLOCKS200 OK` и `child: True status: 0` /
+`proc ok` на месте.
+
+## Baseline: stock 0.9.2 на том же ядре
+
+Отдельная загрузка того же ядра с бинарником 0.9.2 (release, 582 056 байт;
+собран из git-архива `origin/dev` без изменений 0.9.3) на тех же скриптах:
+
+```text
+run /mnt/pythonc /mnt/drop_sweep_1800.py
+BUILT
+DROPPED
+SURVIVED 1800
+run: /mnt/pythonc exited with code 0
+run /mnt/pythonc /mnt/drop_fiber_2000.py
+BUILD
+BUILT
+[user] /mnt/pythonc killed: load page fault (cause=13, stval=0x5204c1930, sepc=0x2ed92)
+run /mnt/pythonc /mnt/drop_fiber_4000.py
+BUILD
+BUILT
+[user] /mnt/pythonc killed: store page fault (cause=15, stval=0x1ffffff8, sepc=0x2881a)
+run /mnt/pythonc /mnt/drop_fiber_tuple_4000.py
+TUPLE BUILT
+[user] /mnt/pythonc killed: store page fault (cause=15, stval=0x1ffffff8, sepc=0x2874e)
+```
+
+Шелл после каждого kill остаётся жив (`ALIVE AFTER STOCK BOMBS`), то есть
+это падение процесса интерпретатора, а не машины.
+
+## Честные пробелы 0.9.3
+
+- **Глубже 4000 живьём не проверялось.** На 1 МиБ bump-heap сама цепочка
+  8000-deep list занимает около половины памяти, поэтому acceptance-набор
+  остаётся на 1800/2000/4000 из аудита; итеративность teardown от глубины не
+  зависит. Hostcheck проверяет 4000 для всех контейнерных видов.
+- **Остались рекурсивными** парсер и `eval_expr` (со своими лимитами 200/256),
+  `repr` (глубина 12) и обход AST. Это не drop-путь и в F-r3-rt-1 не входило.
+- **Сборщика циклов нет:** контейнер, ссылающийся на себя, по-прежнему не
+  освобождается (утечка до конца процесса), как и в 0.9.2.
+- **Стек процесса:** тот же deep-drop на process stack работал и до фикса
+  (1 МиБ, не 64 КиБ); проверка живьём сосредоточена на генераторном файбере,
+  где и был баг.
