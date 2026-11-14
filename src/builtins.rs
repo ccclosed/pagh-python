@@ -275,8 +275,8 @@ fn call_dunder(interp: &mut Interp, value: &Value, name: &str) -> PyResult<Optio
 }
 
 fn dunder_string(interp: &Interp, result: Value, name: &str) -> PyResult<String> {
-    match result {
-        Value::Str(text) => Ok(String::from(&*text)),
+    match &result {
+        Value::Str(text) => Ok(String::from(&**text)),
         other => Err(interp.err(
             "TypeError",
             format!(
@@ -3611,8 +3611,8 @@ fn os_execv(interp: &mut Interp, args: &ArgList, kwargs: &[(Rc<str>, Value)]) ->
     let values = interp.collect_iterable(source)?;
     let mut arguments: Vec<String> = Vec::with_capacity(values.len());
     for value in values {
-        match value {
-            Value::Str(text) => arguments.push(String::from(&*text)),
+        match &value {
+            Value::Str(text) => arguments.push(String::from(&**text)),
             other => {
                 return Err(interp.err(
                     "TypeError",

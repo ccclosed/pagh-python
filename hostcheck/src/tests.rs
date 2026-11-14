@@ -1981,6 +1981,7 @@ fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
         ("parser recursion depth", parser_recursion_depth),
         ("evaluation depth", eval_recursion_depth),
         ("evaluation depth generator", eval_recursion_generator),
+        ("recursive drop on fiber", recursive_drop_fiber),
     ]
 }
 
@@ -2403,4 +2404,105 @@ fn eval_recursion_depth_works() {
 #[test]
 fn eval_recursion_generator_works() {
     eval_recursion_generator().unwrap();
+}
+
+/// F-r3-rt-1: a deep Python value graph released inside a generator must not
+/// recurse through the native drop glue. The generator body runs on a 64 KiB
+/// heap fiber with no guard page, so a recursive teardown would overrun the
+/// stack and corrupt the heap -- the audit PoC died at ~1900 nested lists.
+/// Every container kind that used to recurse is exercised here (list, tuple,
+/// dict, set, instance attributes, function closures, iterator state, a dict
+/// view and a function-frame environment).
+fn recursive_drop_fiber() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
+    let script = r#"
+class C:
+    pass
+
+def build_list(n):
+    a = []
+    for _ in range(n):
+        a = [a]
+    return a
+
+def build_tuple(n):
+    a = ()
+    for _ in range(n):
+        a = (a,)
+    return a
+
+def build_dict(n):
+    a = None
+    for _ in range(n):
+        a = {"k": a}
+    return a
+
+def build_instance(n):
+    a = C()
+    for _ in range(n):
+        b = C()
+        b.next = a
+        a = b
+    return a
+
+def make(prev):
+    def f():
+        return prev
+    return f
+
+def build_function(n):
+    f = None
+    for _ in range(n):
+        f = make(f)
+    return f
+
+def release_env(n):
+    a = build_list(n)
+    return len(a)
+
+def gen(n):
+    a = build_list(n)
+    a = None
+    print("DROP LIST OK")
+    a = build_tuple(n)
+    a = None
+    print("DROP TUPLE OK")
+    a = build_dict(n)
+    a = None
+    print("DROP DICT OK")
+    a = build_tuple(n)
+    s = {a}
+    s = None
+    a = None
+    print("DROP SET OK")
+    a = build_instance(n)
+    a = None
+    print("DROP INSTANCE OK")
+    f = build_function(n)
+    f = None
+    print("DROP FUNCTION OK")
+    a = build_list(n)
+    it = iter(a)
+    a = None
+    it = None
+    print("DROP ITERATOR OK")
+    d = build_dict(n)
+    v = d.items()
+    d = None
+    v = None
+    print("DROP VIEW OK")
+    release_env(n)
+    print("DROP ENV OK")
+    yield 1
+
+for _v in gen(4000):
+    pass
+ok = 1 + 1 == 2
+"#;
+    expect_repr(script, "ok", "True")
+}
+
+#[test]
+fn recursive_drop_fiber_works() {
+    recursive_drop_fiber().unwrap();
 }

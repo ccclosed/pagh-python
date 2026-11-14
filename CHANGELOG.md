@@ -5,6 +5,58 @@
 PASS-листы и транскрипты каждой версии — в [README.md](README.md) и
 [docs/live-testing.md](docs/live-testing.md).
 
+## [0.9.3] — 2026-11-14
+
+Исправление безопасности по round-3 аудиту runtime-стека Pagh (`F-r3-rt-1`,
+medium, verified): лимиты 0.9.2 покрывали оценку AST и headroom, но не
+нативный рекурсивный `Drop` `Rc`-цепочек. `a = None` внутри генератора для
+2000-вложенного списка переполнял 64-КиБ heap-фибер без guard-страницы и
+портил кучу интерпретатора (`load page fault`, `stval=0x5204c1930`);
+1800 уровней выживало, 2000+ умирали, а 4000-deep list/tuple давали
+`store page fault` (`stval=0x1ffffff8`). Освобождение значений стало
+итеративным и не зависит от глубины цепочки.
+
+### Безопасность
+
+- **Явный worklist вместо рекурсии.** `Value::drop` обходит граф объектов
+  циклом: содержимое `list`/`tuple`/`dict`/`set` переезжает в очередь,
+  оболочки освобождаются по одной. Тот же путь покрывает `dict`-view,
+  `Instance`/`Class` (attrs и bases), `Module`, `Function` (defaults и
+  closure-окружение), `BoundMethod`, `Generator` (`yielded`/`sent`/
+  `returned` и захваченная ошибка), `Iterator` (list/tuple/dict/set/
+  enumerate/zip) и `Builtin` с receiver'ом. Очередь принимает только
+  значения, которые сами владеют значениями: плоский список скаляров не
+  аллоцирует, линейная цепочка держит один элемент.
+- **`Env` освобождается тем же worklist'ом.** Возврат функции с 4000-deep
+  локальной переменной (`release_env` → `clear_for_pool`) и цепочка
+  closure-окружений не рекурсируют; кадры и их `parent`-цепочка дренируются
+  по одному объекту за итерацию.
+- **`is_hashable` итеративный.** Проверка хэшируемости tuple-цепочки раньше
+  рекурсировала и переполняла тот же 64-КиБ файбер ещё до построения
+  `{deep_tuple}`; теперь это цикл с явным стеком.
+- **Не изменилось:** рекурсивные парсер и `eval_expr` сохранили прежние
+  лимиты; `repr` ограничен глубиной 12; сборщика циклов по-прежнему нет,
+  поэтому ссылающиеся на себя контейнеры не освобождаются (как и в 0.9.2).
+
+### Тесты
+
+- `hostcheck`: 45 проверок (+ `recursive drop on fiber`), 45 `PASS` в
+  `--selftest`. Новая проверка строит и освобождает внутри генератора на
+  64-КиБ файбере 4000-deep list/tuple/dict/set, instance- и
+  closure-цепочки, iterator, dict view и function-frame `Env`; рекурсивный
+  teardown уронил бы стеком весь harness.
+- Живой прогон 0.9.3 на ядре pagh-riscv 0.24.2 (чистое дерево `23fe825`,
+  QEMU, одна загрузка): 80 запусков, 62 с кодом 0, 18 намеренных
+  диагностик; `SURVIVED 1800`, `FIBER DROP OK 2000`, `FIBER DROP OK 4000`,
+  `TUPLE FIBER OK`, `DICT FIBER OK`, `SET FIBER OK`, `ENV FIBER OK`,
+  `INSTANCE FIBER OK`, `FUNCTION FIBER OK`, `ITERATOR FIBER OK`,
+  `VIEW FIBER OK`, `ALIVE AFTER DROP TESTS`, `SUITE ALIVE`; прежние маркеры
+  (0.1.2–0.9.2) на месте. Транскрипт: `docs/live-pythonc-093.txt`.
+- Baseline на том же ядре: stock `pythonc` 0.9.2 падает на PoC
+  (`load page fault stval=0x5204c1930` для 2000-deep list,
+  `store page fault stval=0x1ffffff8` для 4000-deep list/tuple), 1800 —
+  выживает.
+
 ## [0.9.2] — 2026-11-14
 
 Исправление безопасности по round-2 аудиту runtime-стека Pagh (`F-r2-py-1`,
