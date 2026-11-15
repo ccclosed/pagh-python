@@ -143,4 +143,29 @@ run /mnt/pythonc /mnt/drop_fiber_iterator_4000.py
 run /mnt/pythonc /mnt/drop_fiber_view_2000.py
 # The interpreter and the shell are alive after every drop.
 echo ALIVE AFTER DROP TESTS
+# ── F-r4-rt-2: ordering-comparison depth on the generator fiber (0.9.3) ────
+# `cmp_values` compared nested lists/tuples by native recursion
+# (cmp_values -> compare_sequences -> cmp_values) with no depth limit: the
+# parser/AST/frame caps never saw nesting built at run time (`a = [a]` in a
+# loop). On the 64 KiB heap fiber (no guard page) depth 250 survived, 350/450
+# overwrote live heap objects and died with a load page fault
+# (`stval=0x10`/`0x0`), and 500 went below the heap base. The walk now keeps
+# an explicit frame stack and stops at 256 levels with a catchable
+# RecursionError, on the fiber and on the 1 MiB process stack alike.
+#
+# The audit control: 250 nested lists and 250 nested tuples still compare.
+run /mnt/pythonc /mnt/cmp_depth_250.py
+# 350 lists, uncaught: RecursionError, exit 1, machine alive (stock: heap
+# corruption + load page fault stval=0x10).
+run /mnt/pythonc /mnt/cmp_depth_350.py
+# 450 tuples, uncaught: same clean cap (stock: load page fault stval=0x0).
+run /mnt/pythonc /mnt/cmp_depth_450_tuple.py
+# 500 lists caught inside the generator: the interpreter and the same fiber
+# keep working, a self-referential list is capped instead of recursing, and
+# ordinary comparisons still return the right answer.
+run /mnt/pythonc /mnt/cmp_depth_500_caught.py
+# The process stack follows the same 256-level cap: 1000 lists used to compare
+# successfully on 0.9.3, now they raise the same RecursionError and exit 1.
+run /mnt/pythonc /mnt/cmp_depth_main.py
+echo ALIVE AFTER CMP TESTS
 echo SUITE ALIVE

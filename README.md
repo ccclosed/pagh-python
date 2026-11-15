@@ -39,8 +39,37 @@ heap-фибер без guard-страницы и портил кучу инте�
   проверка хэшируемости tuple-цепочки тоже обходится циклом — раньше она
   рекурсировала на том же 64-КиБ файбере ещё до самого drop.
 - **Что осталось рекурсивным.** Парсер и `eval_expr` — с прежними
-  пределами; `repr` ограничен глубиной 12; сборщика циклов по-прежнему нет
-  (ссылающиеся на себя контейнеры не освобождаются, как и раньше).
+  пределами; сравнение вложенных `list`/`tuple` больше не рекурсивно (его
+  закрывает F-r4-rt-2 ниже); `repr` ограничен глубиной 12; сборщика циклов
+  по-прежнему нет (ссылающиеся на себя контейнеры не освобождаются, как и
+  раньше).
+
+Тем же релизом закрыт F-r4-rt-2 (medium, verified): сравнение вложенных
+списков и кортежей (`cmp_values` → `compare_sequences` → `cmp_values`) было
+нативной рекурсией без лимита — счётчики AST (256) и Python-кадров (56) не
+видят вложенность, построенную в рантайме (`a = [a]` в цикле), а `==`
+ограничен глубиной 20. В генераторе на 64-КиБ heap-фибере без guard-страницы
+250 уровней выживало, 350/450 переполняли файбер в живую кучу
+(`load page fault`, `stval=0x10`/`0x0`), а 500 уходил ниже heap base
+(`store page fault`, `stval=0x1fffffd8`).
+
+- **Явный стек кадров вместо нативной рекурсии.** `cmp_values` обходит пары
+  `list`/`tuple` итеративно: кадр (две последовательности и индекс) лежит в
+  `Vec`, а не на стеке Rust, поэтому глубина стоит байтов кучи, а не стека.
+  Буфер кадров один на интерпретатор и переиспользуется, иначе каждый
+  `cmp_values` в `sorted`/`min`/`max` терял бы на never-freed bump-heap
+  ~160 байт, и сортировка вставками списка из 120 вложенных списков
+  (худший случай, ~7 тысяч сравнений) съела бы больше 1 МиБ.
+  Вложенность ограничена `CMP_RECURSION_LIMIT = 256` (как
+  `EXPR_RECURSION_LIMIT`): 255 уровней сравниваются, 256-й —
+  `RecursionError: maximum recursion depth exceeded (256 nested sequence
+  levels)`, ловимое исключение, а не порча heap. Предел одинаков на 1-МиБ
+  process stack и на 64-КиБ файбере; циклический список тоже останавливается
+  пределом, а не бесконечной рекурсией.
+- **Границы.** `==`/`!=` по-прежнему идут через `values_equal` (cap 20:
+  `False` вместо ошибки), а `cmp_values` — через 256-уровневый предел;
+  обычные сравнения, `sorted`/`min`/`max` и лексикографический порядок не
+  изменились (сверено с CPython на 1600 случайных парах выражений).
 
 В 0.9.2 — пределы глубины *вычисления* (аудит F-r2-py-1/2):
 лево-ассоциативная цепочка `x = 1+1+…` строится парсером в цикле, поэтому
@@ -118,11 +147,11 @@ heap-фибер без guard-страницы и портил кучу инте�
   `*`/`**`, параметр после `**kwargs` и повторяющиеся имена
   (`duplicate argument 'a' in function definition`).
 
-Живая проверка 0.9.3 — на ядре **0.24.2** (`pagh-riscv`, чистое дерево
-`origin/main` на `23fe825`, QEMU `virt`, ext2 64 MiB, драйвер
-`tests/live/qemu_driver.py`, одна загрузка): полный suite
-[`tests/live/live093.cmds`](tests/live/live093.cmds) — 80 запусков, 62 с
-кодом 0, восемнадцать намеренных диагностик, плюс пять `cat`. Секция
+Живая проверка 0.9.3 — на ядре **0.24.3** (`pagh-riscv`, `origin/main` на
+`4c02ed0`, QEMU `virt`, ext2 64 MiB, драйвер `tests/live/qemu_driver.py`,
+одна загрузка): полный suite
+[`tests/live/live093.cmds`](tests/live/live093.cmds) — 85 запусков, 64 с
+кодом 0, двадцать одна намеренная диагностика, плюс пять `cat`. Секция
 F-r3-rt-1: `SURVIVED 1800` (контроль прежнего порога), `FIBER DROP OK 2000`,
 `FIBER DROP OK 4000`, `TUPLE FIBER OK`, а также `DICT FIBER OK`,
 `SET FIBER OK`, `ENV FIBER OK`, `INSTANCE FIBER OK`, `FUNCTION FIBER OK`,
@@ -130,7 +159,20 @@ F-r3-rt-1: `SURVIVED 1800` (контроль прежнего порога), `FI
 сборке ядра stock 0.9.2 отдельной загрузкой падает на тех же PoC:
 `load page fault (stval=0x5204c1930)` для 2000-deep list и
 `store page fault (stval=0x1ffffff8)` для 4000-deep list/tuple; 1800
-выживает. Сырой транскрипт: [`docs/live-pythonc-093.txt`](docs/live-pythonc-093.txt);
+выживает. Секция F-r4-rt-2: `CMP DEPTH 250 OK`, `CMP TUPLE 250 OK`,
+`CMP SORT SHALLOW OK`, `CMP BOMB CAUGHT True`, `CMP RECOVERED True`,
+`CMP HEAP CANARY OK`, `CMP CYCLIC CAUGHT True`, `CMP HEAP STILL OK`,
+`ALIVE AFTER CMP BOMB`, `ALIVE AFTER CMP TESTS`; `cmp_depth_350.py`,
+`cmp_depth_450_tuple.py` и `cmp_depth_main.py` завершаются кодом 1 с
+`RecursionError: maximum recursion depth exceeded (256 nested sequence
+levels)`. Stock 0.9.3 (до фикса) умирает на этих глубинах (`load page fault
+stval=0x10` для 350, `stval=0x0` для 450, `store page fault
+stval=0x1fffffd8` для 500 — логи аудита
+`attack/r4/runtime/logs/20261115-r4rt-cmp-bracket3.txt` и
+`20261115-r4rt-cmp-single.txt`). Живой прогон stock 0.9.3 на наших
+`cmp_depth_*`-скриптах (500-deep даёт `load page fault stval=0x2`) — в
+[`docs/live-testing.md`](docs/live-testing.md).
+Сырой транскрипт: [`docs/live-pythonc-093.txt`](docs/live-pythonc-093.txt);
 для сравнения — [`docs/live-pythonc-092.txt`](docs/live-pythonc-092.txt).
 
 Живая проверка 0.9.2 — на ядре **0.24.1** (`pagh-riscv`, чистое дерево
@@ -163,7 +205,7 @@ F-r3-rt-1: `SURVIVED 1800` (контроль прежнего порога), `FI
 [`docs/live-pythonc-091.txt`](docs/live-pythonc-091.txt), PASS-листы и
 детали — [`docs/live-testing.md`](docs/live-testing.md).
 
-Размер release-ELF — 582 056 байт (569 КиБ; лимит ядра — 1 МиБ): профиль
+Размер release-ELF — 586 152 байта (572 КиБ; лимит ядра — 1 МиБ): профиль
 `release` теперь использует `strip = "symbols"`, потому что одна таблица
 символов занимала ~540 КиБ из 1085 КиБ файла 0.4.0. Потоков, сигналов, сети и
 динамического загрузчика в языке нет. Интерпретатор исполняет настоящие
@@ -668,8 +710,8 @@ CPython).
 
 ```sh
 cd hostcheck
-cargo test                 # 45 unit-тестов интерпретатора
-cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (45 PASS)
+cargo test                 # 46 unit-тестов интерпретатора
+cargo run -- --selftest    # те же проверки с PASS/FAIL-строками (46 PASS)
 cargo run -- ../tests/live/hello.py
 ```
 
@@ -678,7 +720,13 @@ cargo run -- ../tests/live/hello.py
 (с tuple-ключом), instance-цепочка, closure-цепочка, iterator над глубоким
 list, `dict_items`-view и function-frame `Env`; рекурсивный teardown
 переполнил бы стек и уронил весь harness, поэтому проверка ловит регрессию
-F-r3-rt-1. Проверки 0.9.2: `evaluation depth` (200 и 256 термов вычисляются, 257/720/800
+F-r3-rt-1. Проверка F-r4-rt-2 — `sequence comparison depth`: 255 вложенных
+list и tuple сравниваются, 256-й уровень даёт `RecursionError`; в генераторе
+на 64-КиБ файбере 250 уровней работают, 350/450/500 — ловимая ошибка,
+обычные сравнения и heap-canary после неё целы, а циклический список
+останавливается пределом; порядок (`<`, `<=`, `>`, `>=`, `sorted`, `min`,
+`max`) сверен с CPython на 1600 случайных парах. Проверки 0.9.2:
+`evaluation depth` (200 и 256 термов вычисляются, 257/720/800
 дают `RecursionError: maximum recursion depth exceeded`; attribute/subscript
 цепочки — 255 звеньев проходят, 256-е отвергается; 3000-термная цепочка в
 невызываемой функции исполняется; `RecursionError` ловится и интерпретатор
@@ -735,12 +783,15 @@ expressions`, `decorators`, `percent format`, `os.path`, `time`, `random` и
 прогон 0.9.2 на ядре 0.24.1 (69 запусков, 51 PASS, 18 намеренных
 диагностик; `EVAL CHAIN 200 OK`, `EVAL CHAIN 256 OK`, `EVAL RECOVERED OK`,
 `PARSE OK`, `INTERLEAVE OK`, `GEN GUARD OK`, `ALIVE AFTER GEN BOMB`,
-`RECURSION LIMIT OK`, `SUITE ALIVE`) и прогон 0.9.3 на ядре 0.24.2
-(80 запусков, 62 PASS, 18 намеренных диагностик; `SURVIVED 1800`,
+`RECURSION LIMIT OK`, `SUITE ALIVE`) и прогон 0.9.3 на ядре 0.24.3
+(85 запусков, 64 PASS, 21 намеренная диагностика; `SURVIVED 1800`,
 `FIBER DROP OK 2000`, `FIBER DROP OK 4000`, `TUPLE FIBER OK`,
 `DICT FIBER OK`, `SET FIBER OK`, `ENV FIBER OK`, `INSTANCE FIBER OK`,
 `FUNCTION FIBER OK`, `ITERATOR FIBER OK`, `VIEW FIBER OK`,
-`ALIVE AFTER DROP TESTS`, `SUITE ALIVE`) —
+`CMP DEPTH 250 OK`, `CMP TUPLE 250 OK`, `CMP SORT SHALLOW OK`,
+`CMP BOMB CAUGHT True`, `CMP RECOVERED True`, `CMP HEAP CANARY OK`,
+`CMP CYCLIC CAUGHT True`, `CMP HEAP STILL OK`, `ALIVE AFTER CMP BOMB`,
+`ALIVE AFTER DROP TESTS`, `ALIVE AFTER CMP TESTS`, `SUITE ALIVE`) —
 PASS-листы и сырые логи: [`docs/live-testing.md`](docs/live-testing.md),
 транскрипты 0.5.0–0.9.3 —
 [`docs/live-pythonc-050.txt`](docs/live-pythonc-050.txt),
@@ -757,7 +808,7 @@ PASS-листы и сырые логи: [`docs/live-testing.md`](docs/live-testi
 
 `.github/workflows/ci.yml` чекаутит соседний `pagh-api` (main), ставит
 тулчейн из `rust-toolchain.toml` и гоняет два гейта: `cargo test` в
-`hostcheck` (45 проверок) и `cargo build --release` для
+`hostcheck` (46 проверок) и `cargo build --release` для
 `riscv64gc-unknown-none-elf` с проверкой, что `pythonc` не превышает лимит
 ядра в 1 МиБ. Живой QEMU-прогон в CI намеренно не входит: для него нужны
 ядро и QEMU, а артефакт приёмки — транскрипт `tests/live/live093.sh`.

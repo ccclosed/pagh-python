@@ -7,9 +7,11 @@ PASS-листы и транскрипты каждой версии — в [READ
 
 ## [0.9.3] — 2026-11-14
 
-Исправление безопасности по round-3 аудиту runtime-стека Pagh (`F-r3-rt-1`,
-medium, verified): лимиты 0.9.2 покрывали оценку AST и headroom, но не
-нативный рекурсивный `Drop` `Rc`-цепочек. `a = None` внутри генератора для
+Исправления безопасности по round-3/round-4 аудитам runtime-стека Pagh
+(`F-r3-rt-1` и `F-r4-rt-2`, medium, verified): первая находка — нативный
+рекурсивный `Drop` `Rc`-цепочек, вторая — нативная рекурсия сравнения
+вложенных `list`/`tuple`. Лимиты 0.9.2 покрывали оценку AST и headroom, но не
+`Drop`. `a = None` внутри генератора для
 2000-вложенного списка переполнял 64-КиБ heap-фибер без guard-страницы и
 портил кучу интерпретатора (`load page fault`, `stval=0x5204c1930`);
 1800 уровней выживало, 2000+ умирали, а 4000-deep list/tuple давали
@@ -37,25 +39,64 @@ medium, verified): лимиты 0.9.2 покрывали оценку AST и hea
 - **Не изменилось:** рекурсивные парсер и `eval_expr` сохранили прежние
   лимиты; `repr` ограничен глубиной 12; сборщика циклов по-прежнему нет,
   поэтому ссылающиеся на себя контейнеры не освобождаются (как и в 0.9.2).
+  Сравнение вложенных `list`/`tuple` после F-r4-rt-2 итеративное и рекурсивным
+  не осталось.
+
+### F-r4-rt-2: глубина сравнения последовательностей
+
+`cmp_values` для `list`/`tuple` звал `compare_sequences`, а та — снова
+`cmp_values`: нативная рекурсия по вложенности без лимита (счётчики AST 256 и
+Python-кадров 56 не видят вложенность, построенную в рантайме `a = [a]`, а
+`==` ограничен 20 уровнями). В генераторе на 64-КиБ heap-фибере без
+guard-страницы 250 уровней выживало, 350/450 переполняли файбер в живую кучу
+(`load page fault`, `stval=0x10`/`0x0`), 500 уходил ниже heap base
+(`store page fault`, `stval=0x1fffffd8`).
+
+- **Явный стек кадров вместо нативной рекурсии.** `cmp_values` обходит пары
+  последовательностей итеративно: кадр (две последовательности и индекс) лежит
+  в `Vec`, поэтому глубина стоит байтов кучи, а не стека. Буфер кадров один на
+  интерпретатор и переиспользуется: иначе каждый `cmp_values` в
+  `sorted`/`min`/`max` терял бы на never-freed bump-heap ~160 байт, и
+  сортировка вставками в худшем случае съедала бы больше 1 МиБ. Предел —
+  `CMP_RECURSION_LIMIT = 256` (как `EXPR_RECURSION_LIMIT`): 255 уровней
+  сравниваются, 256-й даёт `RecursionError: maximum recursion depth exceeded
+  (256 nested sequence levels)` — ловимое исключение, а не порча heap. Предел
+  одинаков на 1-МиБ process stack и на 64-КиБ файбере; циклический список
+  останавливается им же.
+- **Границы.** `==`/`!=` по-прежнему идут через `values_equal` (cap 20,
+  `False` вместо ошибки), менялся только порядок (`<`, `<=`, `>`, `>=`,
+  `sorted`/`min`/`max`). Обычные сравнения и лексикографический порядок
+  сверены с CPython: 1600 случайных пар выражений и 150
+  `sorted`/`min`/`max`-наборов — 0 расхождений.
 
 ### Тесты
 
-- `hostcheck`: 45 проверок (+ `recursive drop on fiber`), 45 `PASS` в
-  `--selftest`. Новая проверка строит и освобождает внутри генератора на
-  64-КиБ файбере 4000-deep list/tuple/dict/set, instance- и
-  closure-цепочки, iterator, dict view и function-frame `Env`; рекурсивный
-  teardown уронил бы стеком весь harness.
-- Живой прогон 0.9.3 на ядре pagh-riscv 0.24.2 (чистое дерево `23fe825`,
-  QEMU, одна загрузка): 80 запусков, 62 с кодом 0, 18 намеренных
-  диагностик; `SURVIVED 1800`, `FIBER DROP OK 2000`, `FIBER DROP OK 4000`,
+- `hostcheck`: 46 проверок (+ `sequence comparison depth`), 46 `PASS` в
+  `--selftest`. `recursive drop on fiber` строит и освобождает внутри
+  генератора на 64-КиБ файбере 4000-deep list/tuple/dict/set, instance- и
+  closure-цепочки, iterator, dict view и function-frame `Env`;
+  `sequence comparison depth` проверяет границу 255/256 для list и tuple на
+  process stack, глубины 250/350/450/500 в генераторе, ловимость
+  `RecursionError`, heap-canary после ошибки, циклический список и прежний
+  `TypeError` для несравнимых типов.
+- Живой прогон 0.9.3 на ядре pagh-riscv 0.24.3 (`origin/main` `4c02ed0`,
+  QEMU, одна загрузка): 85 запусков, 64 с кодом 0, 21 намеренная
+  диагностика; `SURVIVED 1800`, `FIBER DROP OK 2000`, `FIBER DROP OK 4000`,
   `TUPLE FIBER OK`, `DICT FIBER OK`, `SET FIBER OK`, `ENV FIBER OK`,
   `INSTANCE FIBER OK`, `FUNCTION FIBER OK`, `ITERATOR FIBER OK`,
-  `VIEW FIBER OK`, `ALIVE AFTER DROP TESTS`, `SUITE ALIVE`; прежние маркеры
-  (0.1.2–0.9.2) на месте. Транскрипт: `docs/live-pythonc-093.txt`.
+  `VIEW FIBER OK`, `CMP DEPTH 250 OK`, `CMP TUPLE 250 OK`,
+  `CMP SORT SHALLOW OK`,
+  `CMP BOMB CAUGHT True`, `CMP RECOVERED True`, `CMP HEAP CANARY OK`,
+  `CMP CYCLIC CAUGHT True`, `CMP HEAP STILL OK`, `ALIVE AFTER CMP BOMB`,
+  `ALIVE AFTER DROP TESTS`, `ALIVE AFTER CMP TESTS`, `SUITE ALIVE`; прежние
+  маркеры (0.1.2–0.9.2) на месте. Транскрипт: `docs/live-pythonc-093.txt`.
 - Baseline на том же ядре: stock `pythonc` 0.9.2 падает на PoC
   (`load page fault stval=0x5204c1930` для 2000-deep list,
   `store page fault stval=0x1ffffff8` для 4000-deep list/tuple), 1800 —
-  выживает.
+  выживает. Stock 0.9.3 (`origin/dev` `e26f66c`, без F-r4-rt-2) на тех же
+  `cmp_depth_*`-скриптах: 250 — OK, 350/450/500 — `load page fault`
+  (`stval=0x10`/`0x0`/`0x2`), 1000 на process stack ещё сравнивается; после
+  фикса — чистые `RecursionError`.
 
 ## [0.9.2] — 2026-11-14
 

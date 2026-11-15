@@ -33,7 +33,7 @@ pythonc_hash=$(sha256sum "$PYTHONC" | cut -d' ' -f1)
 
 {
     printf 'Serial transcript of the pythonc 0.9.3 live run.\n\n'
-    printf 'Kernel: %s (pagh-riscv 0.24.2, clean `origin/main` tree at 23fe825), sha256 %s.\n' "$KERNEL" "$kernel_hash"
+    printf 'Kernel: %s (pagh-riscv 0.24.3, `origin/main` at 4c02ed0), sha256 %s.\n' "$KERNEL" "$kernel_hash"
     cat <<'HEADER'
 QEMU `qemu-system-riscv64` 10.2.2, machine `virt`, 256 MiB, serial on a Unix
 socket, no display, virtio-blk. Disk: 64 MiB ext2 image built on the host with
@@ -45,7 +45,8 @@ HEADER
 
 One boot, driven by the repository's own driver, commands in the order of
 `tests/live/live093.cmds` -- the 0.1.2-0.9.2 regression suite plus the new
-recursive-drop boundary checks (audit F-r3-rt-1); the kernel prints
+recursive-drop (audit F-r3-rt-1) and ordering-comparison depth (audit
+F-r4-rt-2) boundary checks; the kernel prints
 `run: /mnt/pythonc exited with code N` after every program. This script runs
 exactly these steps, including the image build:
 
@@ -58,33 +59,48 @@ exactly these steps, including the image build:
 The OpenSBI/kernel boot banner is dropped; the transcript starts at the first
 shell prompt.
 
-Totals: 80 program runs, 62 exited 0; eighteen exited non-zero on purpose
-(`run /mnt/pythonc` without arguments -> 2, and seventeen diagnostics -> 1:
-the five older ones `syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
+Totals: 85 program runs, 64 exited 0; twenty-one exited non-zero on purpose
+(`run /mnt/pythonc` without arguments -> 2, and twenty diagnostics -> 1: the
+five older ones `syntax_error.py`, `uncaught.py`, `generator_syntax.py`,
 `decorator_syntax.py`, `yield_from_syntax.py`, the five 0.9.1 parser-nesting
-ones, and the seven 0.9.2 evaluator-depth ones -- `eval_chain_257.py`,
+ones, the seven 0.9.2 evaluator-depth ones -- `eval_chain_257.py`,
 `eval_chain_720.py`, `eval_chain_740.py`, `eval_chain_800.py`,
-`eval_chain_attr.py`, `eval_chain_sub.py`, `gen_chain_300.py`). Five `cat`
-commands show the staged scripts and the two files written by
-`fileio.py`/`print(file=...)`.
+`eval_chain_attr.py`, `eval_chain_sub.py`, `gen_chain_300.py` -- and the three
+new comparison-depth overflows `cmp_depth_350.py`,
+`cmp_depth_450_tuple.py`, `cmp_depth_main.py`). Five `cat` commands show the
+staged scripts and the two files written by `fileio.py`/`print(file=...)`.
 
-The 0.9.3 fix is visible in the last section: on 0.9.2 a deep `Rc` teardown
-inside a generator overran the 64 KiB heap fiber and killed the process, while
-1800 nested lists survived. Here `SURVIVED 1800` is unchanged, and
-`FIBER DROP OK 2000` / `FIBER DROP OK 4000` / `TUPLE FIBER OK` show the audit
-PoCs exiting 0 instead of dying with
+Two 0.9.3 fixes are visible in the last sections. On 0.9.2 a deep `Rc`
+teardown inside a generator overran the 64 KiB heap fiber and killed the
+process, while 1800 nested lists survived; here `SURVIVED 1800` is unchanged,
+and `FIBER DROP OK 2000` / `FIBER DROP OK 4000` / `TUPLE FIBER OK` show the
+audit PoCs exiting 0 instead of dying with
 `[user] /mnt/pythonc killed: load page fault (stval=0x5204c1930)` or
 `store page fault (stval=0x1ffffff8)`. The same section covers `dict`, `Set`,
 function-frame (`Env`) release, instance-attribute chains, closure chains,
 iterators over a deep list and dict views -- all through one explicit
-teardown worklist. `ALIVE AFTER DROP TESTS` follows, and the older markers
-`EVAL CHAIN 200 OK`, `EVAL CHAIN 256 OK`, `GEN GUARD OK`, `RECURSION LIMIT OK`,
-`KEYWORD ONLY OK`, `DICT SET OK`, `GEN METHODS OK`, `GEN DELEGATION OK`,
-`GEN FIBERS OK`, `YIELD FROM OK`, `NESTING OK`, `PARENS150 OK`, `NOT200 OK`,
-`BLOCKS200 OK` and `child: True status: 0` / `proc ok` are still there.
+teardown worklist.
+
+The new section covers audit F-r4-rt-2. Ordering comparisons of nested
+lists/tuples used to recurse natively with no depth limit, so on the fiber
+250 levels survived while 350/450 overwrote live heap objects
+(`load page fault stval=0x10`/`0x0`) and 500 went below the heap base
+(`store page fault stval=0x1fffffd8`). Now `CMP DEPTH 250 OK` /
+`CMP TUPLE 250 OK` hold, 350 and 450 tuples exit 1 with
+`RecursionError: maximum recursion depth exceeded (256 nested sequence
+levels)`, 500 is caught inside the generator (`CMP BOMB CAUGHT True`,
+`CMP RECOVERED True`, `CMP HEAP CANARY OK`, `CMP CYCLIC CAUGHT True`,
+`CMP HEAP STILL OK`, `ALIVE AFTER CMP BOMB`), and
+the 1000-level process-stack case exits 1 through the same cap. The older
+markers `EVAL CHAIN 200 OK`, `EVAL CHAIN 256 OK`, `GEN GUARD OK`,
+`RECURSION LIMIT OK`, `KEYWORD ONLY OK`, `DICT SET OK`, `GEN METHODS OK`,
+`GEN DELEGATION OK`, `GEN FIBERS OK`, `YIELD FROM OK`, `NESTING OK`,
+`PARENS150 OK`, `NOT200 OK`, `BLOCKS200 OK`, `ALIVE AFTER DROP TESTS`,
+`ALIVE AFTER CMP TESTS` and `child: True status: 0` / `proc ok` are still
+there, as is `SUITE ALIVE`.
 
 ==============================================================================
-## One boot: the 0.1.2-0.9.2 regression commands and the 0.9.3 drop limits
+## One boot: 0.1.2-0.9.2 regression, 0.9.3 drop and comparison-depth limits
 ==============================================================================
 
 BODY
