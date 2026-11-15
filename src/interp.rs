@@ -11,14 +11,17 @@
 //! * positional arguments use [`ArgList`], a small inline array with a `Vec`
 //!   spill only for calls with more than eight arguments.
 //!
-//! Recursion is capped twice. [`RECURSION_LIMIT`] Python call frames bound
-//! function recursion, and [`EXPR_RECURSION_LIMIT`] evaluation levels bound
-//! the recursive tree walk itself: a left-associative chain such as
+//! Recursion is capped three times. [`RECURSION_LIMIT`] Python call frames
+//! bound function recursion, and [`EXPR_RECURSION_LIMIT`] evaluation levels
+//! bound the recursive tree walk itself: a left-associative chain such as
 //! `1+1+…+1` is built by a parser *loop*, so the parser's nesting counter does
 //! not grow, while `eval_expr` recurses once per AST node. Without the second
 //! cap such a chain walks off the 1 MiB process stack (or, inside a generator,
-//! the 64 KiB fiber stack first). Both caps raise `RecursionError`, never a
-//! stack fault.
+//! the 64 KiB fiber stack first). A third cap, [`CMP_RECURSION_LIMIT`], bounds
+//! the recursion depth of ordering comparisons over nested lists and tuples,
+//! whose nesting is built at run time and is therefore invisible to both
+//! counters above (the walk itself is iterative, so the cap bounds heap use,
+//! not stack use). All three caps raise `RecursionError`, never a stack fault.
 
 use alloc::format;
 use alloc::rc::Rc;
@@ -69,6 +72,31 @@ pub const RECURSION_LIMIT: usize = 56;
 /// parser folds iteratively cannot bypass the limit. Crossing it is a
 /// `RecursionError: maximum recursion depth exceeded`, like CPython's limit.
 pub const EXPR_RECURSION_LIMIT: usize = 256;
+
+/// Maximum nesting depth of a list/tuple ordering comparison.
+///
+/// [`Interp::cmp_values`] walks nested sequences lexicographically. That walk
+/// used to recurse natively (`cmp_values` → `compare_sequences` →
+/// `cmp_values`), and the recursion was invisible to [`RECURSION_LIMIT`] and
+/// [`EXPR_RECURSION_LIMIT`]: nesting is built at run time (`a = [a]` in a
+/// loop), so neither the parser nor the AST evaluator ever sees it. On a
+/// generator's 64 KiB heap fiber (there is no guard page under it) the walk
+/// ran off the stack into the live interpreter heap: depth 250 survived while
+/// 300 and deeper died with a load page fault at `stval=0x10` after
+/// overwriting heap objects (audit F-r4-rt-2), and depth 500 went below the
+/// heap base.
+///
+/// The comparison now keeps its own explicit stack of sequence frames, so the
+/// depth costs heap bytes instead of fiber bytes and cannot corrupt any stack.
+/// The counter is still needed for Python parity and to bound that heap use:
+/// equality may answer `False` at its cap ([`values_equal`] stops at 20
+/// levels), but a relational operator must produce a real ordering or raise,
+/// so crossing this limit is a
+/// `RecursionError: maximum recursion depth exceeded`, like CPython's
+/// "… in comparison". The value matches [`EXPR_RECURSION_LIMIT`]; 255 nested
+/// levels compare, level 256 raises, and the audit's 250-level control works
+/// on the process stack and on a generator fiber alike.
+pub const CMP_RECURSION_LIMIT: usize = 256;
 
 /// Free process-stack bytes the evaluator insists on keeping below itself.
 ///
@@ -255,6 +283,12 @@ pub struct Interp {
     /// innermost one to switch back to its resumer, and each entry remembers
     /// where the generator's traceback frames start.
     active_fibers: Vec<ActiveFiber>,
+    /// Reused frame stack for iterative sequence comparisons. The walk itself
+    /// is allocation-free for shallow values and reuses this buffer for deep
+    /// ones, so repeated comparisons in `sorted`/`min`/`max` do not grow the
+    /// never-freed bump heap. Comparisons cannot re-enter (`cmp_values` never
+    /// calls Python code), so one buffer per interpreter is enough.
+    cmp_frames: Vec<SequenceFrame>,
 }
 
 impl Interp {
@@ -399,6 +433,7 @@ impl Interp {
             module_cache: Vec::new(),
             rng_state: RNG_SEED,
             active_fibers: Vec::new(),
+            cmp_frames: Vec::new(),
         };
         interp.init_search_paths(script_dir);
         interp.init_builtins(object_class, type_class);
@@ -954,8 +989,8 @@ impl Interp {
         };
         for expression in base_expressions {
             let value = self.eval_expr(expression, env)?;
-            match value {
-                Value::Class(class) => bases.push(class),
+            match &value {
+                Value::Class(class) => bases.push(class.clone()),
                 other => {
                     return Err(self.err(
                         "TypeError",
@@ -990,7 +1025,10 @@ impl Interp {
             Err(error) => return Err(error),
         }
         let vars = match Rc::try_unwrap(class_env) {
-            Ok(cell) => cell.into_inner().vars,
+            Ok(cell) => {
+                let mut env = cell.into_inner();
+                core::mem::take(&mut env.vars)
+            }
             Err(still_shared) => still_shared.borrow().vars.clone(),
         };
         for (attr_name, value) in vars {
@@ -1135,7 +1173,7 @@ impl Interp {
     }
 
     fn error_from_raised_value(&self, value: Value) -> PyError {
-        match value {
+        match &value {
             Value::Class(class) => {
                 if !class.is_exception {
                     return self.err(
@@ -1154,7 +1192,7 @@ impl Interp {
                     );
                 }
                 let class = instance.class.clone();
-                self.error_from_exception(&class, Value::Instance(instance))
+                self.error_from_exception(&class, Value::Instance(instance.clone()))
             }
             other => self.err(
                 "TypeError",
@@ -2644,14 +2682,14 @@ impl Interp {
         args: ArgList,
         kwargs: Vec<(Name, Value)>,
     ) -> PyResult<Value> {
-        match function {
-            Value::Function(function) => self.call_user_function(&function, &args, &kwargs),
+        match &function {
+            Value::Function(function) => self.call_user_function(function, &args, &kwargs),
             Value::BoundMethod(method) => {
                 let call_args = ArgList::with_receiver(method.receiver.clone(), &args);
                 self.call_user_function(&method.function, &call_args, &kwargs)
             }
-            Value::Builtin(builtin) => self.call_builtin(&builtin, &args, &kwargs),
-            Value::Class(class) => self.instantiate(class, &args, &kwargs),
+            Value::Builtin(builtin) => self.call_builtin(builtin, &args, &kwargs),
+            Value::Class(class) => self.instantiate(class.clone(), &args, &kwargs),
             other => Err(self.err(
                 "TypeError",
                 format!("'{}' object is not callable", other.type_name()),
@@ -2892,19 +2930,22 @@ impl Interp {
             attrs: RefCell::new(Vec::new()),
         });
         match class_lookup(&class, "__init__") {
-            Some(Value::Function(function)) => {
-                // `call_user_function` takes positional arguments with the
-                // receiver already in slot 0; going through `call_value` with
-                // a BoundMethod would prepend it a second time.
-                let call_args = ArgList::with_receiver(Value::Instance(instance.clone()), args);
-                self.call_user_function(&function, &call_args, kwargs)?;
-            }
-            Some(_) => {
-                return Err(self.err(
-                    "TypeError",
-                    format!("{}() __init__ is not a function", class.name),
-                ))
-            }
+            Some(value) => match &value {
+                Value::Function(function) => {
+                    // `call_user_function` takes positional arguments with the
+                    // receiver already in slot 0; going through `call_value`
+                    // with a BoundMethod would prepend it a second time.
+                    let call_args =
+                        ArgList::with_receiver(Value::Instance(instance.clone()), args);
+                    self.call_user_function(function, &call_args, kwargs)?;
+                }
+                _ => {
+                    return Err(self.err(
+                        "TypeError",
+                        format!("{}() __init__ is not a function", class.name),
+                    ))
+                }
+            },
             None => {
                 if args.len() != 0 || !kwargs.is_empty() {
                     return Err(
@@ -2930,13 +2971,14 @@ impl Interp {
         }
         let values = args.to_vec();
         let instance = self.make_exception_instance(class.clone(), values.clone());
-        if let Some(Value::Function(function)) = class_lookup(&class, "__init__") {
+        let initializer = class_lookup(&class, "__init__");
+        if let Some(Value::Function(function)) = &initializer {
             let mut call_args = ArgList::new();
             call_args.push(instance.clone());
             for value in values {
                 call_args.push(value);
             }
-            self.call_user_function(&function, &call_args, &[])?;
+            self.call_user_function(function, &call_args, &[])?;
         }
         Ok(instance)
     }
@@ -3829,11 +3871,12 @@ impl Interp {
     /// o b c %`. The `%(name)s` mapping form is not implemented and reports
     /// the unsupported character.
     fn percent_format(&mut self, format: &Rc<str>, right: Value) -> PyResult<Value> {
-        let values: Vec<Value> = match right {
-            // A tuple supplies one argument per conversion; every other value
-            // (including a list) is a single argument.
-            Value::Tuple(items) => items.as_ref().clone(),
-            other => alloc::vec![other],
+        // A tuple supplies one argument per conversion; every other value
+        // (including a list) is a single argument.
+        let values: Vec<Value> = if let Value::Tuple(items) = &right {
+            items.as_ref().clone()
+        } else {
+            alloc::vec![right]
         };
         let chars: Vec<char> = format.chars().collect();
         let mut out = String::new();
@@ -4116,7 +4159,7 @@ impl Interp {
         Ok(Value::Float(result))
     }
 
-    fn compare_op(&self, op: CmpOp, left: &Value, right: &Value) -> PyResult<bool> {
+    fn compare_op(&mut self, op: CmpOp, left: &Value, right: &Value) -> PyResult<bool> {
         match op {
             CmpOp::Eq => Ok(values_equal(left, right)),
             CmpOp::NotEq => Ok(!values_equal(left, right)),
@@ -4197,27 +4240,90 @@ impl Interp {
     /// sorts as equal to its neighbour (Python's `min`/`sorted` ordering with
     /// NaN is unspecified; relational operators use `numeric_ordering` and
     /// return false instead).
-    pub fn cmp_values(&self, left: &Value, right: &Value) -> PyResult<Ordering> {
-        if let Some(ordering) = self.numeric_ordering(left, right) {
-            return Ok(ordering.unwrap_or(Ordering::Equal));
-        }
-        match (left, right) {
-            (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
-            (Value::Bytes(a), Value::Bytes(b)) => Ok(a.as_slice().cmp(b.as_slice())),
-            (Value::List(a), Value::List(b)) => {
-                let a = a.borrow();
-                let b = b.borrow();
-                compare_sequences(self, &a, &b)
+    ///
+    /// Nested sequences are compared lexicographically with an explicit stack
+    /// of frames, never by native recursion, so the nesting depth costs heap
+    /// bytes instead of stack bytes. That detail matters inside a generator:
+    /// its fiber is a 64 KiB heap allocation with no guard page, and a native
+    /// walk over a deep value used to overrun it into the live interpreter
+    /// heap (audit F-r4-rt-2). The walk is bounded by
+    /// [`CMP_RECURSION_LIMIT`] and raises a clean `RecursionError`.
+    pub fn cmp_values(&mut self, left: &Value, right: &Value) -> PyResult<Ordering> {
+        self.cmp_frames.clear();
+        let mut left = left.clone();
+        let mut right = right.clone();
+        loop {
+            // Compare the current pair. Scalars produce an ordering directly;
+            // a pair of sequences of the same kind descends by pushing a frame
+            // and continuing with its first elements.
+            let mut ordering = if let Some(ordering) = self.numeric_ordering(&left, &right) {
+                ordering.unwrap_or(Ordering::Equal)
+            } else if let (Value::Str(a), Value::Str(b)) = (&left, &right) {
+                a.cmp(b)
+            } else if let (Value::Bytes(a), Value::Bytes(b)) = (&left, &right) {
+                a.as_slice().cmp(b.as_slice())
+            } else if let Some((left_sequence, right_sequence)) = sequences_of(&left, &right) {
+                let left_len = left_sequence.len();
+                let right_len = right_sequence.len();
+                if left_len == 0 || right_len == 0 {
+                    left_len.cmp(&right_len)
+                } else {
+                    if self.cmp_frames.len() + 1 >= CMP_RECURSION_LIMIT {
+                        // Release the parent frames' clones before the error
+                        // travels up: the walk is abandoned, and a caught
+                        // error must not keep a deep value alive until the
+                        // next comparison.
+                        self.cmp_frames.clear();
+                        return Err(self.err(
+                            "RecursionError",
+                            format!(
+                                "maximum recursion depth exceeded ({} nested sequence levels)",
+                                CMP_RECURSION_LIMIT
+                            ),
+                        ));
+                    }
+                    left = left_sequence.item(0);
+                    right = right_sequence.item(0);
+                    self.cmp_frames.push(SequenceFrame {
+                        left: left_sequence,
+                        right: right_sequence,
+                        index: 0,
+                    });
+                    continue;
+                }
+            } else {
+                self.cmp_frames.clear();
+                return Err(self.err(
+                    "TypeError",
+                    format!(
+                        "'<' not supported between instances of '{}' and '{}'",
+                        left.type_name(),
+                        right.type_name()
+                    ),
+                ));
+            };
+            // The current pair is done. An unequal result decides the whole
+            // comparison; an equal one advances the parent frame (or finishes
+            // the walk when there is no parent left).
+            loop {
+                if ordering != Ordering::Equal {
+                    return Ok(ordering);
+                }
+                let Some(frame) = self.cmp_frames.last_mut() else {
+                    return Ok(Ordering::Equal);
+                };
+                frame.index += 1;
+                let left_len = frame.left.len();
+                let right_len = frame.right.len();
+                if frame.index >= left_len || frame.index >= right_len {
+                    ordering = left_len.cmp(&right_len);
+                    self.cmp_frames.pop();
+                    continue;
+                }
+                left = frame.left.item(frame.index);
+                right = frame.right.item(frame.index);
+                break;
             }
-            (Value::Tuple(a), Value::Tuple(b)) => compare_sequences(self, a, b),
-            _ => Err(self.err(
-                "TypeError",
-                format!(
-                    "'<' not supported between instances of '{}' and '{}'",
-                    left.type_name(),
-                    right.type_name()
-                ),
-            )),
         }
     }
 
@@ -4797,9 +4903,9 @@ impl Interp {
                     return Ok(value);
                 }
                 if let Some(value) = class_lookup(&instance.class, name) {
-                    if let Value::Function(function) = value {
+                    if let Value::Function(function) = &value {
                         return Ok(Value::BoundMethod(Rc::new(crate::value::BoundMethod {
-                            function,
+                            function: function.clone(),
                             receiver: target.clone(),
                         })));
                     }
@@ -5496,25 +5602,66 @@ fn exception_class(name: &str, bases: Vec<Rc<Class>>, _unused: Option<()>) -> Rc
 }
 
 fn bind_method(value: Value, receiver: Value) -> PyResult<Value> {
-    match value {
-        Value::Function(function) => Ok(Value::BoundMethod(Rc::new(crate::value::BoundMethod {
-            function,
+    if let Value::Function(function) = &value {
+        return Ok(Value::BoundMethod(Rc::new(crate::value::BoundMethod {
+            function: function.clone(),
             receiver,
-        }))),
-        other => Ok(other),
+        })));
+    }
+    Ok(value)
+}
+
+/// One list or tuple in the middle of an iterative ordering comparison.
+///
+/// The ordering walk keeps these frames on the heap instead of relying on
+/// native recursion, because a deeply nested value can be built at run time
+/// and a recursive walk over it would overrun a generator's 64 KiB fiber (see
+/// [`CMP_RECURSION_LIMIT`]).
+enum SequenceRef {
+    List(Rc<RefCell<Vec<Value>>>),
+    Tuple(Rc<Vec<Value>>),
+}
+
+impl SequenceRef {
+    fn len(&self) -> usize {
+        match self {
+            SequenceRef::List(items) => items.borrow().len(),
+            SequenceRef::Tuple(items) => items.len(),
+        }
+    }
+
+    /// Clone one element out of the sequence. The borrow is released before
+    /// the caller descends, so a self-referential list cannot trip a
+    /// `RefCell` borrow conflict while it is being compared (and compared
+    /// self-referentially until the depth limit stops it).
+    fn item(&self, index: usize) -> Value {
+        match self {
+            SequenceRef::List(items) => items.borrow()[index].clone(),
+            SequenceRef::Tuple(items) => items[index].clone(),
+        }
     }
 }
 
-fn compare_sequences(interp: &Interp, left: &[Value], right: &[Value]) -> PyResult<Ordering> {
-    let mut index = 0;
-    while index < left.len() && index < right.len() {
-        let ordering = interp.cmp_values(&left[index], &right[index])?;
-        if ordering != Ordering::Equal {
-            return Ok(ordering);
+/// A sequence pair being compared and the index of the next element.
+struct SequenceFrame {
+    left: SequenceRef,
+    right: SequenceRef,
+    index: usize,
+}
+
+/// The sequence pair to descend into, when both operands are the same kind of
+/// sequence. A list-versus-tuple pair is a `TypeError`, like any other
+/// unsupported comparison.
+fn sequences_of(left: &Value, right: &Value) -> Option<(SequenceRef, SequenceRef)> {
+    match (left, right) {
+        (Value::List(a), Value::List(b)) => {
+            Some((SequenceRef::List(a.clone()), SequenceRef::List(b.clone())))
         }
-        index += 1;
+        (Value::Tuple(a), Value::Tuple(b)) => {
+            Some((SequenceRef::Tuple(a.clone()), SequenceRef::Tuple(b.clone())))
+        }
+        _ => None,
     }
-    Ok(left.len().cmp(&right.len()))
 }
 
 fn target_len(target: &Value) -> i64 {

@@ -989,3 +989,207 @@ SUITE ALIVE
   записаны в `src/platform.rs`/`src/interp.rs` по контракту pagh-riscv 0.24.1
   (`pagh-riscv/src/user/elf.rs`: `USER_STACK_FLOOR`, `USER_STACK_MAX_SIZE`);
   при изменении контракта их нужно пересмотреть.
+
+---
+
+# Живой прогон pythonc 0.9.3 на ядре 0.24.3
+
+Дата: 2026-11-15. Ядро: `pagh-riscv` 0.24.3, `origin/main` на `4c02ed0`
+(дерево побайтно совпадает с dev-мержем `ef80e1a`), debug ELF,
+`sha256 7b6cec8f720029e50b96c394cf1594bc911a65c189f8e80532c8f58c77931d21`.
+QEMU `qemu-system-riscv64` 10.2.2, машина `virt`, 256 MiB, serial на
+Unix-сокете, 64 MiB ext2. `pythonc` — release, 586 152 байта,
+`sha256 dff15fac4df612071d5c7b5b580bcb1ea5fcd2ee41e7dd3a3e4316b57372d8b2`.
+
+**Одна загрузка**, все команды подряд; драйвер — собственный
+[`../tests/live/qemu_driver.py`](../tests/live/qemu_driver.py), обёртка —
+[`../tests/live/live093.sh`](../tests/live/live093.sh), список команд —
+[`../tests/live/live093.cmds`](../tests/live/live093.cmds). Сырой транскрипт:
+[`live-pythonc-093.txt`](live-pythonc-093.txt).
+
+## Итог 0.9.3
+
+**85 запусков pythonc: 64 с кодом 0, 21 намеренная диагностика** (usage — 2;
+двадцать диагностик — 1: пять прежних, пять 0.9.1 nesting-сценариев, семь
+0.9.2 evaluator-сценариев и три новых comparison-depth сценария), плюс пять
+`cat`. После последнего запуска транскрипт показывает `SUITE ALIVE`: машина
+жива после всех «бомб», включая deep-drop и comparison-depth PoC.
+
+Новое в 0.9.3 — аудит `F-r3-rt-1`: лимиты 0.9.2 считали узлы AST и проверяли
+остаток стека перед каждым узлом, но освобождение `Rc`-цепочек — нативный
+рекурсивный drop glue, который не проходит через `eval_expr`/`exec_stmt`.
+`a = None` для 2000-вложенного списка внутри генератора переполнял 64-КиБ
+heap-фибер без guard-страницы и портил кучу интерпретатора; 1800 уровней
+выживало. Теперь `Value::drop` и `Env::drop` дренируют граф объектов явным
+worklist'ом; `Set`-сценарий дополнительно требует итеративного
+`is_hashable` (иначе tuple-цепочка переполняет файбер ещё при построении
+`set`).
+
+| Скрипт | Что проверяет | Результат |
+|---|---|---|
+| `drop_sweep_1800.py` | контроль прежнего порога: 1800 вложенных списков | `SURVIVED 1800`, exit 0 |
+| `drop_fiber_2000.py` | PoC `F-r3-rt-1` verbatim: 2000-deep list, `a = None` в генераторе | `FIBER DROP OK 2000`, exit 0 |
+| `drop_fiber_4000.py` | 4000-deep list (0.9.2: `store page fault`, stval=0x1ffffff8) | `FIBER DROP OK 4000`, exit 0 |
+| `drop_fiber_tuple_4000.py` | 4000-deep tuple chain | `TUPLE FIBER OK`, exit 0 |
+| `drop_fiber_dict_2000.py` | 2000-deep dict chain | `DICT FIBER OK`, exit 0 |
+| `drop_fiber_set_2000.py` | `set` с 2000-deep tuple-ключом (плюс `is_hashable`) | `SET FIBER OK`, exit 0 |
+| `drop_fiber_env_4000.py` | 4000-deep локальная переменная освобождается при возврате функции (`Env`) | `ENV FIBER OK`, exit 0 |
+| `drop_fiber_instance_2000.py` | 2000-звенная цепочка `Instance.attrs` | `INSTANCE FIBER OK`, exit 0 |
+| `drop_fiber_function_1000.py` | 1000 closure-звеньев `Function → Env → Function` | `FUNCTION FIBER OK`, exit 0 |
+| `drop_fiber_iterator_4000.py` | iterator — последний владелец 4000-deep list | `ITERATOR FIBER OK`, exit 0 |
+| `drop_fiber_view_2000.py` | `dict_items`-view — последний владелец 2000-deep dict | `VIEW FIBER OK`, exit 0 |
+
+## Ключевые строки 0.9.3
+
+```text
+SURVIVED 1800
+FIBER DROP OK 2000
+FIBER DROP OK 4000
+TUPLE FIBER OK
+DICT FIBER OK
+SET FIBER OK
+ENV FIBER OK
+INSTANCE FIBER OK
+FUNCTION FIBER OK
+ITERATOR FIBER OK
+VIEW FIBER OK
+ALIVE AFTER DROP TESTS
+SUITE ALIVE
+```
+
+Регрессия: весь suite 0.1.2–0.9.2 проходит без изменений — `EVAL CHAIN 200 OK`,
+`EVAL CHAIN 256 OK`, `EVAL RECOVERED OK`, `PARSE OK`, `INTERLEAVE OK`,
+`GEN CHAIN 20 OK`, `GEN GUARD OK`, `ALIVE AFTER GEN BOMB`,
+`RECURSION LIMIT OK`, `KEYWORD ONLY OK`, `DICT SET OK`, `GEN METHODS OK`,
+`GEN DELEGATION OK`, `GEN FIBERS OK`, `YIELD FROM OK`, `NESTING OK`,
+`PARENS150 OK`, `NOT200 OK`, `BLOCKS200 OK` и `child: True status: 0` /
+`proc ok` на месте.
+
+## F-r4-rt-2: глубина сравнения sequence'ов
+
+`Interp::cmp_values` для `list`/`tuple` рекурсировал нативно
+(`cmp_values` → `compare_sequences` → `cmp_values`) без лимита: счётчики AST
+(256) и Python-кадров (56) не видят вложенность, построенную в рантайме
+(`a = [a]` в цикле), а `==` ограничен 20 уровнями. На 64-КиБ heap-фибере без
+guard-страницы 250 уровней выживало, 350/450 переполняли файбер в живую кучу
+(`load page fault`, `stval=0x10`/`0x0`), 500 уходил ниже heap base
+(`store page fault`, `stval=0x1fffffd8`).
+
+Фикс — явный стек кадров в `cmp_values` и предел `CMP_RECURSION_LIMIT = 256`
+(как `EXPR_RECURSION_LIMIT`): нативная рекурсия убрана совсем, поэтому
+глубина стоит байтов кучи, а не стека, и одинаково ведёт себя на 1-МиБ
+process stack и на 64-КиБ файбере. 255 уровней сравниваются, 256-й —
+`RecursionError`, ловимое исключение; циклический список тоже останавливается
+пределом.
+
+| Скрипт | Что проверяет | Результат |
+|---|---|---|
+| `cmp_depth_250.py` | контроль аудита: 250 вложенных list и tuple, разница на дне структуры, плюс худший случай `sorted()` из 120 вложенных списков (переиспользование буфера кадров) | `CMP DEPTH 250 OK`, `CMP TUPLE 250 OK`, `CMP SORT SHALLOW OK`, exit 0 |
+| `cmp_depth_350.py` | 350-deep list в генераторе (stock: heap corruption, `load page fault stval=0x10`) | `RecursionError: maximum recursion depth exceeded (256 nested sequence levels)`, exit 1, машина жива |
+| `cmp_depth_450_tuple.py` | 450-deep tuple (stock: `stval=0x0`) | тот же `RecursionError`, exit 1 |
+| `cmp_depth_500_caught.py` | 500-deep list, ошибка поймана в том же генераторе; циклический список; обычные сравнения и heap-canary после | `CMP BOMB CAUGHT True`, `CMP RECOVERED True`, `CMP HEAP CANARY OK`, `CMP CYCLIC CAUGHT True`, `CMP HEAP STILL OK`, `ALIVE AFTER CMP BOMB`, exit 0 |
+| `cmp_depth_main.py` | 1000-deep list на 1-МиБ process stack | `RecursionError`, exit 1 |
+
+## Ключевые строки F-r4-rt-2
+
+```text
+CMP DEPTH 250 OK
+CMP TUPLE 250 OK
+CMP SORT SHALLOW OK
+CMP BOMB CAUGHT True
+CMP RECOVERED True
+CMP HEAP CANARY OK
+CMP CYCLIC CAUGHT True
+CMP HEAP STILL OK
+ALIVE AFTER CMP BOMB
+RecursionError: maximum recursion depth exceeded (256 nested sequence levels)
+ALIVE AFTER CMP TESTS
+SUITE ALIVE
+```
+
+Регрессия 0.9.3 после фикса: весь suite 0.1.2–0.9.3 проходит без изменений;
+обычные сравнения, `sorted`/`min`/`max` и лексикографический порядок сверены
+с CPython на 1600 случайных парах выражений (0 расхождений) и на 150
+`sorted`/`min`/`max`-наборах (0 расхождений).
+
+## Baseline: stock 0.9.2 на том же ядре
+
+Отдельная загрузка того же ядра с бинарником 0.9.2 (release, 582 056 байт;
+собран из git-архива `origin/dev` без изменений 0.9.3) на тех же скриптах:
+
+```text
+run /mnt/pythonc /mnt/drop_sweep_1800.py
+BUILT
+DROPPED
+SURVIVED 1800
+run: /mnt/pythonc exited with code 0
+run /mnt/pythonc /mnt/drop_fiber_2000.py
+BUILD
+BUILT
+[user] /mnt/pythonc killed: load page fault (cause=13, stval=0x5204c1930, sepc=0x2ed92)
+run /mnt/pythonc /mnt/drop_fiber_4000.py
+BUILD
+BUILT
+[user] /mnt/pythonc killed: store page fault (cause=15, stval=0x1ffffff8, sepc=0x2881a)
+run /mnt/pythonc /mnt/drop_fiber_tuple_4000.py
+TUPLE BUILT
+[user] /mnt/pythonc killed: store page fault (cause=15, stval=0x1ffffff8, sepc=0x2874e)
+```
+
+Шелл после каждого kill остаётся жив (`ALIVE AFTER STOCK BOMBS`), то есть
+это падение процесса интерпретатора, а не машины.
+
+## Baseline: stock 0.9.3 на тех же cmp-скриптах
+
+Отдельная загрузка того же ядра с бинарником stock 0.9.3 (`origin/dev`
+`e26f66c` без фикса F-r4-rt-2, release 586 152 байта,
+`sha256 de34cd13f830bfd73c6d493c0689edb471be5df1748def08a86f869c833b8c4f`)
+и теми же пятью `cmp_depth_*.py`:
+
+```text
+run /mnt/pythonc /mnt/cmp_depth_250.py
+CMP DEPTH 250 OK
+CMP TUPLE 250 OK
+run: /mnt/pythonc exited with code 0
+run /mnt/pythonc /mnt/cmp_depth_350.py
+BUILT 350
+[user] /mnt/pythonc killed: load page fault (cause=13, stval=0x10, sepc=0x84a36)
+run /mnt/pythonc /mnt/cmp_depth_450_tuple.py
+BUILT TUPLE 450
+[user] /mnt/pythonc killed: load page fault (cause=13, stval=0x0, sepc=0x108bc)
+run /mnt/pythonc /mnt/cmp_depth_500_caught.py
+BUILT 500
+[user] /mnt/pythonc killed: load page fault (cause=13, stval=0x2, sepc=0x447ce)
+run /mnt/pythonc /mnt/cmp_depth_main.py
+BUILT 1000
+CMP False SURVIVED 1000
+run: /mnt/pythonc exited with code 0
+```
+
+То есть stock не ловит ошибку даже в `try/except RecursionError` (500-deep
+умирает до исключения), а 1000-deep на process stack ещё сравнивается — после
+фикса это документированный `RecursionError`. Шелл после каждого kill жив.
+
+## Честные пробелы 0.9.3
+
+- **Глубже 4000 живьём не проверялось.** На 1 МиБ bump-heap сама цепочка
+  8000-deep list занимает около половины памяти, поэтому acceptance-набор
+  остаётся на 1800/2000/4000 из аудита; итеративность teardown от глубины не
+  зависит. Hostcheck проверяет 4000 для всех контейнерных видов.
+- **Остались рекурсивными** парсер и `eval_expr` (со своими лимитами 200/256),
+  `repr` (глубина 12) и обход AST. Сравнение вложенных `list`/`tuple` после
+  F-r4-rt-2 итеративное и сюда не входит.
+- **Предел сравнения — 256 уровней, а не 1000, как в CPython.** 1000-deep
+  list на process stack до фикса сравнивался (1 МиБ хватало), теперь это
+  `RecursionError` — цена одинакового детерминированного предела на файбере и
+  на стеке процесса. Для реальных данных 256 уровней вложенности не
+  встречаются; предел документирован в README/CMP_RECURSION_LIMIT.
+- **`==`/`!=` по-прежнему capped на 20 уровнях** (`values_equal` возвращает
+  `False`, не ошибку) — это поведение 0.9.2 и не менялось в F-r4-rt-2;
+  менялось только сравнение порядка (`<`, `<=`, `>`, `>=`,
+  `sorted`/`min`/`max`).
+- **Сборщика циклов нет:** контейнер, ссылающийся на себя, по-прежнему не
+  освобождается (утечка до конца процесса), как и в 0.9.2.
+- **Стек процесса:** тот же deep-drop на process stack работал и до фикса
+  (1 МиБ, не 64 КиБ); проверка живьём сосредоточена на генераторном файбере,
+  где и был баг.

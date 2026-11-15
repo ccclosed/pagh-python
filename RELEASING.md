@@ -62,13 +62,14 @@ source archive; `pythonc` is built and size-checked in `ci.yml`. The pre-flight
 below is what a release candidate must have green on its exact commit:
 
 1. **Host interpreter checks** — the same `src/*.rs` compiled against a std
-   `platform`, 44 unit tests at 0.9.2, including the evaluator-depth and
-   generator-stack-headroom regressions from the security audit:
+   `platform`, 45 unit tests at 0.9.3, including the evaluator-depth,
+   generator-stack-headroom and recursive-drop regressions from the security
+   audits:
 
    ```sh
    cd hostcheck
    cargo test --locked
-   cargo run -- --selftest     # the same grid as PASS/FAIL lines (44 PASS)
+   cargo run -- --selftest     # the same grid as PASS/FAIL lines (45 PASS)
    ```
 
 2. **Freestanding release build inside the kernel's 1 MiB image limit**:
@@ -78,7 +79,7 @@ below is what a release candidate must have green on its exact commit:
    wc -c target/riscv64gc-unknown-none-elf/release/pythonc
    ```
 
-   At 0.9.2 the ELF is 582 056 bytes (569 KiB); the kernel refuses images above
+   At 0.9.3 the ELF is 586 152 bytes (572 KiB); the kernel refuses images above
    1 048 576 bytes. `ci.yml` asserts the limit, so a green CI covers items 1–2.
 
 3. **Live QEMU suite** — the acceptance artifact is a committed transcript, not
@@ -87,14 +88,15 @@ below is what a release candidate must have green on its exact commit:
    and rewrites the transcript:
 
    ```sh
-   sh tests/live/live092.sh            # writes docs/live-pythonc-092.txt
-   PAGH=/path/to/pagh-riscv sh tests/live/live092.sh /tmp/live.txt
+   sh tests/live/live093.sh            # writes docs/live-pythonc-093.txt
+   PAGH=/path/to/pagh-riscv sh tests/live/live093.sh /tmp/live.txt
    ```
 
-   At 0.9.2 the suite is 69 runs: 51 PASS plus 18 intentional diagnostics
-   (syntax/uncatchable errors, recursion bombs, process-ABI checks). The PASS
-   list and raw log are in `docs/live-testing.md` and
-   `docs/live-pythonc-092.txt`; link the fresh transcript in the release PR.
+   At 0.9.3 the suite is 80 runs: 62 PASS plus 18 intentional diagnostics
+   (syntax/uncatchable errors, recursion bombs, recursive-drop PoCs,
+   process-ABI checks). The PASS list and raw log are in
+   `docs/live-testing.md` and `docs/live-pythonc-093.txt`; link the fresh
+   transcript in the release PR.
 
 4. **Regression against the previous release** — the whole 0.1.2-onward suite
    and the committed security PoCs must still pass; the released transcript is

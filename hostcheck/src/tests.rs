@@ -1981,6 +1981,8 @@ fn checks() -> Vec<(&'static str, fn() -> Result<(), String>)> {
         ("parser recursion depth", parser_recursion_depth),
         ("evaluation depth", eval_recursion_depth),
         ("evaluation depth generator", eval_recursion_generator),
+        ("sequence comparison depth", sequence_comparison_depth),
+        ("recursive drop on fiber", recursive_drop_fiber),
     ]
 }
 
@@ -2403,4 +2405,221 @@ fn eval_recursion_depth_works() {
 #[test]
 fn eval_recursion_generator_works() {
     eval_recursion_generator().unwrap();
+}
+
+/// F-r4-rt-2: ordering comparisons of nested list/tuple values recurse
+/// natively (`cmp_values` -> `compare_sequences` -> `cmp_values`). The
+/// evaluator's [`RECURSION_LIMIT`] counts Python frames and
+/// [`EXPR_RECURSION_LIMIT`] counts AST nodes, but a nested value is built at
+/// run time (`a = [a]` in a loop), so neither counter ever sees this
+/// recursion. On a generator's 64 KiB heap fiber (no guard page) the walk
+/// overran the stack into the live heap: the audit's depth 250 survived,
+/// 300+ died with a load page fault at `stval=0x10` after overwriting heap
+/// objects, and 500 went below the heap base. The comparison now charges one
+/// level per nested sequence against [`CMP_RECURSION_LIMIT`] and checks stack
+/// headroom; crossing either is a catchable `RecursionError`, never a fault.
+fn sequence_comparison_depth() -> Result<(), String> {
+    // Ordinary comparisons, sorting and min/max keep their lexicographic
+    // semantics -- only the depth at which native recursion stops changed.
+    let ordinary = r#"
+assert [1, 2] < [1, 3]
+assert not ([1, 3] < [1, 2])
+assert [1] < [1, 0]
+assert [] < [0]
+assert [1, [2, [3]]] < [1, [2, [4]]]
+assert (1, [2]) < (1, [3])
+assert [1, 2] <= [1, 2] and [2] > [1, 2] and [2] >= [2]
+assert sorted([[2], [1, 3], [1, 2], []]) == [[], [1, 2], [1, 3], [2]]
+assert sorted([[i] for i in range(120, 0, -1)]) == [[i] for i in range(1, 121)]
+assert min([[2], [1]]) == [1] and max(([1], [2])) == [2]
+x = 1 + 1 == 2
+"#;
+    expect_repr(ordinary, "x", "True")?;
+
+    // The explicit cap: 255 nested lists compare fine, level 256 is a clean
+    // RecursionError. (`deep(255)`'s innermost empty list sits at depth 255.)
+    let boundary = r#"
+def deep(n):
+    a = []
+    for _ in range(n):
+        a = [a]
+    return a
+
+assert not (deep(255) < deep(255))
+caught = False
+try:
+    deep(256) < deep(256)
+except RecursionError:
+    caught = True
+assert caught
+x = 1 + 1 == 2
+"#;
+    expect_repr(boundary, "x", "True")?;
+
+    // The generator variant: the audit control depth 250 still compares on the
+    // 64 KiB fiber, while 350/450/500 -- the sizes that corrupted the heap on
+    // 0.9.3 before this fix -- raise cleanly, are catchable, and the generator
+    // keeps running afterwards. A self-referential list and an unsupported
+    // Dict operand keep their own outcomes (RecursionError / TypeError).
+    let _fiber_guard = fiber_guard();
+    let fiber = r#"
+def deep(n):
+    a = []
+    for _ in range(n):
+        a = [a]
+    return a
+
+def deep_tuple(n):
+    a = ()
+    for _ in range(n):
+        a = (a,)
+    return a
+
+def compare(n, make):
+    a = make(n)
+    b = make(n)
+    yield a < b
+
+def caught(n, make):
+    a = make(n)
+    b = make(n)
+    ok = False
+    try:
+        a < b
+    except RecursionError:
+        ok = True
+    yield ok
+
+canary = [123456789, [7, 8, 9], "heap-canary"]
+assert list(compare(250, deep)) == [False]
+assert list(compare(250, deep_tuple)) == [False]
+assert list(caught(350, deep)) == [True]
+assert list(caught(450, deep_tuple)) == [True]
+assert list(caught(500, deep)) == [True]
+assert canary == [123456789, [7, 8, 9], "heap-canary"]
+
+cyclic = []
+cyclic.append(cyclic)
+ok = False
+try:
+    cyclic < cyclic
+except RecursionError:
+    ok = True
+assert ok
+
+typed = False
+try:
+    {} < {}
+except TypeError:
+    typed = True
+assert typed
+x = 1 + 1 == 2
+"#;
+    expect_repr(fiber, "x", "True")
+}
+
+#[test]
+fn sequence_comparison_depth_works() {
+    sequence_comparison_depth().unwrap();
+}
+
+/// F-r3-rt-1: a deep Python value graph released inside a generator must not
+/// recurse through the native drop glue. The generator body runs on a 64 KiB
+/// heap fiber with no guard page, so a recursive teardown would overrun the
+/// stack and corrupt the heap -- the audit PoC died at ~1900 nested lists.
+/// Every container kind that used to recurse is exercised here (list, tuple,
+/// dict, set, instance attributes, function closures, iterator state, a dict
+/// view and a function-frame environment).
+fn recursive_drop_fiber() -> Result<(), String> {
+    let _fiber_guard = fiber_guard();
+    let script = r#"
+class C:
+    pass
+
+def build_list(n):
+    a = []
+    for _ in range(n):
+        a = [a]
+    return a
+
+def build_tuple(n):
+    a = ()
+    for _ in range(n):
+        a = (a,)
+    return a
+
+def build_dict(n):
+    a = None
+    for _ in range(n):
+        a = {"k": a}
+    return a
+
+def build_instance(n):
+    a = C()
+    for _ in range(n):
+        b = C()
+        b.next = a
+        a = b
+    return a
+
+def make(prev):
+    def f():
+        return prev
+    return f
+
+def build_function(n):
+    f = None
+    for _ in range(n):
+        f = make(f)
+    return f
+
+def release_env(n):
+    a = build_list(n)
+    return len(a)
+
+def gen(n):
+    a = build_list(n)
+    a = None
+    print("DROP LIST OK")
+    a = build_tuple(n)
+    a = None
+    print("DROP TUPLE OK")
+    a = build_dict(n)
+    a = None
+    print("DROP DICT OK")
+    a = build_tuple(n)
+    s = {a}
+    s = None
+    a = None
+    print("DROP SET OK")
+    a = build_instance(n)
+    a = None
+    print("DROP INSTANCE OK")
+    f = build_function(n)
+    f = None
+    print("DROP FUNCTION OK")
+    a = build_list(n)
+    it = iter(a)
+    a = None
+    it = None
+    print("DROP ITERATOR OK")
+    d = build_dict(n)
+    v = d.items()
+    d = None
+    v = None
+    print("DROP VIEW OK")
+    release_env(n)
+    print("DROP ENV OK")
+    yield 1
+
+for _v in gen(4000):
+    pass
+ok = 1 + 1 == 2
+"#;
+    expect_repr(script, "ok", "True")
+}
+
+#[test]
+fn recursive_drop_fiber_works() {
+    recursive_drop_fiber().unwrap();
 }
